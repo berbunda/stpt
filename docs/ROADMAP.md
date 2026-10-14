@@ -9,7 +9,7 @@ IDs A001–D008 were renamed to RA001–RD008 on 2026-10-11 (prefix scheme chang
 - [x] RA003  unified client/server binary ✅ 2026-10-14
 - [x] RA004  configuration subsystem ✅ 2026-10-14
 - [x] RA005  logging/error subsystem ✅ 2026-10-14
-- [ ] RA006  local client ↔ server communication prototype
+- [x] RA006  local client ↔ server communication prototype ❌ 2026-10-14
 
 # 2	Tier RB — Transport
 - [ ] RB001  QUIC transport ← PB001
