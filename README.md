@@ -14,6 +14,7 @@ stpt terminate ACCOUNT@HOST[:PORT] SESSION [--force]
 
 - The default port is 843 (UDP). IPv6 addresses go in brackets: `alice@[2001:db8::1]:843`.
 - `SESSION` is a Session ID, a unique prefix of it, or a Session name.
+- `stpt server` runs the Server, every other command the Client. Server mode is available on Linux only; on Windows the program is a Client.
 - `stpt help COMMAND` shows the options of a command.
 
 Roadmap of the program: `docs/ROADMAP.md`.

@@ -1,4 +1,7 @@
 //! Command line interface: one explicit subcommand per operation.
+//!
+//! The subcommand selects the role of the binary: `server` runs the Server,
+//! every other subcommand runs the Client.
 
 use std::net::SocketAddr;
 use std::process::ExitCode;
@@ -6,6 +9,7 @@ use std::process::ExitCode;
 use clap::{Args, Parser, Subcommand};
 
 use crate::destination::Destination;
+use crate::{client, server};
 
 /// Exit code for STPT and Connection errors, as ssh.
 pub const EXIT_STPT_ERROR: u8 = 255;
@@ -27,6 +31,13 @@ pub enum Command {
         listen: Option<SocketAddr>,
     },
 
+    #[command(flatten)]
+    Client(ClientCommand),
+}
+
+/// Subcommands of the Client role.
+#[derive(Debug, Subcommand)]
+pub enum ClientCommand {
     /// Open an interactive terminal in a new or an existing Session
     Connect {
         /// Account on the Server and Server address [default port: 843]
@@ -115,16 +126,10 @@ pub struct DetachTarget {
 }
 
 pub fn run(cli: Cli) -> ExitCode {
-    let name = match cli.command {
-        Command::Server { .. } => "server",
-        Command::Connect { .. } => "connect",
-        Command::Exec { .. } => "exec",
-        Command::Sessions { .. } => "sessions",
-        Command::Detach { .. } => "detach",
-        Command::Terminate { .. } => "terminate",
-    };
-    eprintln!("stpt: {name}: not implemented yet");
-    ExitCode::from(EXIT_STPT_ERROR)
+    match cli.command {
+        Command::Server { listen } => server::run(listen),
+        Command::Client(command) => client::run(command),
+    }
 }
 
 #[cfg(test)]
@@ -157,25 +162,42 @@ mod tests {
     }
 
     #[test]
+    fn other_subcommands_select_client() {
+        let cases: [&[&str]; 5] = [
+            &["connect", "alice@host"],
+            &["exec", "alice@host", "true"],
+            &["sessions", "alice@host"],
+            &["detach", "alice@host", "work", "--all"],
+            &["terminate", "alice@host", "work"],
+        ];
+        for args in cases {
+            assert!(
+                matches!(parse(args).unwrap().command, Command::Client(_)),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
     fn connect_new_and_attach() {
         let cli = parse(&["connect", "alice@host", "--name", "work"]).unwrap();
         assert!(matches!(
             cli.command,
-            Command::Connect {
+            Command::Client(ClientCommand::Connect {
                 attach: None,
                 name: Some(_),
                 ..
-            }
+            })
         ));
 
         let cli = parse(&["connect", "alice@host", "--attach", "work", "--takeover"]).unwrap();
         assert!(matches!(
             cli.command,
-            Command::Connect {
+            Command::Client(ClientCommand::Connect {
                 attach: Some(_),
                 takeover: true,
                 ..
-            }
+            })
         ));
     }
 
@@ -203,9 +225,9 @@ mod tests {
     #[test]
     fn exec_keeps_command_arguments() {
         let cli = parse(&["exec", "alice@host", "ls", "-la", "/tmp"]).unwrap();
-        let Command::Exec {
+        let Command::Client(ClientCommand::Exec {
             command, no_shell, ..
-        } = cli.command
+        }) = cli.command
         else {
             panic!()
         };
@@ -213,7 +235,10 @@ mod tests {
         assert!(!no_shell);
 
         let cli = parse(&["exec", "alice@host", "--no-shell", "--", "ls", "-la"]).unwrap();
-        assert!(matches!(cli.command, Command::Exec { no_shell: true, .. }));
+        assert!(matches!(
+            cli.command,
+            Command::Client(ClientCommand::Exec { no_shell: true, .. })
+        ));
 
         assert_eq!(
             err_kind(&["exec", "alice@host"]),
@@ -240,7 +265,7 @@ mod tests {
         let cli = parse(&["terminate", "alice@host", "work", "--force"]).unwrap();
         assert!(matches!(
             cli.command,
-            Command::Terminate { force: true, .. }
+            Command::Client(ClientCommand::Terminate { force: true, .. })
         ));
     }
 }

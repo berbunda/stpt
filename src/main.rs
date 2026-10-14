@@ -1,5 +1,7 @@
 mod cli;
+mod client;
 mod destination;
+mod server;
 
 use std::process::ExitCode;
 
