@@ -3,7 +3,7 @@
 Protocol specification: https://github.com/berbunda/stpt-protocol/blob/main/specs/PROTOCOL.md
 
 # 1	Structure
-Single Cargo package `stpt` (binary crate, edition 2024).
+Single Cargo package `stpt` (binary crate, edition 2024). Minimum Rust version (`rust-version`): the current stable release, now 1.99; older compilers refuse to build with a clear message.
 
 | Module | Responsibility |
 |---|---|

@@ -17,4 +17,13 @@ stpt terminate ACCOUNT@HOST[:PORT] SESSION [--force]
 - `stpt server` runs the Server, every other command the Client. Server mode is available on Linux only; on Windows the program is a Client.
 - `stpt help COMMAND` shows the options of a command.
 
+# Build
+Requires Rust 1.99 or newer, installed with rustup (distribution packages are usually older), and a C linker (`build-essential` on Debian).
+
+```
+cargo build --release
+```
+
+The program is `target/release/stpt` (`stpt.exe` on Windows).
+
 Roadmap of the program: `docs/ROADMAP.md`.
