@@ -17,6 +17,23 @@ stpt terminate ACCOUNT@HOST[:PORT] SESSION [--force]
 - `stpt server` runs the Server, every other command the Client. Server mode is available on Linux only; on Windows the program is a Client.
 - `stpt help COMMAND` shows the options of a command.
 
+# Configuration
+TOML files, optional; `--config PATH` uses another file.
+
+| Role | Default file |
+|---|---|
+| Server | `/etc/stpt/server.toml` |
+| Client, Linux | `~/.config/stpt/config.toml` (`$XDG_CONFIG_HOME/stpt/config.toml` if set) |
+| Client, Windows | `%APPDATA%\stpt\config.toml` |
+
+Command line options override the file. Unknown keys and invalid values are errors.
+
+Server settings:
+```toml
+listen = "[::]:843"   # address and UDP port; IPv6 addresses in brackets
+```
+The Client has no settings yet.
+
 # Build
 Requires Rust 1.99 or newer, installed with rustup (distribution packages are usually older), and a C linker (`build-essential` on Debian).
 

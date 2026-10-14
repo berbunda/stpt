@@ -7,7 +7,7 @@ IDs A001–D008 were renamed to RA001–RD008 on 2026-10-11 (prefix scheme chang
 - [x] RA001  Project bootstrap: repositories, Rust project, licenses, docs, build check ✅ 2026-10-10
 - [x] RA002  CLI skeleton ✅ 2026-10-13
 - [x] RA003  unified client/server binary ✅ 2026-10-14
-- [ ] RA004  configuration subsystem
+- [x] RA004  configuration subsystem ✅ 2026-10-14
 - [ ] RA005  logging/error subsystem
 - [ ] RA006  local client ↔ server communication prototype
 

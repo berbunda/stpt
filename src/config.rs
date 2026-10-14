@@ -1,0 +1,186 @@
+//! Configuration files (TOML): one for the Client, one for the Server.
+//!
+//! Precedence: command line, then configuration file, then built-in default.
+//! Unknown keys are errors, so a misspelt key never falls back to a default silently.
+
+use std::ffi::OsString;
+use std::fmt;
+use std::fs;
+use std::io;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+
+use serde::Deserialize;
+use serde::de::DeserializeOwned;
+
+/// Default path of the Server configuration.
+pub const SERVER_PATH: &str = "/etc/stpt/server.toml";
+
+/// Client configuration. It has no settings yet; the first one comes with RD009.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientConfig {}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerConfig {
+    /// Address and UDP port to listen on.
+    pub listen: Option<SocketAddr>,
+}
+
+#[derive(Debug)]
+pub enum Error {
+    Read {
+        path: PathBuf,
+        source: io::Error,
+    },
+    Parse {
+        path: PathBuf,
+        source: toml::de::Error,
+    },
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read { path, source } => write!(f, "{}: {source}", path.display()),
+            Self::Parse { path, source } => write!(f, "{}: {source}", path.display()),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+/// Loads a configuration file.
+///
+/// A file given explicitly (`--config`) must exist. A missing file at the default
+/// path, or no default path at all, means built-in defaults; any other read error
+/// at the default path is an error.
+pub fn load<T: DeserializeOwned + Default>(
+    explicit: Option<&Path>,
+    default: Option<PathBuf>,
+) -> Result<T, Error> {
+    let (path, required) = match (explicit, default) {
+        (Some(path), _) => (path.to_owned(), true),
+        (None, Some(path)) => (path, false),
+        (None, None) => return Ok(T::default()),
+    };
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if !required && e.kind() == io::ErrorKind::NotFound => return Ok(T::default()),
+        Err(source) => return Err(Error::Read { path, source }),
+    };
+    toml::from_str(&text).map_err(|source| Error::Parse { path, source })
+}
+
+/// Default path of the Client configuration; `None` if the user's directory is unknown.
+pub fn client_path() -> Option<PathBuf> {
+    client_path_from(|name| std::env::var_os(name))
+}
+
+fn client_path_from(var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    let dir = |name: &str| var(name).filter(|v| !v.is_empty()).map(PathBuf::from);
+    let base = if cfg!(windows) {
+        dir("APPDATA")?
+    } else {
+        // XDG Base Directory: a relative XDG_CONFIG_HOME is invalid and ignored.
+        match dir("XDG_CONFIG_HOME").filter(|p| p.is_absolute()) {
+            Some(p) => p,
+            None => dir("HOME")?.join(".config"),
+        }
+    };
+    Some(base.join("stpt").join("config.toml"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse<T: DeserializeOwned>(text: &str) -> Result<T, toml::de::Error> {
+        toml::from_str(text)
+    }
+
+    #[test]
+    fn server_listen() {
+        let config: ServerConfig = parse(r#"listen = "[::1]:900""#).unwrap();
+        assert_eq!(config.listen, Some("[::1]:900".parse().unwrap()));
+        assert_eq!(parse::<ServerConfig>("").unwrap().listen, None);
+    }
+
+    #[test]
+    fn invalid_values_and_unknown_keys_are_errors() {
+        assert!(parse::<ServerConfig>(r#"listen = "host""#).is_err());
+        assert!(parse::<ServerConfig>("listen = 843").is_err());
+        assert!(parse::<ServerConfig>(r#"lisen = "[::]:843""#).is_err());
+        assert!(parse::<ClientConfig>("detach_timeout = 60").is_err());
+        assert!(parse::<ClientConfig>("").is_ok());
+    }
+
+    #[test]
+    fn missing_file() {
+        let missing = Path::new("/nonexistent/stpt/config.toml");
+        assert!(load::<ServerConfig>(None, Some(missing.to_owned())).is_ok());
+        assert!(load::<ServerConfig>(None, None).is_ok());
+        assert!(matches!(
+            load::<ServerConfig>(Some(missing), None),
+            Err(Error::Read { .. })
+        ));
+    }
+
+    #[test]
+    fn explicit_path_replaces_default() {
+        let dir = std::env::temp_dir().join(format!("stpt-config-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("server.toml");
+        fs::write(&file, r#"listen = "127.0.0.1:2222""#).unwrap();
+        let bad = dir.join("bad.toml");
+        fs::write(&bad, "listen = [").unwrap();
+
+        let config: ServerConfig = load(Some(&file), Some(bad.clone())).unwrap();
+        assert_eq!(config.listen.unwrap().port(), 2222);
+        assert!(matches!(
+            load::<ServerConfig>(None, Some(bad)),
+            Err(Error::Parse { .. })
+        ));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn env<'a>(vars: &'a [(&str, &str)]) -> impl Fn(&str) -> Option<OsString> + 'a {
+        move |name| {
+            vars.iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| OsString::from(v))
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn client_path_windows() {
+        assert_eq!(
+            client_path_from(env(&[("APPDATA", r"C:\Users\a\AppData\Roaming")])),
+            Some(PathBuf::from(
+                r"C:\Users\a\AppData\Roaming\stpt\config.toml"
+            ))
+        );
+        assert_eq!(client_path_from(env(&[("APPDATA", "")])), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn client_path_unix() {
+        let path = |vars| client_path_from(env(vars));
+        assert_eq!(
+            path(&[("HOME", "/home/a")]),
+            Some(PathBuf::from("/home/a/.config/stpt/config.toml"))
+        );
+        assert_eq!(
+            path(&[("HOME", "/home/a"), ("XDG_CONFIG_HOME", "/cfg")]),
+            Some(PathBuf::from("/cfg/stpt/config.toml"))
+        );
+        assert_eq!(
+            path(&[("HOME", "/home/a"), ("XDG_CONFIG_HOME", "rel")]),
+            Some(PathBuf::from("/home/a/.config/stpt/config.toml"))
+        );
+        assert_eq!(path(&[]), None);
+    }
+}

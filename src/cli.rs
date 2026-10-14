@@ -4,6 +4,7 @@
 //! every other subcommand runs the Client.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
@@ -18,6 +19,10 @@ pub const EXIT_STPT_ERROR: u8 = 255;
 #[derive(Debug, Parser)]
 #[command(name = "stpt", version, propagate_version = true)]
 pub struct Cli {
+    /// Configuration file instead of the default one
+    #[arg(long, global = true, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -126,9 +131,10 @@ pub struct DetachTarget {
 }
 
 pub fn run(cli: Cli) -> ExitCode {
+    let config = cli.config.as_deref();
     match cli.command {
-        Command::Server { listen } => server::run(listen),
-        Command::Client(command) => client::run(command),
+        Command::Server { listen } => server::run(listen, config),
+        Command::Client(command) => client::run(command, config),
     }
 }
 
@@ -159,6 +165,19 @@ mod tests {
             parse(&["server"]).unwrap().command,
             Command::Server { listen: None }
         ));
+    }
+
+    #[test]
+    fn config_before_or_after_subcommand() {
+        for args in [
+            &["--config", "a.toml", "server"][..],
+            &["server", "--config", "a.toml"],
+            &["connect", "alice@host", "--config", "a.toml"],
+        ] {
+            let cli = parse(args).unwrap();
+            assert_eq!(cli.config, Some(PathBuf::from("a.toml")), "{args:?}");
+        }
+        assert_eq!(parse(&["server"]).unwrap().config, None);
     }
 
     #[test]
