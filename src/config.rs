@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
+use crate::logging;
+
 /// Default path of the Server configuration.
 pub const SERVER_PATH: &str = "/etc/stpt/server.toml";
 
@@ -26,6 +28,8 @@ pub struct ClientConfig {}
 pub struct ServerConfig {
     /// Address and UDP port to listen on.
     pub listen: Option<SocketAddr>,
+    /// Log level when neither `-v` nor `-q` is given.
+    pub log_level: Option<logging::Level>,
 }
 
 #[derive(Debug)]
@@ -51,7 +55,7 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// Loads a configuration file.
+/// Loads a configuration file; returns it with the path of the file read, if any.
 ///
 /// A file given explicitly (`--config`) must exist. A missing file at the default
 /// path, or no default path at all, means built-in defaults; any other read error
@@ -59,18 +63,31 @@ impl std::error::Error for Error {}
 pub fn load<T: DeserializeOwned + Default>(
     explicit: Option<&Path>,
     default: Option<PathBuf>,
-) -> Result<T, Error> {
+) -> Result<(T, Option<PathBuf>), Error> {
     let (path, required) = match (explicit, default) {
         (Some(path), _) => (path.to_owned(), true),
         (None, Some(path)) => (path, false),
-        (None, None) => return Ok(T::default()),
+        (None, None) => return Ok((T::default(), None)),
     };
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
-        Err(e) if !required && e.kind() == io::ErrorKind::NotFound => return Ok(T::default()),
+        Err(e) if !required && e.kind() == io::ErrorKind::NotFound => {
+            return Ok((T::default(), None));
+        }
         Err(source) => return Err(Error::Read { path, source }),
     };
-    toml::from_str(&text).map_err(|source| Error::Parse { path, source })
+    match toml::from_str(&text) {
+        Ok(config) => Ok((config, Some(path))),
+        Err(source) => Err(Error::Parse { path, source }),
+    }
+}
+
+/// Logs which configuration is used; called once logging is initialised.
+pub fn log_source(path: Option<&Path>) {
+    match path {
+        Some(path) => tracing::debug!(path = %path.display(), "configuration file read"),
+        None => tracing::debug!("no configuration file, built-in defaults"),
+    }
 }
 
 /// Default path of the Client configuration; `None` if the user's directory is unknown.
@@ -105,6 +122,8 @@ mod tests {
         let config: ServerConfig = parse(r#"listen = "[::1]:900""#).unwrap();
         assert_eq!(config.listen, Some("[::1]:900".parse().unwrap()));
         assert_eq!(parse::<ServerConfig>("").unwrap().listen, None);
+        let config: ServerConfig = parse(r#"log_level = "debug""#).unwrap();
+        assert_eq!(config.log_level, Some(logging::Level::Debug));
     }
 
     #[test]
@@ -119,8 +138,11 @@ mod tests {
     #[test]
     fn missing_file() {
         let missing = Path::new("/nonexistent/stpt/config.toml");
-        assert!(load::<ServerConfig>(None, Some(missing.to_owned())).is_ok());
-        assert!(load::<ServerConfig>(None, None).is_ok());
+        assert!(matches!(
+            load::<ServerConfig>(None, Some(missing.to_owned())),
+            Ok((_, None))
+        ));
+        assert!(matches!(load::<ServerConfig>(None, None), Ok((_, None))));
         assert!(matches!(
             load::<ServerConfig>(Some(missing), None),
             Err(Error::Read { .. })
@@ -136,8 +158,9 @@ mod tests {
         let bad = dir.join("bad.toml");
         fs::write(&bad, "listen = [").unwrap();
 
-        let config: ServerConfig = load(Some(&file), Some(bad.clone())).unwrap();
+        let (config, read) = load::<ServerConfig>(Some(&file), Some(bad.clone())).unwrap();
         assert_eq!(config.listen.unwrap().port(), 2222);
+        assert_eq!(read, Some(file));
         assert!(matches!(
             load::<ServerConfig>(None, Some(bad)),
             Err(Error::Parse { .. })

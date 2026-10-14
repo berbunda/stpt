@@ -16,6 +16,7 @@ stpt terminate ACCOUNT@HOST[:PORT] SESSION [--force]
 - `SESSION` is a Session ID, a unique prefix of it, or a Session name.
 - `stpt server` runs the Server, every other command the Client. Server mode is available on Linux only; on Windows the program is a Client.
 - `stpt help COMMAND` shows the options of a command.
+- Messages go to standard error. `-v` shows more (`-vv`, `-vvv` even more), `-q` errors only. The Server logs to standard error, which systemd keeps in the journal.
 
 # Configuration
 TOML files, optional; `--config PATH` uses another file.
@@ -31,6 +32,7 @@ Command line options override the file. Unknown keys and invalid values are erro
 Server settings:
 ```toml
 listen = "[::]:843"   # address and UDP port; IPv6 addresses in brackets
+log_level = "info"    # error, warn, info, debug or trace; -v and -q override it
 ```
 The Client has no settings yet.
 

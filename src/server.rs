@@ -1,12 +1,14 @@
 //! Server role: `stpt server`.
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-use crate::cli::EXIT_STPT_ERROR;
+use crate::cli::Common;
 use crate::config::{self, ServerConfig};
 use crate::destination::DEFAULT_PORT;
+use crate::error::Error;
+use crate::logging::{self, Role};
 
 /// Server mode needs a Unix PTY; Windows Server mode (ConPTY) comes with RK006 (gate G2).
 pub const AVAILABLE: bool = cfg!(unix);
@@ -15,22 +17,23 @@ pub const AVAILABLE: bool = cfg!(unix);
 pub const DEFAULT_LISTEN: SocketAddr =
     SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), DEFAULT_PORT);
 
-pub fn run(listen: Option<SocketAddr>, config_path: Option<&Path>) -> ExitCode {
+pub fn run(listen: Option<SocketAddr>, common: &Common) -> Result<ExitCode, Error> {
     if !AVAILABLE {
-        eprintln!("stpt: server: Server mode is not available on this platform");
-        return ExitCode::from(EXIT_STPT_ERROR);
+        return Err(Error::ServerUnavailable);
     }
-    let config: ServerConfig =
-        match config::load(config_path, Some(PathBuf::from(config::SERVER_PATH))) {
-            Ok(config) => config,
-            Err(e) => {
-                eprintln!("stpt: config: {e}");
-                return ExitCode::from(EXIT_STPT_ERROR);
-            }
-        };
-    let _listen = listen_address(listen, &config);
-    eprintln!("stpt: server: not implemented yet");
-    ExitCode::from(EXIT_STPT_ERROR)
+    let (config, path) = config::load::<ServerConfig>(
+        common.config.as_deref(),
+        Some(PathBuf::from(config::SERVER_PATH)),
+    )?;
+    logging::init(
+        Role::Server,
+        logging::level(Role::Server, common.verbose, common.quiet, config.log_level),
+    );
+    config::log_source(path.as_deref());
+
+    let listen = listen_address(listen, &config);
+    tracing::debug!(%listen, "listen address");
+    Err(Error::NotImplemented("server"))
 }
 
 /// `--listen`, else the configuration, else [`DEFAULT_LISTEN`].
@@ -52,7 +55,10 @@ mod tests {
     fn listen_precedence() {
         let a: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let b: SocketAddr = "127.0.0.1:2".parse().unwrap();
-        let config = ServerConfig { listen: Some(b) };
+        let config = ServerConfig {
+            listen: Some(b),
+            ..Default::default()
+        };
         assert_eq!(listen_address(Some(a), &config), a);
         assert_eq!(listen_address(None, &config), b);
         assert_eq!(

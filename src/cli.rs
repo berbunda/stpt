@@ -7,24 +7,57 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Args, Parser, Subcommand};
+use clap::error::ErrorKind;
+use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand};
 
 use crate::destination::Destination;
+use crate::error::Error;
 use crate::{client, server};
-
-/// Exit code for STPT and Connection errors, as ssh.
-pub const EXIT_STPT_ERROR: u8 = 255;
 
 /// Secure terminal access over QUIC.
 #[derive(Debug, Parser)]
 #[command(name = "stpt", version, propagate_version = true)]
 pub struct Cli {
+    #[command(flatten)]
+    pub common: Common,
+
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+/// Options of both roles, accepted before or after the subcommand.
+#[derive(Debug, Args)]
+pub struct Common {
     /// Configuration file instead of the default one
     #[arg(long, global = true, value_name = "PATH")]
     pub config: Option<PathBuf>,
 
-    #[command(subcommand)]
-    pub command: Command,
+    /// More log messages: -v info, -vv debug, -vvv trace
+    #[arg(short, long, global = true, action = ArgAction::Count)]
+    pub verbose: u8,
+
+    /// Log errors only
+    #[arg(short, long, global = true)]
+    pub quiet: bool,
+}
+
+impl Cli {
+    /// Parses the command line; a usage error exits with 2.
+    pub fn parse_args() -> Self {
+        Self::parse().validate().unwrap_or_else(|e| e.exit())
+    }
+
+    /// Checks that clap cannot express: `conflicts_with` misses global options
+    /// given on different levels (`-q server -v`).
+    fn validate(self) -> Result<Self, clap::Error> {
+        if self.common.quiet && self.common.verbose > 0 {
+            return Err(Self::command().error(
+                ErrorKind::ArgumentConflict,
+                "--quiet cannot be used with --verbose",
+            ));
+        }
+        Ok(self)
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -130,11 +163,10 @@ pub struct DetachTarget {
     pub id: Option<u64>,
 }
 
-pub fn run(cli: Cli) -> ExitCode {
-    let config = cli.config.as_deref();
+pub fn run(cli: Cli) -> Result<ExitCode, Error> {
     match cli.command {
-        Command::Server { listen } => server::run(listen, config),
-        Command::Client(command) => client::run(command, config),
+        Command::Server { listen } => server::run(listen, &cli.common),
+        Command::Client(command) => client::run(command, &cli.common),
     }
 }
 
@@ -145,7 +177,7 @@ mod tests {
     use clap::error::ErrorKind;
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
-        Cli::try_parse_from(std::iter::once("stpt").chain(args.iter().copied()))
+        Cli::try_parse_from(std::iter::once("stpt").chain(args.iter().copied()))?.validate()
     }
 
     fn err_kind(args: &[&str]) -> ErrorKind {
@@ -175,9 +207,24 @@ mod tests {
             &["connect", "alice@host", "--config", "a.toml"],
         ] {
             let cli = parse(args).unwrap();
-            assert_eq!(cli.config, Some(PathBuf::from("a.toml")), "{args:?}");
+            assert_eq!(cli.common.config, Some(PathBuf::from("a.toml")), "{args:?}");
         }
-        assert_eq!(parse(&["server"]).unwrap().config, None);
+        assert_eq!(parse(&["server"]).unwrap().common.config, None);
+    }
+
+    #[test]
+    fn verbosity() {
+        assert_eq!(parse(&["-vv", "server"]).unwrap().common.verbose, 2);
+        assert_eq!(
+            parse(&["server", "-v", "-v", "-v"]).unwrap().common.verbose,
+            3
+        );
+        assert!(parse(&["server", "-q"]).unwrap().common.quiet);
+        assert_eq!(
+            err_kind(&["-q", "server", "-v"]),
+            ErrorKind::ArgumentConflict
+        );
+        assert_eq!(err_kind(&["server", "-qv"]), ErrorKind::ArgumentConflict);
     }
 
     #[test]

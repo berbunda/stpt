@@ -1,19 +1,21 @@
 //! Client role: every subcommand except `server`.
 
-use std::path::Path;
 use std::process::ExitCode;
 
-use crate::cli::{ClientCommand, EXIT_STPT_ERROR};
+use crate::cli::{ClientCommand, Common};
 use crate::config::{self, ClientConfig};
+use crate::error::Error;
+use crate::logging::{self, Role};
 
-pub fn run(command: ClientCommand, config_path: Option<&Path>) -> ExitCode {
-    let _config: ClientConfig = match config::load(config_path, config::client_path()) {
-        Ok(config) => config,
-        Err(e) => {
-            eprintln!("stpt: config: {e}");
-            return ExitCode::from(EXIT_STPT_ERROR);
-        }
-    };
+pub fn run(command: ClientCommand, common: &Common) -> Result<ExitCode, Error> {
+    let (_config, path) =
+        config::load::<ClientConfig>(common.config.as_deref(), config::client_path())?;
+    logging::init(
+        Role::Client,
+        logging::level(Role::Client, common.verbose, common.quiet, None),
+    );
+    config::log_source(path.as_deref());
+
     let name = match command {
         ClientCommand::Connect { .. } => "connect",
         ClientCommand::Exec { .. } => "exec",
@@ -21,6 +23,5 @@ pub fn run(command: ClientCommand, config_path: Option<&Path>) -> ExitCode {
         ClientCommand::Detach { .. } => "detach",
         ClientCommand::Terminate { .. } => "terminate",
     };
-    eprintln!("stpt: {name}: not implemented yet");
-    ExitCode::from(EXIT_STPT_ERROR)
+    Err(Error::NotImplemented(name))
 }

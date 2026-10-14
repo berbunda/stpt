@@ -2,12 +2,18 @@ mod cli;
 mod client;
 mod config;
 mod destination;
+mod error;
+mod logging;
 mod server;
 
 use std::process::ExitCode;
 
-use clap::Parser;
-
 fn main() -> ExitCode {
-    cli::run(cli::Cli::parse())
+    match cli::run(cli::Cli::parse_args()) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("stpt: {e}");
+            ExitCode::from(e.exit_code())
+        }
+    }
 }
