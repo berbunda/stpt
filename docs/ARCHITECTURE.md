@@ -27,7 +27,7 @@ Single Cargo package `stpt` (binary crate, edition 2024). Minimum Rust version (
 # 3	Roles
 - The same binary is Client and Server; the subcommand selects the role. `cli::Command` has the variant `Server` and the flattened `Client(ClientCommand)`, so the dispatch in `cli::run` is by role and each role module receives only its own commands.
 - Client and Server share only common modules (now `destination`); a role module does not use the other role.
-- The command line is the same on every platform. Server mode needs a Unix PTY: on Windows `stpt server` exits with 255 and `Server mode is not available on this platform` (gate G2, until RK006). `server::AVAILABLE` holds the platform check.
+- The command line is the same on every platform. Server mode needs a Unix PTY: on Windows `stpt server` exits with 255 and `Server mode is not available on this platform` (gate G2, until RC008). `server::AVAILABLE` holds the platform check.
 - Default listen address `[::]:843`; whether it also accepts IPv4 (dual-stack) is set with the socket in RB001.
 
 # 4	Configuration

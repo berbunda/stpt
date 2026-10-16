@@ -10,7 +10,7 @@ use crate::destination::DEFAULT_PORT;
 use crate::error::Error;
 use crate::logging::{self, Role};
 
-/// Server mode needs a Unix PTY; Windows Server mode (ConPTY) comes with RK006 (gate G2).
+/// Server mode needs a Unix PTY; Windows Server mode (ConPTY) comes with RC008 (gate G2).
 pub const AVAILABLE: bool = cfg!(unix);
 
 /// Listen address without `--listen` and configuration: all addresses, port 843.

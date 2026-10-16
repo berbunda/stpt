@@ -28,6 +28,7 @@ IDs A001–D008 were renamed to RA001–RD008 on 2026-10-11 (prefix scheme chang
 - [ ] RC005  signals / Ctrl+C ← PC005
 - [ ] RC006  interactive applications ← PC002
 - [ ] RC007  graceful disconnect ← PC006
+- [ ] RC008  Windows PTY (ConPTY), Server mode on Windows ➕ 2026-10-17
 
 # 4	Tier RD — Session Model
 - [ ] RD001  Session ID ← PD001
@@ -87,7 +88,8 @@ IDs A001–D008 were renamed to RA001–RD008 on 2026-10-11 (prefix scheme chang
 - [ ] RK003  man pages, shell completion ➕ 2026-10-13
 - [ ] RK004  reproducible builds, release signing ➕ 2026-10-13
 - [ ] RK005  test vector verification ← PK002 ➕ 2026-10-13
-- [ ] RK006  Windows Server mode (ConPTY) ➕ 2026-10-13
+- [x] RK006  Windows Server mode (ConPTY) ❌ 2026-10-17
+- [ ] RK007  Windows Server as a service ➕ 2026-10-17
 
 # 12	Backlog — on request
 Items taken up only when users ask for them.
