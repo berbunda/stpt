@@ -30,8 +30,9 @@ fn unknown_client_key() {
 #[test]
 fn empty_client_file() {
     let path = config_file("config-empty", "# no settings\n");
-    let out = stpt(&["--config", &path, "sessions", "alice@host"]);
-    assert_eq!(stderr(&out), "stpt: sessions: not implemented yet");
+    let out = stpt(&["--config", &path, "trust", "list"]);
+    assert!(out.status.success());
+    assert_eq!(stderr(&out), "");
 }
 
 #[cfg(unix)]

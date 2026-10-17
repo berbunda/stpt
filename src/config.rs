@@ -30,6 +30,8 @@ pub struct ServerConfig {
     pub listen: Option<SocketAddr>,
     /// Log level when neither `-v` nor `-q` is given.
     pub log_level: Option<logging::Level>,
+    /// Key file of the Server Identity, created if missing.
+    pub identity_key: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -92,10 +94,16 @@ pub fn log_source(path: Option<&Path>) {
 
 /// Default path of the Client configuration; `None` if the user's directory is unknown.
 pub fn client_path() -> Option<PathBuf> {
-    client_path_from(|name| std::env::var_os(name))
+    client_dir().map(|dir| dir.join("config.toml"))
 }
 
-fn client_path_from(var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+/// Directory of the Client configuration and trust store; `None` if the user's
+/// directory is unknown.
+pub fn client_dir() -> Option<PathBuf> {
+    client_dir_from(|name| std::env::var_os(name))
+}
+
+fn client_dir_from(var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
     let dir = |name: &str| var(name).filter(|v| !v.is_empty()).map(PathBuf::from);
     let base = if cfg!(windows) {
         dir("APPDATA")?
@@ -106,7 +114,7 @@ fn client_path_from(var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
             None => dir("HOME")?.join(".config"),
         }
     };
-    Some(base.join("stpt").join("config.toml"))
+    Some(base.join("stpt"))
 }
 
 #[cfg(test)]
@@ -124,6 +132,8 @@ mod tests {
         assert_eq!(parse::<ServerConfig>("").unwrap().listen, None);
         let config: ServerConfig = parse(r#"log_level = "debug""#).unwrap();
         assert_eq!(config.log_level, Some(logging::Level::Debug));
+        let config: ServerConfig = parse(r#"identity_key = "/srv/key""#).unwrap();
+        assert_eq!(config.identity_key, Some(PathBuf::from("/srv/key")));
     }
 
     #[test]
@@ -178,31 +188,29 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn client_path_windows() {
+    fn client_dir_windows() {
         assert_eq!(
-            client_path_from(env(&[("APPDATA", r"C:\Users\a\AppData\Roaming")])),
-            Some(PathBuf::from(
-                r"C:\Users\a\AppData\Roaming\stpt\config.toml"
-            ))
+            client_dir_from(env(&[("APPDATA", r"C:\Users\a\AppData\Roaming")])),
+            Some(PathBuf::from(r"C:\Users\a\AppData\Roaming\stpt"))
         );
-        assert_eq!(client_path_from(env(&[("APPDATA", "")])), None);
+        assert_eq!(client_dir_from(env(&[("APPDATA", "")])), None);
     }
 
     #[cfg(unix)]
     #[test]
-    fn client_path_unix() {
-        let path = |vars| client_path_from(env(vars));
+    fn client_dir_unix() {
+        let path = |vars| client_dir_from(env(vars));
         assert_eq!(
             path(&[("HOME", "/home/a")]),
-            Some(PathBuf::from("/home/a/.config/stpt/config.toml"))
+            Some(PathBuf::from("/home/a/.config/stpt"))
         );
         assert_eq!(
             path(&[("HOME", "/home/a"), ("XDG_CONFIG_HOME", "/cfg")]),
-            Some(PathBuf::from("/cfg/stpt/config.toml"))
+            Some(PathBuf::from("/cfg/stpt"))
         );
         assert_eq!(
             path(&[("HOME", "/home/a"), ("XDG_CONFIG_HOME", "rel")]),
-            Some(PathBuf::from("/home/a/.config/stpt/config.toml"))
+            Some(PathBuf::from("/home/a/.config/stpt"))
         );
         assert_eq!(path(&[]), None);
     }

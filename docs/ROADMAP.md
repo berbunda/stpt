@@ -14,7 +14,7 @@ IDs A001–D008 were renamed to RA001–RD008 on 2026-10-11 (prefix scheme chang
 # 2	Tier RB — Transport
 - [x] RB001  QUIC transport ← PB001 ✅ 2026-10-17
 - [x] RB002  TLS 1.3 ← PB001 ✅ 2026-10-17
-- [ ] RB003  server identity ← PB005
+- [x] RB003  server identity ← PB005 ✅ 2026-10-17
 - [ ] RB004  client ↔ server handshake ← PB006
 - [ ] RB005  STPT protocol negotiation ← PB007
 - [ ] RB006  authentication ← PB008

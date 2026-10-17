@@ -3,10 +3,12 @@ mod client;
 mod config;
 mod destination;
 mod error;
+mod identity;
 mod logging;
 mod quic;
 mod server;
 mod tls;
+mod trust;
 
 use std::process::ExitCode;
 

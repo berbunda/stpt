@@ -2,9 +2,13 @@
 //! exits with [`Error::exit_code`]; command line errors are reported by clap (exit 2).
 
 use std::fmt;
+use std::io;
 
 use crate::config;
+use crate::destination::Address;
+use crate::identity::{self, Fingerprint};
 use crate::quic;
+use crate::trust;
 
 /// Exit code for STPT and Connection errors, as ssh.
 pub const EXIT_STPT_ERROR: u8 = 255;
@@ -17,16 +21,40 @@ pub enum Error {
     ServerUnavailable,
     /// Subcommand that is recognised but not implemented yet.
     NotImplemented(&'static str),
+    /// Key file of the Server Identity.
+    ServerKey(identity::KeyFileError),
+    /// Trust store file of the Client.
+    Trust(trust::Error),
+    /// No directory for the trust store: the user's directory is unknown.
+    NoTrustStore,
+    NoTrustEntry(Address),
+    Resolve {
+        address: Address,
+        source: io::Error,
+    },
+    /// First contact without a fingerprint, and no terminal to ask the user.
+    KeyNotKnown {
+        address: Address,
+        presented: Fingerprint,
+    },
+    /// First contact: the user did not confirm the key.
+    KeyNotTrusted(Address),
+    KeyChanged {
+        address: Address,
+        stored: Fingerprint,
+        presented: Fingerprint,
+    },
+    FingerprintMismatch {
+        address: Address,
+        expected: Fingerprint,
+        presented: Fingerprint,
+    },
+    Terminal(io::Error),
 }
 
 impl Error {
     pub fn exit_code(&self) -> u8 {
-        match self {
-            Self::Config(_)
-            | Self::Transport(_)
-            | Self::ServerUnavailable
-            | Self::NotImplemented(_) => EXIT_STPT_ERROR,
-        }
+        EXIT_STPT_ERROR
     }
 }
 
@@ -39,6 +67,49 @@ impl fmt::Display for Error {
                 f.write_str("server: Server mode is not available on this platform")
             }
             Self::NotImplemented(command) => write!(f, "{command}: not implemented yet"),
+            Self::ServerKey(e) => write!(f, "server key: {e}"),
+            Self::Trust(e) => write!(f, "trust store: {e}"),
+            Self::NoTrustStore => f.write_str(if cfg!(windows) {
+                "trust store: APPDATA is not set"
+            } else {
+                "trust store: neither XDG_CONFIG_HOME nor HOME is set"
+            }),
+            Self::NoTrustEntry(address) => write!(f, "trust store: no entry for {address}"),
+            Self::Resolve { address, source } => write!(f, "{}: {source}", address.host),
+            Self::KeyNotKnown { address, presented } => write!(
+                f,
+                "the key of the Server {address} is not known\n  \
+                 fingerprint: {presented}\n\
+                 Compare it in full with the output of `stpt server --fingerprint` on the \
+                 Server, then pass it with --fingerprint or confirm it in a terminal."
+            ),
+            Self::KeyNotTrusted(address) => {
+                write!(f, "the key of the Server {address} was not trusted")
+            }
+            Self::KeyChanged {
+                address,
+                stored,
+                presented,
+            } => write!(
+                f,
+                "the key of the Server {address} has changed\n  \
+                 stored:    {stored}\n  \
+                 presented: {presented}\n\
+                 Someone may be intercepting the Connection, or the Server has a new key.\n\
+                 Only if the Server administrator confirms the new key, remove the old one: \
+                 stpt trust remove {address}"
+            ),
+            Self::FingerprintMismatch {
+                address,
+                expected,
+                presented,
+            } => write!(
+                f,
+                "the key of the Server {address} does not match --fingerprint\n  \
+                 expected:  {expected}\n  \
+                 presented: {presented}"
+            ),
+            Self::Terminal(e) => write!(f, "terminal: {e}"),
         }
     }
 }
@@ -48,7 +119,11 @@ impl std::error::Error for Error {
         match self {
             Self::Config(e) => Some(e),
             Self::Transport(e) => Some(e),
-            Self::ServerUnavailable | Self::NotImplemented(_) => None,
+            Self::ServerKey(e) => Some(e),
+            Self::Trust(e) => Some(e),
+            Self::Resolve { source, .. } => Some(source),
+            Self::Terminal(e) => Some(e),
+            _ => None,
         }
     }
 }
@@ -65,6 +140,18 @@ impl From<quic::Error> for Error {
     }
 }
 
+impl From<identity::KeyFileError> for Error {
+    fn from(e: identity::KeyFileError) -> Self {
+        Self::ServerKey(e)
+    }
+}
+
+impl From<trust::Error> for Error {
+    fn from(e: trust::Error) -> Self {
+        Self::Trust(e)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,5 +165,22 @@ mod tests {
             Error::ServerUnavailable.to_string(),
             "server: Server mode is not available on this platform"
         );
+    }
+
+    #[test]
+    fn changed_key_shows_both_fingerprints_in_full() {
+        let a: Fingerprint = "SHA256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU"
+            .parse()
+            .unwrap();
+        let b = identity::ServerKey::generate().public_key().fingerprint();
+        let e = Error::KeyChanged {
+            address: "host".parse().unwrap(),
+            stored: a,
+            presented: b,
+        };
+        let text = e.to_string();
+        assert!(text.contains(&format!("stored:    {a}\n")), "{text}");
+        assert!(text.contains(&format!("presented: {b}\n")), "{text}");
+        assert!(text.ends_with("stpt trust remove host:843"), "{text}");
     }
 }

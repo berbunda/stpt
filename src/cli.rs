@@ -10,8 +10,9 @@ use std::process::ExitCode;
 use clap::error::ErrorKind;
 use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand};
 
-use crate::destination::Destination;
+use crate::destination::{Address, Destination};
 use crate::error::Error;
+use crate::identity::Fingerprint;
 use crate::{client, server};
 
 /// Secure terminal access over QUIC.
@@ -67,6 +68,10 @@ pub enum Command {
         /// Address and UDP port to listen on [default: all addresses, port 843]
         #[arg(long, value_name = "ADDR:PORT")]
         listen: Option<SocketAddr>,
+
+        /// Print the fingerprint of the Server key and exit; creates the key if missing
+        #[arg(long, conflicts_with = "listen")]
+        fingerprint: bool,
     },
 
     #[command(flatten)]
@@ -78,9 +83,8 @@ pub enum Command {
 pub enum ClientCommand {
     /// Open an interactive terminal in a new or an existing Session
     Connect {
-        /// Account on the Server and Server address [default port: 843]
-        #[arg(value_name = "ACCOUNT@HOST[:PORT]")]
-        destination: Destination,
+        #[command(flatten)]
+        remote: Remote,
 
         /// Attach to an existing Session instead of creating one
         #[arg(long, value_name = "SESSION")]
@@ -101,9 +105,8 @@ pub enum ClientCommand {
 
     /// Run a command in a new Session
     Exec {
-        /// Account on the Server and Server address [default port: 843]
-        #[arg(value_name = "ACCOUNT@HOST[:PORT]")]
-        destination: Destination,
+        #[command(flatten)]
+        remote: Remote,
 
         /// Run the command as an argument vector, without the Account's shell
         #[arg(long)]
@@ -116,16 +119,14 @@ pub enum ClientCommand {
 
     /// List the Sessions of the Account
     Sessions {
-        /// Account on the Server and Server address [default port: 843]
-        #[arg(value_name = "ACCOUNT@HOST[:PORT]")]
-        destination: Destination,
+        #[command(flatten)]
+        remote: Remote,
     },
 
     /// Detach Attachments of a Session
     Detach {
-        /// Account on the Server and Server address [default port: 843]
-        #[arg(value_name = "ACCOUNT@HOST[:PORT]")]
-        destination: Destination,
+        #[command(flatten)]
+        remote: Remote,
 
         /// Session ID, unique ID prefix or name
         #[arg(value_name = "SESSION")]
@@ -137,9 +138,8 @@ pub enum ClientCommand {
 
     /// Terminate a Session
     Terminate {
-        /// Account on the Server and Server address [default port: 843]
-        #[arg(value_name = "ACCOUNT@HOST[:PORT]")]
-        destination: Destination,
+        #[command(flatten)]
+        remote: Remote,
 
         /// Session ID, unique ID prefix or name
         #[arg(value_name = "SESSION")]
@@ -148,6 +148,37 @@ pub enum ClientCommand {
         /// Kill the processes at once, without the grace period
         #[arg(long)]
         force: bool,
+    },
+
+    /// Manage the trusted Server keys
+    Trust {
+        #[command(subcommand)]
+        action: TrustAction,
+    },
+}
+
+/// Server of a Client command and how its key is verified at first contact.
+#[derive(Debug, Args)]
+pub struct Remote {
+    /// Account on the Server and Server address [default port: 843]
+    #[arg(value_name = "ACCOUNT@HOST[:PORT]")]
+    pub destination: Destination,
+
+    /// Expected fingerprint of the Server key, obtained out of band
+    #[arg(long, value_name = "SHA256:...")]
+    pub fingerprint: Option<Fingerprint>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TrustAction {
+    /// List the trusted Server keys
+    List,
+
+    /// Remove the trusted key of a Server
+    Remove {
+        /// Server address [default port: 843]
+        #[arg(value_name = "HOST[:PORT]")]
+        address: Address,
     },
 }
 
@@ -165,7 +196,10 @@ pub struct DetachTarget {
 
 pub fn run(cli: Cli) -> Result<ExitCode, Error> {
     match cli.command {
-        Command::Server { listen } => server::run(listen, &cli.common),
+        Command::Server {
+            listen,
+            fingerprint,
+        } => server::run(listen, fingerprint, &cli.common),
         Command::Client(command) => client::run(command, &cli.common),
     }
 }
@@ -192,10 +226,20 @@ mod tests {
     #[test]
     fn server_listen() {
         let cli = parse(&["server", "--listen", "[::]:843"]).unwrap();
-        assert!(matches!(cli.command, Command::Server { listen: Some(a) } if a.port() == 843));
+        assert!(matches!(cli.command, Command::Server { listen: Some(a), .. } if a.port() == 843));
         assert!(matches!(
             parse(&["server"]).unwrap().command,
-            Command::Server { listen: None }
+            Command::Server {
+                listen: None,
+                fingerprint: false
+            }
+        ));
+        assert!(matches!(
+            parse(&["server", "--fingerprint"]).unwrap().command,
+            Command::Server {
+                fingerprint: true,
+                ..
+            }
         ));
     }
 
@@ -323,6 +367,43 @@ mod tests {
         assert_eq!(
             err_kind(&["detach", "alice@host", "work", "--all", "--id", "3"]),
             ErrorKind::ArgumentConflict
+        );
+    }
+
+    #[test]
+    fn fingerprint_option() {
+        let fp = "SHA256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU";
+        let cli = parse(&["connect", "alice@host", "--fingerprint", fp]).unwrap();
+        let Command::Client(ClientCommand::Connect { remote, .. }) = cli.command else {
+            panic!()
+        };
+        assert_eq!(remote.fingerprint.unwrap().to_string(), fp);
+        assert!(parse(&["exec", "alice@host", "--fingerprint", fp, "ls"]).is_ok());
+        assert_eq!(
+            err_kind(&["connect", "alice@host", "--fingerprint", "SHA256:47DEQpj8"]),
+            ErrorKind::ValueValidation
+        );
+    }
+
+    #[test]
+    fn trust_commands() {
+        assert!(matches!(
+            parse(&["trust", "list"]).unwrap().command,
+            Command::Client(ClientCommand::Trust {
+                action: TrustAction::List
+            })
+        ));
+        let cli = parse(&["trust", "remove", "Host.Example:900"]).unwrap();
+        let Command::Client(ClientCommand::Trust {
+            action: TrustAction::Remove { address },
+        }) = cli.command
+        else {
+            panic!()
+        };
+        assert_eq!(address.to_string(), "host.example:900");
+        assert_eq!(
+            err_kind(&["trust", "remove"]),
+            ErrorKind::MissingRequiredArgument
         );
     }
 

@@ -10,7 +10,8 @@ use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{Connection, Endpoint, EndpointConfig, Incoming, TransportConfig, VarInt};
 use socket2::{Domain, Protocol, Socket, Type};
 
-use crate::tls::{self, PublicKey, ServerKey};
+use crate::identity::ServerKey;
+use crate::tls::{self, ServerKeyCheck};
 
 /// QUIC version 1 (RFC 9000); no other version is offered or accepted.
 const QUIC_V1: u32 = 1;
@@ -20,6 +21,9 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The Client sends PING after this idle time, so an idle terminal keeps its Connection.
 pub const KEEP_ALIVE: Duration = Duration::from_secs(15);
+
+/// Error code of a regular close (§13.2).
+pub const NO_ERROR: VarInt = VarInt::from_u32(0);
 
 #[derive(Debug)]
 pub enum Error {
@@ -65,18 +69,29 @@ pub async fn accept(incoming: Incoming) -> Result<Connection, Error> {
     incoming.await.map_err(Error::Connection)
 }
 
-/// Connects to the Server at `addr`, which must present `expected`. `server_name` is
+/// Client Endpoint for Connections to `server`: the unspecified address of its
+/// family, port 0. Needs the runtime.
+pub fn client(server: SocketAddr) -> Result<Endpoint, Error> {
+    let local = match server {
+        SocketAddr::V4(_) => SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0),
+        SocketAddr::V6(_) => SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0),
+    };
+    endpoint(local, None)
+}
+
+/// Connects to the Server at `addr`; `check` decides on its key. `server_name` is
 /// the host as the user gave it: a DNS name is sent as SNI, an IP address is not (§6.4).
-#[cfg_attr(not(test), expect(dead_code, reason = "Client connects from RB003 on"))]
 pub async fn connect(
+    endpoint: &Endpoint,
     addr: SocketAddr,
     server_name: &str,
-    expected: PublicKey,
+    check: Arc<ServerKeyCheck>,
 ) -> Result<Connection, Error> {
-    connect_tls(addr, server_name, tls::client_config(expected)).await
+    connect_tls(endpoint, addr, server_name, tls::client_config(check)).await
 }
 
 async fn connect_tls(
+    endpoint: &Endpoint,
     addr: SocketAddr,
     server_name: &str,
     tls: rustls::ClientConfig,
@@ -87,12 +102,6 @@ async fn connect_tls(
     transport.keep_alive_interval(Some(KEEP_ALIVE));
     config.transport_config(Arc::new(transport));
     config.version(QUIC_V1);
-
-    let local = match addr {
-        SocketAddr::V4(_) => SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0),
-        SocketAddr::V6(_) => SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0),
-    };
-    let endpoint = endpoint(local, None)?;
     endpoint
         .connect_with(config, addr, server_name)
         .map_err(Error::Connect)?
@@ -138,8 +147,22 @@ fn bind(addr: SocketAddr) -> io::Result<UdpSocket> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::PublicKey;
+    use crate::tls::Expected;
     use quinn::crypto::rustls::HandshakeData;
     use std::future::Future;
+
+    fn trusting(key: PublicKey) -> Arc<ServerKeyCheck> {
+        ServerKeyCheck::new(Expected {
+            stored: Some(key),
+            fingerprint: None,
+        })
+    }
+
+    /// Connects from a new Client Endpoint to a Server expected to hold `key`.
+    async fn connect_to(addr: SocketAddr, name: &str, key: PublicKey) -> Result<Connection, Error> {
+        connect(&client(addr)?, addr, name, trusting(key)).await
+    }
 
     /// Runs `test` with a Server Endpoint on `addr` and its public key.
     fn with_server<F: Future<Output = ()>>(
@@ -177,7 +200,7 @@ mod tests {
         with_server("127.0.0.1:0", |server, key| async move {
             let addr = SocketAddr::from(([127, 0, 0, 1], port(&server)));
             let (client, accepted) =
-                tokio::join!(connect(addr, "localhost", key), accept_one(&server));
+                tokio::join!(connect_to(addr, "localhost", key), accept_one(&server));
             let (client, accepted) = (client.unwrap(), accepted.unwrap());
 
             assert_eq!(handshake(&client).protocol.as_deref(), Some(tls::ALPN));
@@ -209,7 +232,7 @@ mod tests {
         with_server("127.0.0.1:0", |server, key| async move {
             let addr = SocketAddr::from(([127, 0, 0, 1], port(&server)));
             let (_client, accepted) =
-                tokio::join!(connect(addr, "127.0.0.1", key), accept_one(&server));
+                tokio::join!(connect_to(addr, "127.0.0.1", key), accept_one(&server));
             assert_eq!(handshake(&accepted.unwrap()).server_name, None);
         });
     }
@@ -219,7 +242,7 @@ mod tests {
         with_server("[::]:0", |server, key| async move {
             let addr = SocketAddr::from(([127, 0, 0, 1], port(&server)));
             let (client, accepted) =
-                tokio::join!(connect(addr, "127.0.0.1", key), accept_one(&server));
+                tokio::join!(connect_to(addr, "127.0.0.1", key), accept_one(&server));
             client.unwrap();
             accepted.unwrap();
         });
@@ -231,7 +254,7 @@ mod tests {
             let addr = SocketAddr::from(([127, 0, 0, 1], port(&server)));
             let other = ServerKey::generate().public_key();
             let (client, accepted) =
-                tokio::join!(connect(addr, "localhost", other), accept_one(&server));
+                tokio::join!(connect_to(addr, "localhost", other), accept_one(&server));
             assert!(matches!(client, Err(Error::Connection(_))));
             assert!(accepted.is_err());
         });
@@ -241,10 +264,13 @@ mod tests {
     fn client_without_alpn_is_rejected() {
         with_server("127.0.0.1:0", |server, key| async move {
             let addr = SocketAddr::from(([127, 0, 0, 1], port(&server)));
-            let mut tls = tls::client_config(key);
+            let mut tls = tls::client_config(trusting(key));
             tls.alpn_protocols.clear();
-            let (client, accepted) =
-                tokio::join!(connect_tls(addr, "localhost", tls), accept_one(&server));
+            let endpoint = client(addr).unwrap();
+            let (client, accepted) = tokio::join!(
+                connect_tls(&endpoint, addr, "localhost", tls),
+                accept_one(&server)
+            );
             assert!(client.is_err(), "{client:?}");
             assert!(accepted.is_err(), "{accepted:?}");
         });

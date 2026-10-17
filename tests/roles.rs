@@ -2,12 +2,12 @@
 
 mod common;
 
-use common::{config_file, stderr, stpt};
+use common::{stderr, stpt};
 
 #[cfg(unix)]
 #[test]
 fn server_role() {
-    let config = config_file("roles-server", "");
+    let config = common::server_config("roles-server", "");
     let lines = common::server_until_listening(&["--listen", "127.0.0.1:0", "--config", &config]);
     let last = lines.last().expect("Server logs");
     assert!(last.contains("listening listen=127.0.0.1:"), "{lines:?}");
@@ -16,7 +16,7 @@ fn server_role() {
 #[cfg(windows)]
 #[test]
 fn server_role() {
-    let config = config_file("roles-server", "");
+    let config = common::config_file("roles-server", "");
     let out = stpt(&["server", "--listen", "127.0.0.1:0", "--config", &config]);
     assert_eq!(out.status.code(), Some(255));
     assert_eq!(
@@ -27,9 +27,8 @@ fn server_role() {
 
 #[test]
 fn client_role() {
-    let out = stpt(&["connect", "alice@host"]);
-    assert_eq!(out.status.code(), Some(255));
-    assert_eq!(stderr(&out), "stpt: connect: not implemented yet");
+    let out = stpt(&["trust", "list"]);
+    assert!(out.status.success(), "{}", stderr(&out));
 }
 
 #[test]

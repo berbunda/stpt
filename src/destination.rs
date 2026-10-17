@@ -1,7 +1,7 @@
-//! Destination of a Connection: `account@host[:port]`.
+//! Destination of a Connection: `account@host[:port]`; Server address: `host[:port]`.
 
 use std::fmt;
-use std::net::Ipv6Addr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::str::FromStr;
 
 /// Default STPT port (PROTOCOL.md §6.6).
@@ -13,7 +13,14 @@ const MAX_ACCOUNT_LEN: usize = 256;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Destination {
     pub account: String,
-    /// DNS name or IP address as given by the user, without brackets.
+    pub address: Address,
+}
+
+/// Server address. The host is a DNS name or an IP address as the user gave it,
+/// normalized so that equal addresses compare equal: DNS names in lower case,
+/// IP addresses in canonical form, IPv6 without brackets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Address {
     pub host: String,
     pub port: u16,
 }
@@ -24,6 +31,7 @@ pub enum ParseError {
     AccountTooLong,
     AccountControlChar,
     MissingHost,
+    InvalidHost,
     UnclosedBracket,
     InvalidIpv6,
     UnbracketedIpv6,
@@ -37,9 +45,10 @@ impl fmt::Display for ParseError {
             Self::AccountTooLong => "account name is longer than 256 bytes",
             Self::AccountControlChar => "account name contains a control character",
             Self::MissingHost => "host is empty",
+            Self::InvalidHost => "host contains a space, a control character or a bracket",
             Self::UnclosedBracket => "IPv6 address is missing its closing bracket",
             Self::InvalidIpv6 => "invalid IPv6 address in brackets",
-            Self::UnbracketedIpv6 => "IPv6 address must be in brackets: account@[addr]:port",
+            Self::UnbracketedIpv6 => "IPv6 address must be in brackets: [addr]:port",
             Self::InvalidPort => "port must be a number from 1 to 65535",
         })
     }
@@ -63,24 +72,46 @@ impl FromStr for Destination {
         if account.chars().any(char::is_control) {
             return Err(ParseError::AccountControlChar);
         }
+        Ok(Self {
+            account: account.to_owned(),
+            address: rest.parse()?,
+        })
+    }
+}
 
-        let (host, port) = if let Some(bracketed) = rest.strip_prefix('[') {
+impl FromStr for Address {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (host, port) = if let Some(bracketed) = s.strip_prefix('[') {
             let (addr, after) = bracketed
                 .split_once(']')
                 .ok_or(ParseError::UnclosedBracket)?;
-            addr.parse::<Ipv6Addr>()
+            let addr = addr
+                .parse::<Ipv6Addr>()
                 .map_err(|_| ParseError::InvalidIpv6)?;
             let port = match after {
                 "" => None,
                 _ => Some(after.strip_prefix(':').ok_or(ParseError::InvalidPort)?),
             };
-            (addr, port)
+            (addr.to_string(), port)
         } else {
-            match rest.split_once(':') {
+            let (host, port) = match s.split_once(':') {
                 Some((_, p)) if p.contains(':') => return Err(ParseError::UnbracketedIpv6),
                 Some((h, p)) => (h, Some(p)),
-                None => (rest, None),
+                None => (s, None),
+            };
+            if host
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control() || c == '[' || c == ']')
+            {
+                return Err(ParseError::InvalidHost);
             }
+            let host = match host.parse::<IpAddr>() {
+                Ok(ip) => ip.to_string(),
+                Err(_) => host.to_lowercase(),
+            };
+            (host, port)
         };
 
         if host.is_empty() {
@@ -93,22 +124,23 @@ impl FromStr for Destination {
                 _ => return Err(ParseError::InvalidPort),
             },
         };
+        Ok(Self { host, port })
+    }
+}
 
-        Ok(Self {
-            account: account.to_owned(),
-            host: host.to_owned(),
-            port,
-        })
+impl fmt::Display for Address {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.host.contains(':') {
+            write!(f, "[{}]:{}", self.host, self.port)
+        } else {
+            write!(f, "{}:{}", self.host, self.port)
+        }
     }
 }
 
 impl fmt::Display for Destination {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.host.contains(':') {
-            write!(f, "{}@[{}]:{}", self.account, self.host, self.port)
-        } else {
-            write!(f, "{}@{}:{}", self.account, self.host, self.port)
-        }
+        write!(f, "{}@{}", self.account, self.address)
     }
 }
 
@@ -119,8 +151,10 @@ mod tests {
     fn dest(account: &str, host: &str, port: u16) -> Destination {
         Destination {
             account: account.into(),
-            host: host.into(),
-            port,
+            address: Address {
+                host: host.into(),
+                port,
+            },
         }
     }
 
@@ -161,6 +195,15 @@ mod tests {
     }
 
     #[test]
+    fn address_is_normalized() {
+        let address = |s: &str| s.parse::<Address>().unwrap().to_string();
+        assert_eq!(address("Server.Example.ORG"), "server.example.org:843");
+        assert_eq!(address("[0:0:0::1]:900"), "[::1]:900");
+        assert_eq!(address("[FE80::A]"), "[fe80::a]:843");
+        assert_eq!(address("192.168.0.1:22"), "192.168.0.1:22");
+    }
+
+    #[test]
     fn errors() {
         let cases = [
             ("host", ParseError::MissingAccount),
@@ -174,6 +217,9 @@ mod tests {
             ("alice@host:0", ParseError::InvalidPort),
             ("alice@host:65536", ParseError::InvalidPort),
             ("alice@host:", ParseError::InvalidPort),
+            ("alice@ho st", ParseError::InvalidHost),
+            ("alice@ho\tst", ParseError::InvalidHost),
+            ("alice@host]", ParseError::InvalidHost),
             ("al\nice@host", ParseError::AccountControlChar),
         ];
         for (input, err) in cases {

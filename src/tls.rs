@@ -3,27 +3,25 @@
 //! The Server authenticates with an Ed25519 Raw Public Key (RFC 7250); there are no
 //! X.509 certificates, no client certificates, no 0-RTT and no session resumption.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use aws_lc_rs::rand::SystemRandom;
-use aws_lc_rs::signature::Ed25519KeyPair;
 use rustls::client::Resumption;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{CryptoProvider, aws_lc_rs as provider};
-use rustls::pki_types::{
-    CertificateDer, PrivatePkcs8KeyDer, ServerName, SubjectPublicKeyInfoDer, UnixTime,
-};
+use rustls::pki_types::{CertificateDer, ServerName, SubjectPublicKeyInfoDer, UnixTime};
 use rustls::server::{
     AlwaysResolvesServerRawPublicKeys, ClientHello, NoServerSessionStorage, ResolvesServerCert,
 };
 use rustls::sign::CertifiedKey;
 use rustls::{ClientConfig, DigitallySignedStruct, NamedGroup, ServerConfig, SignatureScheme};
 
+use crate::identity::{Fingerprint, PublicKey, ServerKey};
+
 /// ALPN token (§6.3).
 pub const ALPN: &[u8] = b"stpt";
 
 /// Cipher suites and key exchange groups of §6.2, in order of preference.
-fn crypto_provider() -> Arc<CryptoProvider> {
+pub(crate) fn crypto_provider() -> Arc<CryptoProvider> {
     use provider::{cipher_suite, kx_group};
     Arc::new(CryptoProvider {
         cipher_suites: vec![
@@ -36,37 +34,6 @@ fn crypto_provider() -> Arc<CryptoProvider> {
     })
 }
 
-/// Public key of a Server Identity: DER-encoded SubjectPublicKeyInfo.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PublicKey(Vec<u8>);
-
-/// Key pair of a Server Identity (§9.1). Persistent storage comes with RB003.
-pub struct ServerKey {
-    certified: Arc<CertifiedKey>,
-}
-
-impl ServerKey {
-    /// Generates a new Ed25519 key pair.
-    pub fn generate() -> Self {
-        let pkcs8 =
-            Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).expect("Ed25519 key generation");
-        let signing = crypto_provider()
-            .key_provider
-            .load_private_key(PrivatePkcs8KeyDer::from(pkcs8.as_ref().to_vec()).into())
-            .expect("generated Ed25519 key is valid");
-        let spki = signing.public_key().expect("Ed25519 key has a public key");
-        let certified = CertifiedKey::new(vec![CertificateDer::from(spki.to_vec())], signing);
-        Self {
-            certified: Arc::new(certified),
-        }
-    }
-
-    #[cfg_attr(not(test), expect(dead_code, reason = "Client connects from RB003 on"))]
-    pub fn public_key(&self) -> PublicKey {
-        PublicKey(self.certified.end_entity_cert().expect("one key").to_vec())
-    }
-}
-
 /// TLS configuration of the Server.
 pub fn server_config(key: &ServerKey) -> ServerConfig {
     let mut config = ServerConfig::builder_with_provider(crypto_provider())
@@ -74,7 +41,7 @@ pub fn server_config(key: &ServerKey) -> ServerConfig {
         .expect("provider supports TLS 1.3")
         .with_no_client_auth()
         .with_cert_resolver(Arc::new(ServerIdentity(
-            AlwaysResolvesServerRawPublicKeys::new(key.certified.clone()),
+            AlwaysResolvesServerRawPublicKeys::new(key.certified()),
         )));
     config.alpn_protocols = vec![ALPN.to_vec()];
     config.max_early_data_size = 0;
@@ -117,17 +84,17 @@ fn hybrid_selected(client_groups: &[NamedGroup]) -> bool {
     }
 }
 
-/// TLS configuration of the Client; the Server must present `expected`.
-pub fn client_config(expected: PublicKey) -> ClientConfig {
-    client_config_with(crypto_provider(), expected)
+/// TLS configuration of the Client; `check` decides whether the Server key is trusted.
+pub fn client_config(check: Arc<ServerKeyCheck>) -> ClientConfig {
+    client_config_with(crypto_provider(), check)
 }
 
-fn client_config_with(provider: Arc<CryptoProvider>, expected: PublicKey) -> ClientConfig {
+fn client_config_with(provider: Arc<CryptoProvider>, check: Arc<ServerKeyCheck>) -> ClientConfig {
     let mut config = ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .expect("provider supports TLS 1.3")
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(ExpectedKey(expected)))
+        .with_custom_certificate_verifier(check)
         .with_no_client_auth();
     config.alpn_protocols = vec![ALPN.to_vec()];
     config.resumption = Resumption::disabled();
@@ -135,11 +102,71 @@ fn client_config_with(provider: Arc<CryptoProvider>, expected: PublicKey) -> Cli
     config
 }
 
-/// Accepts only the Raw Public Key it was given (§9.1); the trust store is RB003.
-#[derive(Debug)]
-struct ExpectedKey(PublicKey);
+/// What the Client knows of the Server key before the handshake (§9.3).
+#[derive(Debug, Clone, Default)]
+pub struct Expected {
+    /// Key of the trust store entry for the Server address.
+    pub stored: Option<PublicKey>,
+    /// Fingerprint supplied out of band.
+    pub fingerprint: Option<Fingerprint>,
+}
 
-impl ServerCertVerifier for ExpectedKey {
+/// Decision on the key the Server presented.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    /// Equal to the stored key and to the given fingerprint, whichever are known.
+    Trusted,
+    /// No stored key and no fingerprint: first contact, the user decides.
+    Unknown,
+    /// Differs from the stored key.
+    Changed { stored: PublicKey },
+    /// Does not match the given fingerprint.
+    Mismatch { expected: Fingerprint },
+}
+
+/// Verifies the Server key (§9.1, §9.3): only Raw Public Keys, signature scheme
+/// Ed25519. The handshake goes on only if the key is trusted; otherwise it is aborted
+/// and [`ServerKeyCheck::outcome`] tells why, so the Client can report it.
+#[derive(Debug)]
+pub struct ServerKeyCheck {
+    expected: Expected,
+    outcome: Mutex<Option<(PublicKey, Verdict)>>,
+}
+
+impl ServerKeyCheck {
+    pub fn new(expected: Expected) -> Arc<Self> {
+        Arc::new(Self {
+            expected,
+            outcome: Mutex::new(None),
+        })
+    }
+
+    /// The presented key and the verdict on it; `None` before the Server presented one.
+    pub fn outcome(&self) -> Option<(PublicKey, Verdict)> {
+        self.outcome.lock().expect("not poisoned").clone()
+    }
+
+    fn verdict(&self, presented: &PublicKey) -> Verdict {
+        if let Some(stored) = &self.expected.stored
+            && stored != presented
+        {
+            return Verdict::Changed {
+                stored: stored.clone(),
+            };
+        }
+        if let Some(expected) = self.expected.fingerprint
+            && expected != presented.fingerprint()
+        {
+            return Verdict::Mismatch { expected };
+        }
+        if self.expected.stored.is_none() && self.expected.fingerprint.is_none() {
+            return Verdict::Unknown;
+        }
+        Verdict::Trusted
+    }
+}
+
+impl ServerCertVerifier for ServerKeyCheck {
     fn verify_server_cert(
         &self,
         end_entity: &CertificateDer<'_>,
@@ -148,12 +175,22 @@ impl ServerCertVerifier for ExpectedKey {
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        if intermediates.is_empty() && end_entity.as_ref() == self.0.0 {
-            Ok(ServerCertVerified::assertion())
-        } else {
+        let rejected = || {
             Err(rustls::Error::InvalidCertificate(
                 rustls::CertificateError::UnknownIssuer,
             ))
+        };
+        if !intermediates.is_empty() {
+            return rejected();
+        }
+        let presented = PublicKey::from_spki(end_entity.as_ref());
+        let verdict = self.verdict(&presented);
+        let trusted = verdict == Verdict::Trusted;
+        *self.outcome.lock().expect("not poisoned") = Some((presented, verdict));
+        if trusted {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            rejected()
         }
     }
 
@@ -201,6 +238,63 @@ mod tests {
     use super::*;
     use rustls::{ClientConnection, ServerConnection};
 
+    fn trusting(key: PublicKey) -> Arc<ServerKeyCheck> {
+        ServerKeyCheck::new(Expected {
+            stored: Some(key),
+            fingerprint: None,
+        })
+    }
+
+    /// Handshake with a Client expecting `expected`; returns the outcome of its check.
+    fn check(expected: Expected, key: &ServerKey) -> (bool, Option<(PublicKey, Verdict)>) {
+        let check = ServerKeyCheck::new(expected);
+        let ok = handshake(client_config(check.clone()), server_config(key)).is_ok();
+        (ok, check.outcome())
+    }
+
+    #[test]
+    fn verdicts() {
+        let key = ServerKey::generate();
+        let presented = key.public_key();
+        let other = ServerKey::generate().public_key();
+        let verdict = |stored: Option<&PublicKey>, fingerprint: Option<Fingerprint>| {
+            let expected = Expected {
+                stored: stored.cloned(),
+                fingerprint,
+            };
+            let (ok, outcome) = check(expected, &key);
+            let (seen, verdict) = outcome.unwrap();
+            assert_eq!(seen, presented);
+            assert_eq!(ok, verdict == Verdict::Trusted);
+            verdict
+        };
+        let fp = Some(presented.fingerprint());
+        let other_fp = Some(other.fingerprint());
+
+        assert_eq!(verdict(None, None), Verdict::Unknown);
+        assert_eq!(verdict(Some(&presented), None), Verdict::Trusted);
+        assert_eq!(verdict(None, fp), Verdict::Trusted);
+        assert_eq!(verdict(Some(&presented), fp), Verdict::Trusted);
+        assert_eq!(
+            verdict(Some(&other), None),
+            Verdict::Changed {
+                stored: other.clone()
+            }
+        );
+        assert_eq!(
+            verdict(None, other_fp),
+            Verdict::Mismatch {
+                expected: other.fingerprint()
+            }
+        );
+        // A changed key is reported as such even with a matching fingerprint.
+        assert!(matches!(verdict(Some(&other), fp), Verdict::Changed { .. }));
+        assert!(matches!(
+            verdict(Some(&presented), other_fp),
+            Verdict::Mismatch { .. }
+        ));
+    }
+
     /// Runs a TLS handshake in memory (TLS over TCP framing, same configuration).
     fn handshake(
         client: ClientConfig,
@@ -228,7 +322,11 @@ mod tests {
     #[test]
     fn profile() {
         let key = ServerKey::generate();
-        let (c, s) = handshake(client_config(key.public_key()), server_config(&key)).unwrap();
+        let (c, s) = handshake(
+            client_config(trusting(key.public_key())),
+            server_config(&key),
+        )
+        .unwrap();
         assert_eq!(c.protocol_version(), Some(rustls::ProtocolVersion::TLSv1_3));
         assert_eq!(c.alpn_protocol(), Some(ALPN));
         assert_eq!(s.alpn_protocol(), Some(ALPN));
@@ -259,7 +357,7 @@ mod tests {
             kx_groups: groups,
             ..(*crypto_provider()).clone()
         };
-        let client = client_config_with(Arc::new(provider), key.public_key());
+        let client = client_config_with(Arc::new(provider), trusting(key.public_key()));
         assert!(handshake(client, server_config(&key)).is_err());
     }
 
@@ -270,7 +368,7 @@ mod tests {
             kx_groups: vec![provider::kx_group::X25519],
             ..(*crypto_provider()).clone()
         };
-        let client = client_config_with(Arc::new(provider), key.public_key());
+        let client = client_config_with(Arc::new(provider), trusting(key.public_key()));
         let (c, _) = handshake(client, server_config(&key)).unwrap();
         let group = c.negotiated_key_exchange_group().unwrap().name();
         assert_eq!(group, NamedGroup::X25519);
@@ -281,7 +379,11 @@ mod tests {
         let key = ServerKey::generate();
         let other = ServerKey::generate();
         assert_ne!(key.public_key(), other.public_key());
-        let err = handshake(client_config(other.public_key()), server_config(&key)).unwrap_err();
+        let err = handshake(
+            client_config(trusting(other.public_key())),
+            server_config(&key),
+        )
+        .unwrap_err();
         assert!(
             matches!(err, rustls::Error::InvalidCertificate(_)),
             "{err:?}"
@@ -291,7 +393,7 @@ mod tests {
     #[test]
     fn other_alpn_is_rejected() {
         let key = ServerKey::generate();
-        let mut client = client_config(key.public_key());
+        let mut client = client_config(trusting(key.public_key()));
         client.alpn_protocols = vec![b"h3".to_vec()];
         let err = handshake(client, server_config(&key)).unwrap_err();
         assert_eq!(err, rustls::Error::NoApplicationProtocol);

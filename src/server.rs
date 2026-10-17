@@ -10,9 +10,9 @@ use crate::cli::Common;
 use crate::config::{self, ServerConfig};
 use crate::destination::DEFAULT_PORT;
 use crate::error::Error;
+use crate::identity::{self, ServerKey};
 use crate::logging::{self, Role};
 use crate::quic;
-use crate::tls::ServerKey;
 
 /// Server mode needs a Unix PTY; Windows Server mode (ConPTY) comes with RC008 (gate G2).
 pub const AVAILABLE: bool = cfg!(unix);
@@ -21,7 +21,12 @@ pub const AVAILABLE: bool = cfg!(unix);
 pub const DEFAULT_LISTEN: SocketAddr =
     SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), DEFAULT_PORT);
 
-pub fn run(listen: Option<SocketAddr>, common: &Common) -> Result<ExitCode, Error> {
+/// Runs the Server; with `print_fingerprint` only prints the fingerprint of its key.
+pub fn run(
+    listen: Option<SocketAddr>,
+    print_fingerprint: bool,
+    common: &Common,
+) -> Result<ExitCode, Error> {
     if !AVAILABLE {
         return Err(Error::ServerUnavailable);
     }
@@ -35,10 +40,13 @@ pub fn run(listen: Option<SocketAddr>, common: &Common) -> Result<ExitCode, Erro
     );
     config::log_source(path.as_deref());
 
+    let key = server_key(&config)?;
+    if print_fingerprint {
+        println!("{}", key.public_key().fingerprint());
+        return Ok(ExitCode::SUCCESS);
+    }
+
     let listen = listen_address(listen, &config);
-    // A persistent Server Identity comes with RB003.
-    let key = ServerKey::generate();
-    tracing::warn!("temporary Server key, replaced at every start");
     quic::runtime()?.block_on(async {
         let endpoint = quic::listen(listen, &key)?;
         let local = endpoint.local_addr().map_err(|source| quic::Error::Bind {
@@ -69,6 +77,22 @@ async fn connection(incoming: Incoming) {
         }
         Err(error) => tracing::info!(%remote, ?error, "handshake failed"),
     }
+}
+
+/// Loads the Server Identity key, creating it at the first start (§9.1).
+fn server_key(config: &ServerConfig) -> Result<ServerKey, Error> {
+    let path = config
+        .identity_key
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(identity::SERVER_KEY_PATH));
+    let (key, created) = ServerKey::load_or_create(&path)?;
+    let fingerprint = key.public_key().fingerprint();
+    if created {
+        tracing::info!(path = %path.display(), %fingerprint, "Server key created");
+    } else {
+        tracing::info!(path = %path.display(), %fingerprint, "Server key");
+    }
+    Ok(key)
 }
 
 /// `--listen`, else the configuration, else [`DEFAULT_LISTEN`].

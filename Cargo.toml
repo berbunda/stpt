@@ -1,11 +1,12 @@
 [package]
 name = "stpt"
-version = "0.1.5-0"
+version = "0.1.6-0"
 edition = "2024"
 rust-version = "1.99"
 
 [dependencies]
 aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys"] }
+base64 = { version = "0.23.1", default-features = false, features = ["std"] }
 clap = { version = "4.6", features = ["derive"] }
 quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
 rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "std"] }
