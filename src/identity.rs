@@ -26,6 +26,10 @@ impl PublicKey {
         Self(der.to_vec())
     }
 
+    pub fn as_spki(&self) -> &[u8] {
+        &self.0
+    }
+
     /// SHA-256 over the SubjectPublicKeyInfo (§9.2).
     pub fn fingerprint(&self) -> Fingerprint {
         let hash = digest(&SHA256, &self.0);
@@ -178,8 +182,17 @@ fn generate_pkcs8() -> PrivatePkcs8KeyDer<'static> {
     PrivatePkcs8KeyDer::from(pkcs8.as_ref().to_vec())
 }
 
-/// Reads a PEM PKCS#8 key file; on Unix it must not be accessible by group or others.
 fn load(path: &Path) -> Result<ServerKey, KeyFileError> {
+    let der = read_private_key(path)?;
+    ServerKey::from_pkcs8(der).map_err(|reason| KeyFileError::Format {
+        path: path.to_owned(),
+        reason,
+    })
+}
+
+/// Reads a PEM PKCS#8 private key file (Server or user key); on Unix it must not be
+/// accessible by group or others.
+pub fn read_private_key(path: &Path) -> Result<PrivatePkcs8KeyDer<'static>, KeyFileError> {
     let io_error = |source| KeyFileError::Io {
         path: path.to_owned(),
         source,
@@ -188,13 +201,10 @@ fn load(path: &Path) -> Result<ServerKey, KeyFileError> {
     check_permissions(&file, path)?;
     let mut pem = Vec::new();
     file.read_to_end(&mut pem).map_err(io_error)?;
-    let format = |reason| KeyFileError::Format {
+    PrivatePkcs8KeyDer::from_pem_slice(&pem).map_err(|e| KeyFileError::Format {
         path: path.to_owned(),
-        reason,
-    };
-    let der = PrivatePkcs8KeyDer::from_pem_slice(&pem)
-        .map_err(|e| format(format!("expected a PEM PKCS#8 private key: {e}")))?;
-    ServerKey::from_pkcs8(der).map_err(format)
+        reason: format!("expected a PEM PKCS#8 private key: {e}"),
+    })
 }
 
 #[cfg(unix)]

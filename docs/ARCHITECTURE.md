@@ -13,6 +13,8 @@ Single Cargo package `stpt` (binary crate, edition 2024). Minimum Rust version (
 | `src/server.rs` | Server role: `stpt server` |
 | `src/config.rs` | configuration files of both roles |
 | `src/destination.rs` | parsing of `account@host[:port]` and `host[:port]` |
+| `src/auth.rs` | user authentication messages, channel binding, user key |
+| `src/authorized.rs` | authorized keys of the Accounts, uniform Server decision |
 | `src/cbor.rs` | strict CBOR codec of the STPT subset |
 | `src/error.rs` | error type ending the program, exit codes |
 | `src/hello.rs` | HELLO messages, version selection, capabilities, limits, GREASE |
@@ -25,8 +27,8 @@ Single Cargo package `stpt` (binary crate, edition 2024). Minimum Rust version (
 
 # 2	Command line
 - One binary, one explicit subcommand per operation: `server`, `connect`, `exec`, `sessions`, `detach`, `terminate`, `trust list`, `trust remove`.
-- `server` accepts Connections (§6); `server --fingerprint` prints the fingerprint of the Server key and exits (§7). The Client commands with a destination establish a Connection, verify the Server key (§7) and exchange HELLO (§8), then close it regularly and print `not implemented yet`. `trust` manages the trust store.
-- The destination and `--fingerprint SHA256:...` form `cli::Remote`, flattened into every Client command with a destination.
+- `server` accepts Connections (§6); `server --fingerprint` prints the fingerprint of the Server key and exits (§7). The Client commands with a destination load the user key, establish a Connection, verify the Server key (§7), exchange HELLO (§8) and authenticate (§9), then close it regularly and print `not implemented yet`. `trust` manages the trust store.
+- The destination, `--fingerprint SHA256:...` and `-i/--identity PATH` (user key) form `cli::Remote`, flattened into every Client command with a destination.
 - Destination `account@host[:port]`: the last `@` separates the Account (so `user@domain` Accounts work), IPv6 addresses go in brackets, the default port is 843, the Account name is at most 256 bytes (PROTOCOL.md §13.4).
 - Server address (`destination::Address`, also `trust remove HOST[:PORT]`): normalized at parsing, so equal addresses compare equal: DNS names in lower case, IP addresses in canonical form (`[0::1]` = `[::1]`). A host with a space, control character or bracket is refused, so it cannot break a trust store line.
 - Session arguments are kept as text (ID, unique ID prefix or name); resolution through the Session list comes with RD004.
@@ -46,7 +48,7 @@ Single Cargo package `stpt` (binary crate, edition 2024). Minimum Rust version (
 - Precedence: command line, then file, then built-in default.
 - The Client has no keys yet (first: RD009). A key is added with the item that uses it. The Client configuration directory also holds the trust store `known_servers` (§7); `config::client_dir` gives the directory.
 - The Server checks platform availability (G2) before it reads its configuration.
-- Keys: Server `listen`, `log_level`, `identity_key` (Server key file, default `/etc/stpt/server_key`).
+- Keys: Server `listen`, `log_level`, `identity_key` (Server key file, default `/etc/stpt/server_key`), `authorized_keys` (directory, default `/etc/stpt/authorized_keys`). The Client's default user key is `id_ed25519` in its configuration directory.
 
 # 5	Errors and logging
 - A role returns `Result<ExitCode, error::Error>`. `main` prints an error once as `stpt: <error>` on standard error and exits with `Error::exit_code` (now always 255). Command line errors are clap's (exit 2). Lower modules have their own error types (`config::Error`, `quic::Error`, `identity::KeyFileError`, `trust::Error`), converted with `From`. Errors of the Server key check are multi-line (§7). A protocol failure found by the Client (`wire::Failure`: code and local reason) is `Error::Protocol`, printed as `stpt: protocol: <reason> (<CODE>)`; a close by the Server is a transport error printed with the code name (`stpt: transport: closed by the peer: VERSION_NEGOTIATION_FAILED`).
@@ -96,11 +98,23 @@ PROTOCOL.md §7, §8.1, §10, §11, §13.
 - `wire::Failure` (error code and reason) is a locally found reason to close; the peer gets only the code with an empty reason phrase (PROTOCOL.md §13.1), the reason goes to the Server log or the Client's error message. `wire::Code` holds the codes of §13.2 and their names.
 - HELLO (`hello`): wire version 0xFF000001 only. The Client offers it plus one random GREASE version (0x?A?A?A?A, repeated digit) and one random GREASE capability with parameter null; no capabilities are defined yet, so the Server selects none. Limits are sent only when they differ from the default. The Server selects the highest common final version, else the highest common draft version, never GREASE; none: VERSION_NEGOTIATION_FAILED. SERVER_HELLO lists method 1 (`publickey-ed25519`).
 - Validation: CLIENT_HELLO needs a non-empty list of uint versions; capabilities a map with uint ids; limits a map with integer keys and a message size of at least 65535. The Client checks SERVER_HELLO: a version it offered and not GREASE, only capabilities it offered and not GREASE, a non-empty list of methods. Every violation is PROTOCOL_VIOLATION.
-- Server sequence (`server::serve_connection`): accept the control stream and read CLIENT_HELLO within 10 s (TIMEOUT); the first message must be CLIENT_HELLO; answer SERVER_HELLO; Established. Until user authentication (RB006) every further message is refused (a second CLIENT_HELLO or any other type: PROTOCOL_VIOLATION), the end or a reset of the control stream is PROTOCOL_VIOLATION, and the authentication deadline (60 s) closes with TIMEOUT. Deadlines are `server::Deadlines` (shorter in tests).
-- Client sequence (`client::Connection::hello`): open the control stream, send CLIENT_HELLO, read SERVER_HELLO within 10 s (TIMEOUT, PROTOCOL.md §13.3), check it. The Client keeps both directions of the control stream until it closes the Connection: dropping a quinn stream sends FIN, which the Server would treat as a violation.
+- Server sequence (`server::serve_connection`): accept the control stream and read CLIENT_HELLO within 10 s (TIMEOUT); the first message must be CLIENT_HELLO; answer SERVER_HELLO; Established; then user authentication (§9). The end or a reset of the control stream is PROTOCOL_VIOLATION at any time. Deadlines are `server::Deadlines` (shorter in tests). An internal `End` (Connection lost, or a `Failure` the Server closes with) lets every step use `?`.
+- Client sequence (`client::Connection::hello`): open the control stream, send CLIENT_HELLO, read SERVER_HELLO within 10 s (TIMEOUT, PROTOCOL.md §13.3), check it, including that method 1 is offered. The Client keeps both directions of the control stream until it closes the Connection: dropping a quinn stream sends FIN, which the Server would treat as a violation. A failed step (`Connection::failed`) closes with the code of the failure.
 - Not yet (RB007): the control stream after authentication, message dispatch by Connection state, stream priority.
 
-# 9	Dependencies
+# 9	User authentication
+PROTOCOL.md §12, §13.3, §13.4.
+
+- User key (`auth::UserKey`): Ed25519, PEM PKCS#8 as `openssl genpkey -algorithm ed25519` writes it (v1 and v2 accepted), read by `identity::read_private_key` with the same owner-only check on Unix as the Server key. Default `id_ed25519` in the Client configuration directory, `-i/--identity PATH` for another file. It is loaded before the Client connects; a missing file ends with the openssl command that creates it (`&& chmod 600` on Unix). `stpt keygen` comes with RI001.
+- AUTH_REQUEST (`auth`): method 1, Account (at most 256 bytes, else LIMIT_EXCEEDED), raw 32-byte key, 64-byte signature over the deterministic CBOR of `["STPT user authentication", exporter, method, Account, key]`. The exporter value is the TLS exporter of the Connection (`quinn::Connection::export_keying_material`, label `EXPORTER-STPT-user-auth`, empty context, 32 bytes); each side computes it itself. Verification: `aws-lc-rs` Ed25519 (RFC 8032).
+- Authorized keys (`authorized`): directory `authorized_keys` (default `/etc/stpt/authorized_keys`), one file per Account named like the Account, kept by the administrator. Line: base64 of the key's SubjectPublicKeyInfo (second line of `openssl pkey -pubout`), optional label of 1–64 bytes; `#` comments. Directory and file must be owned by root or by the Server's own user and not writable by group or others, the file must be a regular file; otherwise, or with an invalid line, the file is ignored (fail closed) and the reason logged. An Account name that is not a plain file name (`/`, `\`, `.`, `..`, control characters) is treated as an unknown Account.
+- Accounts: `authorized::SystemAccounts` asks the system user database (`getpwnam` through `nix`); tests use their own `Accounts`.
+- Decision (`Authorizer::decide`, in `spawn_blocking`, as `getpwnam` and file reading block): signature verification, Account lookup and reading the keys file all run, whichever fails; the decision is made once after them. The exact reason (invalid signature, no such Account, keys file missing, unsafe or invalid, key not listed) goes to the Server log with Account (Debug-escaped) and key fingerprint; the Client gets AUTH_RESULT false.
+- Server sequence (`server::authenticate`): AUTH_REQUEST after AUTH_REQUEST until the authentication deadline (60 s); another message type before authentication, or an unoffered method, is PROTOCOL_VIOLATION. A failure is answered no earlier than 300 ms (`Deadlines::failure_delay`) after its AUTH_REQUEST, so the response time does not depend on the reason; the 6th failure closes with AUTH_FAILED instead of a result.
+- Authenticated Connection: the Server logs Account, key fingerprint and label, raises the bidirectional stream limit to 1 + 10 (§8.2, §14.5) and rejects every new stream with CHANNEL_REJECTED (RESET_STREAM and STOP_SENDING) until Channels exist (Tier RC). On the control stream a further AUTH_REQUEST or CLIENT_HELLO is PROTOCOL_VIOLATION; any other message closes with INTERNAL_ERROR (`not implemented yet`, RB007 and Tier RD).
+- Client (`client::Connection::authenticate`): one key, one AUTH_REQUEST, AUTH_RESULT within 10 s (TIMEOUT). Refused: the Client closes regularly and ends with the key fingerprint and its authorized keys line for the administrator.
+
+# 10	Dependencies
 | Crate | Purpose | Why |
 |---|---|---|
 | `clap` (derive) | command line parsing | de facto standard Rust parser: help, error messages and later shell completion (RK003) without own parsing code |
@@ -113,4 +127,5 @@ PROTOCOL.md §7, §8.1, §10, §11, §13.
 | `aws-lc-rs` | Ed25519 key generation, SHA-256 of fingerprints | the crypto provider of `rustls` already, so no further library; the only one of the `rustls` providers with X25519MLKEM768. Built from C (AWS-LC): a C compiler is needed |
 | `tokio` (`rt-multi-thread`, `time`) | async runtime | the runtime `quinn` runs on |
 | `socket2` | UDP socket options | explicit dual-stack; already used inside `tokio` and `quinn` |
+| `nix` (`user` only; Unix only) | Account lookup (`getpwnam_r`), file owner check (`geteuid`) | safe wrappers of the Unix calls instead of own `unsafe` FFI; needed later for PTY, processes and signals (Tier RC) |
 | `base64` (`std` only) | fingerprints, PEM key file, trust store | the standard Rust base64 crate; strict decoding (no non-canonical trailing bits); without the default `simd-unsafe` feature |

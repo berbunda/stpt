@@ -1,22 +1,26 @@
 //! Server role: `stpt server`.
 
+use std::convert::Infallible;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
-use quinn::{Connection, Endpoint, Incoming};
-use tokio::time::{Instant, timeout, timeout_at};
+use quinn::{Connection, Endpoint, Incoming, VarInt};
+use tokio::time::{Instant, sleep_until, timeout, timeout_at};
 
+use crate::auth::{self, AUTH_REQUEST, AuthRequest};
+use crate::authorized::{self, Accepted, Authorizer, SystemAccounts};
 use crate::cli::Common;
 use crate::config::{self, ServerConfig};
 use crate::destination::DEFAULT_PORT;
 use crate::error::Error;
-use crate::hello::{ClientHello, ServerHello};
+use crate::hello::{AUTH_PUBLICKEY_ED25519, ClientHello, ServerHello};
 use crate::identity::{self, ServerKey};
 use crate::logging::{self, Role};
 use crate::quic;
-use crate::wire::{self, CLIENT_HELLO, DEFAULT_MESSAGE_LIMIT, Failure, StreamError};
+use crate::wire::{self, CLIENT_HELLO, Code, DEFAULT_MESSAGE_LIMIT, Failure, StreamError};
 
 /// Server mode needs a Unix PTY; Windows Server mode (ConPTY) comes with RC008 (gate G2).
 pub const AVAILABLE: bool = cfg!(unix);
@@ -25,6 +29,12 @@ pub const AVAILABLE: bool = cfg!(unix);
 pub const DEFAULT_LISTEN: SocketAddr =
     SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), DEFAULT_PORT);
 
+/// Failed authentication attempts per Connection (§13.4).
+const MAX_FAILED_ATTEMPTS: u32 = 6;
+
+/// Concurrent Channels per Connection besides the control Channel (§14.5).
+const MAX_CHANNELS: u32 = 10;
+
 /// Deadlines of a Connection (§13.3).
 #[derive(Debug, Clone, Copy)]
 pub struct Deadlines {
@@ -32,15 +42,29 @@ pub struct Deadlines {
     pub hello: Duration,
     /// Connection Authenticated after it became Established.
     pub auth: Duration,
+    /// A failed attempt is answered no earlier than this after its AUTH_REQUEST, so
+    /// the response time does not depend on the reason of the failure (§12.4).
+    pub failure_delay: Duration,
+}
+
+impl Deadlines {
+    pub const DEFAULT: Self = Self {
+        hello: Duration::from_secs(10),
+        auth: Duration::from_secs(60),
+        failure_delay: Duration::from_millis(300),
+    };
 }
 
 impl Default for Deadlines {
     fn default() -> Self {
-        Self {
-            hello: Duration::from_secs(10),
-            auth: Duration::from_secs(60),
-        }
+        Self::DEFAULT
     }
+}
+
+/// What the Connections of a Server share.
+pub struct Shared {
+    pub deadlines: Deadlines,
+    pub authorizer: Authorizer,
 }
 
 /// Runs the Server; with `print_fingerprint` only prints the fingerprint of its key.
@@ -68,6 +92,16 @@ pub fn run(
         return Ok(ExitCode::SUCCESS);
     }
 
+    let keys_dir = config
+        .authorized_keys
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(authorized::AUTHORIZED_KEYS_DIR));
+    tracing::info!(path = %keys_dir.display(), "authorized keys directory");
+    let shared = Arc::new(Shared {
+        deadlines: Deadlines::default(),
+        authorizer: Authorizer::new(keys_dir, Box::new(SystemAccounts)),
+    });
+
     let listen = listen_address(listen, &config);
     quic::runtime()?.block_on(async {
         let endpoint = quic::listen(listen, &key)?;
@@ -76,20 +110,21 @@ pub fn run(
             source,
         })?;
         tracing::info!(listen = %local, "listening");
-        serve(endpoint).await;
+        serve(endpoint, shared).await;
         Ok(ExitCode::SUCCESS)
     })
 }
 
-async fn serve(endpoint: Endpoint) {
+async fn serve(endpoint: Endpoint, shared: Arc<Shared>) {
     while let Some(incoming) = endpoint.accept().await {
-        tokio::spawn(connection(incoming, Deadlines::default()));
+        tokio::spawn(connection(incoming, shared.clone()));
     }
 }
 
-/// One Connection: TLS handshake, HELLO, then the wait for user authentication.
-/// Every rejection is logged with its exact reason; the Client gets the code only.
-async fn connection(incoming: Incoming, deadlines: Deadlines) {
+/// One Connection: TLS handshake, HELLO, user authentication, then the
+/// Authenticated Connection. Every rejection is logged with its exact reason; the
+/// Client gets the code only.
+async fn connection(incoming: Incoming, shared: Arc<Shared>) {
     let remote = incoming.remote_address();
     let connection = match quic::accept(incoming).await {
         Ok(connection) => connection,
@@ -99,9 +134,10 @@ async fn connection(incoming: Incoming, deadlines: Deadlines) {
         }
     };
     tracing::debug!(%remote, "TLS handshake completed");
-    match serve_connection(&connection, deadlines).await {
-        Ok(reason) => tracing::info!(%remote, ?reason, "Connection closed"),
-        Err(failure) => {
+    let Err(end) = serve_connection(&connection, &shared).await;
+    match end {
+        End::Lost(reason) => tracing::info!(%remote, ?reason, "Connection closed"),
+        End::Close(failure) => {
             connection.close(failure.code.varint(), b"");
             tracing::info!(
                 %remote,
@@ -113,37 +149,52 @@ async fn connection(incoming: Incoming, deadlines: Deadlines) {
     }
 }
 
-/// Runs a Connection until it is lost (`Ok` with the reason) or the Server must
-/// close it (`Err`).
+/// How a Connection ends on the Server.
+enum End {
+    /// Closed by the Client or lost.
+    Lost(quinn::ConnectionError),
+    /// The Server closes it.
+    Close(Failure),
+}
+
+impl From<Failure> for End {
+    fn from(failure: Failure) -> Self {
+        Self::Close(failure)
+    }
+}
+
+impl From<StreamError> for End {
+    fn from(error: StreamError) -> Self {
+        match error {
+            StreamError::Lost(reason) => Self::Lost(reason),
+            other => Self::Close(control_failure(other)),
+        }
+    }
+}
+
+/// Runs a Connection until it ends.
 async fn serve_connection(
     connection: &Connection,
-    deadlines: Deadlines,
-) -> Result<quinn::ConnectionError, Failure> {
-    let hello = timeout(deadlines.hello, async {
+    shared: &Arc<Shared>,
+) -> Result<Infallible, End> {
+    let deadlines = shared.deadlines;
+    let (mut send, mut recv, message) = timeout(deadlines.hello, async {
         let (send, mut recv) = connection.accept_bi().await.map_err(StreamError::Lost)?;
         let message = control_message(&mut recv).await?;
-        Ok::<_, StreamError>((send, recv, message))
+        Ok::<_, End>((send, recv, message))
     })
     .await
     .map_err(|_| {
         Failure::new(
-            wire::Code::Timeout,
+            Code::Timeout,
             format!("no CLIENT_HELLO within {} s", deadlines.hello.as_secs_f32()),
         )
-    })?;
-    let (mut send, mut recv, message) = match hello {
-        Ok(hello) => hello,
-        Err(StreamError::Lost(reason)) => return Ok(reason),
-        Err(e) => return Err(control_failure(e)),
-    };
+    })??;
     // §10.1: nothing but CLIENT_HELLO may come first.
     let hello = ClientHello::from_message(&message)?;
     let answer = ServerHello::answer(&hello)?;
-    match wire::write_message(&mut send, &answer.to_message(), hello.limits.max_message).await {
-        Ok(()) => {}
-        Err(StreamError::Lost(reason)) => return Ok(reason),
-        Err(e) => return Err(control_failure(e)),
-    }
+    let peer_limit = hello.limits.max_message;
+    wire::write_message(&mut send, &answer.to_message(), peer_limit).await?;
     let established = Instant::now();
     tracing::info!(
         remote = %connection.remote_address(),
@@ -151,29 +202,127 @@ async fn serve_connection(
         "Connection established"
     );
 
-    // User authentication comes with RB006: until then every further message is
-    // refused, and the authentication deadline ends the Connection.
-    let next = timeout_at(established + deadlines.auth, control_message(&mut recv))
-        .await
-        .map_err(|_| {
-            Failure::new(
-                wire::Code::Timeout,
-                format!(
-                    "not authenticated within {} s",
-                    deadlines.auth.as_secs_f32()
-                ),
-            )
-        })?;
-    match next {
-        Ok(message) if message.kind == CLIENT_HELLO => {
-            Err(Failure::violation("second CLIENT_HELLO"))
+    let control = Control {
+        connection,
+        send: &mut send,
+        recv: &mut recv,
+        peer_limit,
+    };
+    let accepted = authenticate(control, shared, established + deadlines.auth).await?;
+    tracing::info!(
+        remote = %connection.remote_address(),
+        account = ?accepted.account,
+        key = %accepted.fingerprint,
+        label = ?accepted.label,
+        "Connection authenticated"
+    );
+    // §8.2, §14.5: Channels become available.
+    connection.set_max_concurrent_bi_streams(VarInt::from_u32(1 + MAX_CHANNELS));
+    tokio::spawn(reject_channels(connection.clone()));
+
+    // Session requests come with RB007 and Tier RD.
+    let message = control_message(&mut recv).await?;
+    Err(match message.kind {
+        AUTH_REQUEST => Failure::violation("AUTH_REQUEST on an Authenticated Connection"),
+        CLIENT_HELLO => Failure::violation("second CLIENT_HELLO"),
+        kind => Failure::new(
+            Code::InternalError,
+            format!("message type {kind}: not implemented yet"),
+        ),
+    }
+    .into())
+}
+
+/// The control stream of an Established Connection.
+struct Control<'a> {
+    connection: &'a Connection,
+    send: &'a mut quinn::SendStream,
+    recv: &'a mut quinn::RecvStream,
+    peer_limit: u64,
+}
+
+/// User authentication (§12) until `deadline`: AUTH_REQUEST after AUTH_REQUEST, each
+/// decided by the Authorizer; failures are answered after the failure delay, and the
+/// last allowed failure closes the Connection with AUTH_FAILED.
+async fn authenticate(
+    control: Control<'_>,
+    shared: &Arc<Shared>,
+    deadline: Instant,
+) -> Result<Accepted, End> {
+    let deadlines = shared.deadlines;
+    let remote = control.connection.remote_address();
+    let exporter = auth::exporter(control.connection)?;
+    let mut failures = 0;
+    loop {
+        let message = timeout_at(deadline, control_message(control.recv))
+            .await
+            .map_err(|_| {
+                Failure::new(
+                    Code::Timeout,
+                    format!(
+                        "not authenticated within {} s",
+                        deadlines.auth.as_secs_f32()
+                    ),
+                )
+            })??;
+        match message.kind {
+            AUTH_REQUEST => {}
+            CLIENT_HELLO => return Err(Failure::violation("second CLIENT_HELLO").into()),
+            kind => {
+                return Err(Failure::violation(format!(
+                    "message type {kind} before authentication"
+                ))
+                .into());
+            }
         }
-        Ok(message) => Err(Failure::violation(format!(
-            "message type {} before authentication (user authentication is not implemented yet)",
-            message.kind
-        ))),
-        Err(StreamError::Lost(reason)) => Ok(reason),
-        Err(e) => Err(control_failure(e)),
+        let received = Instant::now();
+        let request = AuthRequest::from_message(&message)?;
+        if request.method != AUTH_PUBLICKEY_ED25519 {
+            return Err(Failure::violation(format!(
+                "authentication method {} was not offered",
+                request.method
+            ))
+            .into());
+        }
+        let (worker, deciding) = (shared.clone(), request.clone());
+        let decision =
+            tokio::task::spawn_blocking(move || worker.authorizer.decide(&deciding, &exporter))
+                .await
+                .map_err(|e| Failure::new(Code::InternalError, format!("authorization: {e}")))?;
+        let success = match decision {
+            Ok(accepted) => Some(accepted),
+            Err(reason) => {
+                failures += 1;
+                tracing::info!(
+                    %remote,
+                    account = ?request.account,
+                    key = %auth::ed25519_spki(&request.key).fingerprint(),
+                    %reason,
+                    attempt = failures,
+                    "authentication failed"
+                );
+                sleep_until(received + deadlines.failure_delay).await;
+                if failures >= MAX_FAILED_ATTEMPTS {
+                    return Err(Failure::new(Code::AuthFailed, "too many failed attempts").into());
+                }
+                None
+            }
+        };
+        let result = auth::result_message(success.is_some());
+        wire::write_message(control.send, &result, control.peer_limit).await?;
+        if let Some(accepted) = success {
+            return Ok(accepted);
+        }
+    }
+}
+
+/// Channels come with Tier RC: every stream the Client opens is rejected with
+/// CHANNEL_REJECTED (§8.3).
+async fn reject_channels(connection: Connection) {
+    let code = Code::ChannelRejected.varint();
+    while let Ok((mut send, mut recv)) = connection.accept_bi().await {
+        let _ = send.reset(code);
+        let _ = recv.stop(code);
     }
 }
 
@@ -189,10 +338,9 @@ fn control_failure(error: StreamError) -> Failure {
     match error {
         StreamError::Failure(failure) => failure,
         StreamError::Reset(code) => Failure::violation(format!("control stream reset ({code})")),
-        StreamError::Lost(reason) => Failure::new(
-            wire::Code::InternalError,
-            format!("Connection lost: {reason}"),
-        ),
+        StreamError::Lost(reason) => {
+            Failure::new(Code::InternalError, format!("Connection lost: {reason}"))
+        }
     }
 }
 
@@ -220,19 +368,37 @@ fn listen_address(cli: Option<SocketAddr>, config: &ServerConfig) -> SocketAddr 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::UserKey;
+    use crate::authorized::Accounts;
     use crate::hello::WIRE_VERSION;
     use crate::tls::{Expected, ServerKeyCheck};
-    use crate::wire::{Code, Message, SERVER_HELLO, frame};
+    use crate::wire::{Message, SERVER_HELLO, frame};
 
     const SHORT: Deadlines = Deadlines {
         hello: Duration::from_millis(300),
         auth: Duration::from_millis(300),
+        failure_delay: Duration::from_millis(50),
     };
 
-    /// A Client Connection to a Server that serves exactly this Connection.
+    const FAST_FAILURES: Deadlines = Deadlines {
+        failure_delay: Duration::from_millis(50),
+        ..Deadlines::DEFAULT
+    };
+
+    struct Alice;
+
+    impl Accounts for Alice {
+        fn exists(&self, name: &str) -> bool {
+            name == "alice"
+        }
+    }
+
+    /// A Client Connection to a Server that serves exactly this Connection; the
+    /// Server authorizes `user` for the Account `alice`.
     struct Peer {
         _endpoint: Endpoint,
         connection: Connection,
+        user: UserKey,
     }
 
     impl Peer {
@@ -240,9 +406,24 @@ mod tests {
             let key = ServerKey::generate();
             let server = quic::listen("127.0.0.1:0".parse().unwrap(), &key).unwrap();
             let addr = server.local_addr().unwrap();
+            let user = UserKey::generate();
+            let dir = std::env::temp_dir().join(format!(
+                "stpt-server-keys-{}-{}",
+                std::process::id(),
+                addr.port()
+            ));
+            crate::authorized::test_support::keys_file(
+                &dir,
+                "alice",
+                &format!("{} test\n", user.public_key().to_base64()),
+            );
+            let shared = Arc::new(Shared {
+                deadlines,
+                authorizer: Authorizer::new(dir, Box::new(Alice)),
+            });
             tokio::spawn(async move {
                 let incoming = server.accept().await.unwrap();
-                connection(incoming, deadlines).await;
+                connection(incoming, shared).await;
             });
             let endpoint = quic::client(addr).unwrap();
             let check = ServerKeyCheck::new(Expected {
@@ -255,7 +436,27 @@ mod tests {
             Self {
                 _endpoint: endpoint,
                 connection,
+                user,
             }
+        }
+
+        /// Opens the control stream and exchanges HELLO.
+        async fn hello(&self) -> (quinn::SendStream, quinn::RecvStream) {
+            let (mut send, mut recv) = self.connection.open_bi().await.unwrap();
+            send.write_all(&hello_frame(&ClientHello::ours()))
+                .await
+                .unwrap();
+            wire::read_message(&mut recv, DEFAULT_MESSAGE_LIMIT)
+                .await
+                .unwrap()
+                .unwrap();
+            (send, recv)
+        }
+
+        /// AUTH_REQUEST of `key` for `account`, signed for this Connection.
+        fn request(&self, key: &UserKey, account: &str) -> Vec<u8> {
+            let exporter = auth::exporter(&self.connection).unwrap();
+            frame(&key.request(&exporter, account).to_message().encode())
         }
 
         /// The error code the Server closed the Connection with.
@@ -271,6 +472,99 @@ mod tests {
 
     fn hello_frame(hello: &ClientHello) -> Vec<u8> {
         frame(&hello.to_message().encode())
+    }
+
+    async fn auth_result(recv: &mut quinn::RecvStream) -> bool {
+        let message = wire::read_message(recv, DEFAULT_MESSAGE_LIMIT)
+            .await
+            .unwrap()
+            .unwrap();
+        auth::result_from_message(&message).unwrap()
+    }
+
+    #[tokio::test]
+    async fn authentication_then_channels_rejected() {
+        let peer = Peer::start(Deadlines::default()).await;
+        let (mut send, mut recv) = peer.hello().await;
+        send.write_all(&peer.request(&peer.user, "alice"))
+            .await
+            .unwrap();
+        assert!(auth_result(&mut recv).await);
+
+        // §8.2: the Client may open Channels now; there are none yet, so each is
+        // rejected with CHANNEL_REJECTED (§8.3).
+        let (mut channel, mut channel_recv) = peer.connection.open_bi().await.unwrap();
+        channel.write_all(b"\x01").await.unwrap();
+        let mut buf = [0u8; 1];
+        match channel_recv.read(&mut buf).await {
+            Err(quinn::ReadError::Reset(code)) => {
+                assert_eq!(code, Code::ChannelRejected.varint());
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // The Account of a Connection never changes (§12.4).
+        send.write_all(&peer.request(&peer.user, "alice"))
+            .await
+            .unwrap();
+        assert_eq!(peer.closed_with().await, Some(Code::ProtocolViolation));
+    }
+
+    #[tokio::test]
+    async fn failed_attempts_are_uniform_and_limited() {
+        let peer = Peer::start(FAST_FAILURES).await;
+        let (mut send, mut recv) = peer.hello().await;
+        let stranger = UserKey::generate();
+        let exporter = auth::exporter(&peer.connection).unwrap();
+        let mut relayed = peer.user.request(&[0u8; 32], "alice");
+        relayed.signature = peer.user.request(&[1u8; 32], "alice").signature;
+        let attempts = [
+            peer.request(&stranger, "alice"),
+            peer.request(&peer.user, "bob"),
+            peer.request(&peer.user, "../alice"),
+            frame(&relayed.to_message().encode()),
+            frame(
+                &stranger
+                    .request(&exporter, &"x".repeat(256))
+                    .to_message()
+                    .encode(),
+            ),
+        ];
+        for attempt in attempts {
+            let start = Instant::now();
+            send.write_all(&attempt).await.unwrap();
+            assert!(!auth_result(&mut recv).await);
+            assert!(start.elapsed() >= FAST_FAILURES.failure_delay);
+        }
+        send.write_all(&peer.request(&stranger, "alice"))
+            .await
+            .unwrap();
+        assert_eq!(peer.closed_with().await, Some(Code::AuthFailed));
+    }
+
+    #[tokio::test]
+    async fn invalid_authentication_requests() {
+        let violation = Some(Code::ProtocolViolation);
+        let after = async |bytes: Vec<u8>| {
+            let peer = Peer::start(Deadlines::default()).await;
+            let (mut send, _recv) = peer.hello().await;
+            send.write_all(&bytes).await.unwrap();
+            peer.closed_with().await
+        };
+        let user = UserKey::generate();
+        let mut other_method = user.request(&[0u8; 32], "alice");
+        other_method.method = 2;
+        assert_eq!(
+            after(frame(&other_method.to_message().encode())).await,
+            violation
+        );
+        let session_list = Message::new(31, vec![]);
+        assert_eq!(after(frame(&session_list.encode())).await, violation);
+        let long = user.request(&[0u8; 32], &"x".repeat(257));
+        assert_eq!(
+            after(frame(&long.to_message().encode())).await,
+            Some(Code::LimitExceeded)
+        );
     }
 
     #[tokio::test]

@@ -32,6 +32,8 @@ pub struct ServerConfig {
     pub log_level: Option<logging::Level>,
     /// Key file of the Server Identity, created if missing.
     pub identity_key: Option<PathBuf>,
+    /// Directory with one file of authorized user keys per Account.
+    pub authorized_keys: Option<PathBuf>,
 }
 
 #[derive(Debug)]

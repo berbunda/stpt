@@ -106,6 +106,10 @@ mod server {
         let address = format!("127.0.0.1:{port}");
         let dest = format!("alice@{address}");
         let home = dir("trust-flow-home");
+        common::user_key(&home);
+        let reached_auth = |out: &std::process::Output| {
+            stderr(out).starts_with("stpt: the Server did not accept the key")
+        };
 
         // First contact without a terminal and without --fingerprint: refused.
         let out = stpt_in(&home, &["connect", &dest]);
@@ -130,7 +134,7 @@ mod server {
 
         // The right fingerprint: the Connection is established and the key stored.
         let out = stpt_in(&home, &["connect", &dest, "--fingerprint", &fp]);
-        assert_eq!(stderr(&out), "stpt: connect: not implemented yet");
+        assert!(reached_auth(&out), "{}", stderr(&out));
         assert_eq!(
             stdout(&stpt_in(&home, &["trust", "list"])),
             format!("{address} {fp}")
@@ -138,7 +142,7 @@ mod server {
 
         // Known key: no fingerprint needed.
         let out = stpt_in(&home, &["sessions", &dest]);
-        assert_eq!(stderr(&out), "stpt: sessions: not implemented yet");
+        assert!(reached_auth(&out), "{}", stderr(&out));
 
         // Same address, new Server key: refused, both fingerprints shown.
         drop(server);
@@ -165,7 +169,7 @@ mod server {
         let out = stpt_in(&home, &["trust", "remove", &address]);
         assert!(out.status.success(), "{}", stderr(&out));
         let out = stpt_in(&home, &["connect", &dest, "--fingerprint", &new_fp]);
-        assert_eq!(stderr(&out), "stpt: connect: not implemented yet");
+        assert!(reached_auth(&out), "{}", stderr(&out));
         assert_eq!(
             stdout(&stpt_in(&home, &["trust", "list"])),
             format!("{address} {new_fp}")

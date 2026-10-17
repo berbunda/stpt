@@ -32,6 +32,27 @@ pub fn stdout(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).trim_end().to_owned()
 }
 
+/// Ed25519 user key for tests only, written by `openssl genpkey -algorithm ed25519`.
+pub const TEST_USER_KEY: &str = "-----BEGIN PRIVATE KEY-----\n\
+    MC4CAQAwBQYDK2VwBCIEIPSgAC0ev0Odcs+ZVkJmGoVuFuG4QdHWbwBYaB3GW1Qp\n\
+    -----END PRIVATE KEY-----\n";
+
+/// Its authorized keys line: second line of `openssl pkey -pubout`.
+pub const TEST_USER_KEY_LINE: &str = "MCowBQYDK2VwAyEAk9YxouLpNL+A/ZjwtDwMeKhGGVbPOnq2vhNQXSwd7Q4=";
+
+/// Writes the test user key as the default user key of `home`, owner only.
+pub fn user_key(home: &Path) -> PathBuf {
+    let path = home.join("stpt").join("id_ed25519");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, TEST_USER_KEY).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    path
+}
+
 /// Directory for files of one test, created empty.
 pub fn dir(name: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
@@ -47,12 +68,24 @@ pub fn config_file(name: &str, text: &str) -> String {
     path.to_str().unwrap().to_owned()
 }
 
-/// Writes a Server configuration whose key file is in the test directory.
+/// Writes a Server configuration whose key file and authorized keys directory
+/// (`authorized_keys`, empty) are in the test directory.
 pub fn server_config(name: &str, text: &str) -> String {
     let dir = dir(name);
     let key = dir.join("server_key");
+    let keys = dir.join("authorized_keys");
+    std::fs::create_dir_all(&keys).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
     let path = dir.join("server.toml");
-    let text = format!("identity_key = {:?}\n{text}", key.to_str().unwrap());
+    let text = format!(
+        "identity_key = {:?}\nauthorized_keys = {:?}\n{text}",
+        key.to_str().unwrap(),
+        keys.to_str().unwrap()
+    );
     std::fs::write(&path, text).unwrap();
     path.to_str().unwrap().to_owned()
 }

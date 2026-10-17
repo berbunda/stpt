@@ -1,7 +1,7 @@
 # stpt
 Secure terminal access over QUIC: a single program acting as client and server, with Sessions that survive the loss of a connection.
 
-Status: early development. The Client connects to the Server, verifies the Server key and agrees on the protocol version; user login and terminals are not there yet, so the Client commands end with `not implemented yet`.
+Status: early development. The Client connects to the Server, verifies the Server key, agrees on the protocol version and logs in with the user key; terminals and Sessions are not there yet, so the Client commands end with `not implemented yet`.
 
 ```
 stpt server [--listen ADDR:PORT] [--fingerprint]
@@ -13,7 +13,7 @@ stpt terminate ACCOUNT@HOST[:PORT] SESSION [--force]
 stpt trust list
 stpt trust remove HOST[:PORT]
 ```
-Every command with `ACCOUNT@HOST` also accepts `--fingerprint SHA256:...` (see Server key).
+Every command with `ACCOUNT@HOST` also accepts `--fingerprint SHA256:...` (see Server key) and `-i PATH` (see User key).
 
 - The default port is 843 (UDP). IPv6 addresses go in brackets: `alice@[2001:db8::1]:843`.
 - `SESSION` is a Session ID, a unique prefix of it, or a Session name.
@@ -33,6 +33,24 @@ The Client remembers the key of every Server it trusts, in `known_servers` next 
 
 `stpt trust list` shows the remembered Servers and their fingerprints.
 
+# User key
+You log in with a key, as with ssh keys; there are no passwords. Create the key once on the Client with OpenSSL (create the `stpt` directory first if it does not exist yet):
+
+| Client | Command |
+|---|---|
+| Linux | `openssl genpkey -algorithm ed25519 -out ~/.config/stpt/id_ed25519 && chmod 600 ~/.config/stpt/id_ed25519` |
+| Windows | `openssl genpkey -algorithm ed25519 -out %APPDATA%\stpt\id_ed25519` |
+
+`-i PATH` uses another key file. On Linux the key file must be readable by you only.
+
+The administrator of the Server decides which keys may log in to which Account (an operating system account on the Server). Show your public key with `openssl pkey -in ~/.config/stpt/id_ed25519 -pubout` and give its second line (it starts with `MCowBQYDK2VwAyEA`) to the administrator; the Client also prints that line when the Server refuses the key.
+
+On the Server, the keys of the Account `alice` are in `/etc/stpt/authorized_keys/alice`, one per line, optionally followed by a label:
+```
+MCowBQYDK2VwAyEAk9YxouLpNL+A/ZjwtDwMeKhGGVbPOnq2vhNQXSwd7Q4= alice-laptop
+```
+Only root may change these files: the directory and the files must belong to root and must not be writable by group or others (`chmod 755` for the directory, `644` for the files), otherwise the Server ignores them. A refused login tells the Client nothing about the reason; the Server log has it.
+
 # Configuration
 TOML files, optional; `--config PATH` uses another file.
 
@@ -49,6 +67,7 @@ Server settings:
 listen = "[::]:843"   # address and UDP port; IPv6 addresses in brackets; [::] also accepts IPv4
 log_level = "info"    # error, warn, info, debug or trace; -v and -q override it
 identity_key = "/etc/stpt/server_key"   # Server key file, created if missing
+authorized_keys = "/etc/stpt/authorized_keys"   # directory of authorized user keys, one file per Account
 ```
 The Client has no settings yet.
 

@@ -1,3 +1,5 @@
+mod auth;
+mod authorized;
 mod cbor;
 mod cli;
 mod client;

@@ -2,14 +2,18 @@
 
 use std::io::{self, IsTerminal, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
 
+use tokio::time::timeout;
+
+use crate::auth::{self, UserKey};
 use crate::cli::{ClientCommand, Common, Remote, TrustAction};
 use crate::config::{self, ClientConfig};
 use crate::destination::Address;
 use crate::error::Error;
-use crate::hello::{ClientHello, ServerHello};
+use crate::hello::{AUTH_PUBLICKEY_ED25519, ClientHello, ServerHello};
 use crate::identity::Fingerprint;
 use crate::logging::{self, Role};
 use crate::quic;
@@ -19,6 +23,12 @@ use crate::wire::{self, DEFAULT_MESSAGE_LIMIT, Failure, StreamError};
 
 /// SERVER_HELLO received after CLIENT_HELLO was sent (§13.3).
 pub const SERVER_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// AUTH_RESULT received after AUTH_REQUEST was sent (§13.3).
+pub const AUTH_RESULT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// File name of the user key in the Client configuration directory.
+pub const USER_KEY_FILE: &str = "id_ed25519";
 
 pub fn run(command: ClientCommand, common: &Common) -> Result<ExitCode, Error> {
     let (_config, path) =
@@ -38,6 +48,13 @@ pub fn run(command: ClientCommand, common: &Common) -> Result<ExitCode, Error> {
         ClientCommand::Terminate { remote, .. } => ("terminate", remote),
     };
     let mut store = trust_store()?;
+    let key_path = match &remote.identity {
+        Some(path) => path.clone(),
+        None => config::client_dir()
+            .ok_or(Error::NoTrustStore)?
+            .join(USER_KEY_FILE),
+    };
+    let key = load_user_key(&key_path)?;
     let runtime = quic::runtime()?;
     let _guard = runtime.enter();
     let addr = resolve(&remote.destination.address)?;
@@ -47,9 +64,30 @@ pub fn run(command: ClientCommand, common: &Common) -> Result<ExitCode, Error> {
         version = format_args!("{:#x}", hello.version),
         "Connection established"
     );
-    // User authentication comes with RB006.
+    let account = &remote.destination.account;
+    let accepted = runtime.block_on(connection.authenticate(account, &key, AUTH_RESULT_TIMEOUT))?;
     runtime.block_on(connection.close());
+    if !accepted {
+        return Err(Error::AuthRejected {
+            account: account.clone(),
+            fingerprint: key.public_key().fingerprint(),
+            key_line: key.public_key().to_base64(),
+        });
+    }
+    tracing::info!(%account, key = %key.public_key().fingerprint(), "Connection authenticated");
+    // Sessions and terminals come with Tiers RC and RD.
     Err(Error::NotImplemented(name))
+}
+
+fn load_user_key(path: &Path) -> Result<UserKey, Error> {
+    UserKey::load(path).map_err(|e| match e {
+        crate::identity::KeyFileError::Io { source, .. }
+            if source.kind() == io::ErrorKind::NotFound =>
+        {
+            Error::NoUserKey(path.to_owned())
+        }
+        other => Error::UserKey(other),
+    })
 }
 
 fn trust_store() -> Result<TrustStore, Error> {
@@ -97,6 +135,8 @@ pub struct Connection {
     /// Control stream once opened; kept until the Connection is closed, as dropping
     /// it would end the stream, which the Server treats as an error (§8.1).
     control: Option<(quinn::SendStream, quinn::RecvStream)>,
+    /// Message size limit of the Server, from SERVER_HELLO.
+    peer_limit: u64,
 }
 
 impl Connection {
@@ -110,19 +150,40 @@ impl Connection {
     /// within `deadline`, checked against the offer. A violation by the Server
     /// closes the Connection with its code; the reason is reported locally only.
     async fn hello(&mut self, deadline: Duration) -> Result<ServerHello, Error> {
-        let failure = match self.exchange_hello(deadline).await {
-            Ok(hello) => return Ok(hello),
-            Err(StreamError::Lost(reason)) => {
-                return Err(quic::Error::Connection(reason).into());
-            }
-            Err(StreamError::Failure(failure)) => failure,
-            Err(StreamError::Reset(code)) => {
+        match self.exchange_hello(deadline).await {
+            Ok(hello) => Ok(hello),
+            Err(error) => Err(self.failed(error).await),
+        }
+    }
+
+    /// User authentication (§12) with `key` for `account`: AUTH_REQUEST bound to this
+    /// Connection, AUTH_RESULT within `deadline`. `Ok(false)`: the key was not accepted.
+    async fn authenticate(
+        &mut self,
+        account: &str,
+        key: &UserKey,
+        deadline: Duration,
+    ) -> Result<bool, Error> {
+        match self.exchange_auth(account, key, deadline).await {
+            Ok(accepted) => Ok(accepted),
+            Err(error) => Err(self.failed(error).await),
+        }
+    }
+
+    /// Error of a failed step on the control stream. A violation by the Server or an
+    /// expired deadline closes the Connection with its code; the reason is reported
+    /// locally only.
+    async fn failed(&self, error: StreamError) -> Error {
+        let failure = match error {
+            StreamError::Lost(reason) => return quic::Error::Connection(reason).into(),
+            StreamError::Failure(failure) => failure,
+            StreamError::Reset(code) => {
                 Failure::violation(format!("the Server reset the control stream ({code})"))
             }
         };
         self.connection.close(failure.code.varint(), b"");
         self.endpoint.wait_idle().await;
-        Err(Error::Protocol(failure))
+        Error::Protocol(failure)
     }
 
     async fn exchange_hello(&mut self, deadline: Duration) -> Result<ServerHello, StreamError> {
@@ -131,20 +192,51 @@ impl Connection {
             .insert(self.connection.open_bi().await.map_err(StreamError::Lost)?);
         let offer = ClientHello::ours();
         wire::write_message(send, &offer.to_message(), DEFAULT_MESSAGE_LIMIT).await?;
-        let message =
-            tokio::time::timeout(deadline, wire::read_message(recv, DEFAULT_MESSAGE_LIMIT))
-                .await
-                .map_err(|_| {
-                    Failure::new(
-                        wire::Code::Timeout,
-                        format!("no SERVER_HELLO within {} s", deadline.as_secs_f32()),
-                    )
-                })??
-                .ok_or_else(|| Failure::violation("the Server ended the control stream"))?;
+        let message = reply(recv, deadline, "SERVER_HELLO").await?;
         let hello = ServerHello::from_message(&message)?;
         hello.check(&offer)?;
+        if !hello.auth_methods.contains(&AUTH_PUBLICKEY_ED25519) {
+            return Err(Failure::violation("the Server does not offer publickey-ed25519").into());
+        }
+        self.peer_limit = hello.limits.max_message;
         Ok(hello)
     }
+
+    async fn exchange_auth(
+        &mut self,
+        account: &str,
+        key: &UserKey,
+        deadline: Duration,
+    ) -> Result<bool, StreamError> {
+        let exporter = auth::exporter(&self.connection)?;
+        let (send, recv) = self
+            .control
+            .as_mut()
+            .expect("HELLO opened the control stream");
+        let request = key.request(&exporter, account);
+        wire::write_message(send, &request.to_message(), self.peer_limit).await?;
+        let message = reply(recv, deadline, "AUTH_RESULT").await?;
+        Ok(auth::result_from_message(&message)?)
+    }
+}
+
+/// The next message from the Server within `deadline`; `what` names the expected one.
+async fn reply(
+    recv: &mut quinn::RecvStream,
+    deadline: Duration,
+    what: &str,
+) -> Result<wire::Message, StreamError> {
+    Ok(
+        timeout(deadline, wire::read_message(recv, DEFAULT_MESSAGE_LIMIT))
+            .await
+            .map_err(|_| {
+                Failure::new(
+                    wire::Code::Timeout,
+                    format!("no {what} within {} s", deadline.as_secs_f32()),
+                )
+            })??
+            .ok_or_else(|| Failure::violation("the Server ended the control stream"))?,
+    )
 }
 
 /// Connects to the Server at `addr` and verifies its key against the trust store
@@ -179,6 +271,7 @@ async fn connect(
                     endpoint,
                     connection,
                     control: None,
+                    peer_limit: DEFAULT_MESSAGE_LIMIT,
                 });
             }
             Err(error) => error,
@@ -278,6 +371,7 @@ mod tests {
                     .parse::<Destination>()
                     .unwrap(),
                 fingerprint,
+                identity: None,
             }
         }
     }
@@ -431,6 +525,7 @@ mod tests {
         let remote = Remote {
             destination: format!("alice@{addr}").parse().unwrap(),
             fingerprint: Some(key.public_key().fingerprint()),
+            identity: None,
         };
         let mut connection = connect(&remote, addr, &mut store, never_asked)
             .await
@@ -503,6 +598,105 @@ mod tests {
         assert_eq!(
             result.unwrap_err().to_string(),
             "transport: closed by the peer: VERSION_NEGOTIATION_FAILED"
+        );
+    }
+
+    /// Runs a fake Server that exchanges HELLO, checks the channel binding of the
+    /// AUTH_REQUEST with its own exporter value, then replies with `reply`.
+    /// Returns the result of the Client's authentication.
+    async fn authenticate_against(
+        reply: impl FnOnce() -> Reply + Send + 'static,
+    ) -> Result<bool, Error> {
+        let key = ServerKey::generate();
+        let endpoint = quic::listen("127.0.0.1:0".parse().unwrap(), &key).unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let user = UserKey::generate();
+        let user_public = user.raw_public();
+        let server = tokio::spawn(async move {
+            let connection = quic::accept(endpoint.accept().await.unwrap())
+                .await
+                .unwrap();
+            let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+            let read = async |recv: &mut quinn::RecvStream| {
+                wire::read_message(recv, DEFAULT_MESSAGE_LIMIT)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            };
+            let hello = ClientHello::from_message(&read(&mut recv).await).unwrap();
+            let answer = ServerHello::answer(&hello).unwrap().to_message();
+            send.write_all(&wire::frame(&answer.encode()))
+                .await
+                .unwrap();
+            let request = auth::AuthRequest::from_message(&read(&mut recv).await).unwrap();
+            assert_eq!(request.account, "alice");
+            assert_eq!(request.key, user_public);
+            let exporter = auth::exporter(&connection).unwrap();
+            assert!(request.signature_valid(&exporter), "channel binding");
+            match reply() {
+                Reply::Bytes(bytes) => send.write_all(&bytes).await.unwrap(),
+                Reply::Nothing => {}
+                Reply::Close(code) => connection.close(code.varint(), b""),
+            }
+            connection.closed().await;
+        });
+        let path = store_path(&format!("auth-{}", addr.port()));
+        let mut store = TrustStore::load(path.clone()).unwrap();
+        let remote = Remote {
+            destination: format!("alice@{addr}").parse().unwrap(),
+            fingerprint: Some(key.public_key().fingerprint()),
+            identity: None,
+        };
+        let mut connection = connect(&remote, addr, &mut store, never_asked)
+            .await
+            .unwrap();
+        connection.hello(Duration::from_secs(5)).await.unwrap();
+        let result = connection
+            .authenticate("alice", &user, Duration::from_millis(300))
+            .await;
+        if result.is_ok() {
+            connection.close().await;
+        }
+        server.await.unwrap();
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        result
+    }
+
+    fn result_frame(success: bool) -> Reply {
+        Reply::Bytes(wire::frame(&auth::result_message(success).encode()))
+    }
+
+    #[tokio::test]
+    async fn authentication_results() {
+        assert!(authenticate_against(|| result_frame(true)).await.unwrap());
+        assert!(!authenticate_against(|| result_frame(false)).await.unwrap());
+        let garbage = || Reply::Bytes(wire::frame(&wire::Message::new(2, vec![]).encode()));
+        assert_eq!(
+            protocol_code(authenticate_against(garbage).await.map(|_| unreachable!())),
+            wire::Code::ProtocolViolation
+        );
+        assert_eq!(
+            protocol_code(
+                authenticate_against(|| Reply::Nothing)
+                    .await
+                    .map(|_| unreachable!())
+            ),
+            wire::Code::Timeout
+        );
+    }
+
+    #[test]
+    fn missing_user_key_tells_how_to_create_one() {
+        let path = store_path("no-key").with_file_name("id_ed25519");
+        let err = load_user_key(&path).err().unwrap();
+        assert!(matches!(err, Error::NoUserKey(_)));
+        let text = err.to_string();
+        assert!(
+            text.contains(&format!(
+                "openssl genpkey -algorithm ed25519 -out {}",
+                path.display()
+            )),
+            "{text}"
         );
     }
 }

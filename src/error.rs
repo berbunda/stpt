@@ -3,6 +3,7 @@
 
 use std::fmt;
 use std::io;
+use std::path::PathBuf;
 
 use crate::config;
 use crate::destination::Address;
@@ -54,6 +55,16 @@ pub enum Error {
     /// The Server violated the protocol or a deadline expired; the Connection was
     /// closed with the code of the failure.
     Protocol(wire::Failure),
+    /// No user key file at the path.
+    NoUserKey(PathBuf),
+    UserKey(identity::KeyFileError),
+    /// The Server did not accept the user key for the Account.
+    AuthRejected {
+        account: String,
+        fingerprint: Fingerprint,
+        /// The key as an authorized keys line: base64 of its SubjectPublicKeyInfo.
+        key_line: String,
+    },
 }
 
 impl Error {
@@ -115,6 +126,29 @@ impl fmt::Display for Error {
             ),
             Self::Terminal(e) => write!(f, "terminal: {e}"),
             Self::Protocol(failure) => write!(f, "protocol: {failure}"),
+            Self::NoUserKey(path) => write!(
+                f,
+                "no user key at {path}\n\
+                 Create one with: openssl genpkey -algorithm ed25519 -out {path}{chmod}",
+                path = path.display(),
+                chmod = if cfg!(unix) {
+                    format!(" && chmod 600 {}", path.display())
+                } else {
+                    String::new()
+                }
+            ),
+            Self::UserKey(e) => write!(f, "user key: {e}"),
+            Self::AuthRejected {
+                account,
+                fingerprint,
+                key_line,
+            } => write!(
+                f,
+                "the Server did not accept the key {fingerprint} for the Account {account}\n\
+                 If it should, the Server administrator adds this line to the authorized \
+                 keys of the Account (by default /etc/stpt/authorized_keys/{account}):\n  \
+                 {key_line}"
+            ),
         }
     }
 }
@@ -128,6 +162,7 @@ impl std::error::Error for Error {
             Self::Trust(e) => Some(e),
             Self::Resolve { source, .. } => Some(source),
             Self::Terminal(e) => Some(e),
+            Self::UserKey(e) => Some(e),
             _ => None,
         }
     }

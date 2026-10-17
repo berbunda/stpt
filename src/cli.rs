@@ -167,6 +167,10 @@ pub struct Remote {
     /// Expected fingerprint of the Server key, obtained out of band
     #[arg(long, value_name = "SHA256:...")]
     pub fingerprint: Option<Fingerprint>,
+
+    /// User key file [default: id_ed25519 next to the Client configuration]
+    #[arg(short, long, value_name = "PATH")]
+    pub identity: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
