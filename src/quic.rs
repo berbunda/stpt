@@ -39,8 +39,33 @@ impl fmt::Display for Error {
             Self::Runtime(e) => write!(f, "async runtime: {e}"),
             Self::Bind { addr, source } => write!(f, "{addr}: {source}"),
             Self::Connect(e) => e.fmt(f),
-            Self::Connection(e) => e.fmt(f),
+            Self::Connection(e) => fmt_connection_error(e, f),
         }
+    }
+}
+
+/// The reason phrase of a close comes from the peer (§13.1): it is shown escaped, so
+/// it cannot inject line breaks or terminal control sequences. quinn's own Display
+/// writes it unchanged.
+fn fmt_connection_error(e: &quinn::ConnectionError, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    let reason = |bytes: &[u8]| match bytes {
+        [] => String::new(),
+        _ => format!(", reason {:?}", String::from_utf8_lossy(bytes)),
+    };
+    match e {
+        quinn::ConnectionError::ConnectionClosed(close) => write!(
+            f,
+            "closed by the peer: {}{}",
+            close.error_code,
+            reason(&close.reason)
+        ),
+        quinn::ConnectionError::ApplicationClosed(close) => write!(
+            f,
+            "closed by the peer: code {}{}",
+            close.error_code,
+            reason(&close.reason)
+        ),
+        other => fmt::Display::fmt(other, f),
     }
 }
 
@@ -257,6 +282,23 @@ mod tests {
                 tokio::join!(connect_to(addr, "localhost", other), accept_one(&server));
             assert!(matches!(client, Err(Error::Connection(_))));
             assert!(accepted.is_err());
+        });
+    }
+
+    #[test]
+    fn peer_reason_is_escaped() {
+        with_server("127.0.0.1:0", |server, key| async move {
+            let addr = SocketAddr::from(([127, 0, 0, 1], port(&server)));
+            let (client, accepted) =
+                tokio::join!(connect_to(addr, "localhost", key), accept_one(&server));
+            accepted
+                .unwrap()
+                .close(VarInt::from_u32(7), b"\x1b]52;c;evil\x07\nstpt: fake");
+            let text = Error::Connection(client.unwrap().closed().await).to_string();
+            assert_eq!(
+                text,
+                r#"closed by the peer: code 7, reason "\u{1b}]52;c;evil\u{7}\nstpt: fake""#
+            );
         });
     }
 
