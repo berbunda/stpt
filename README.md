@@ -1,7 +1,7 @@
 # stpt
 Secure terminal access over QUIC: a single program acting as client and server, with Sessions that survive the loss of a connection.
 
-Status: early development. The commands below are recognised, but none is implemented yet.
+Status: early development. `stpt server` accepts QUIC Connections but does nothing with them yet and uses a new temporary key at every start; the other commands are recognised, but not implemented yet.
 
 ```
 stpt server [--listen ADDR:PORT]
@@ -31,13 +31,13 @@ Command line options override the file. Unknown keys and invalid values are erro
 
 Server settings:
 ```toml
-listen = "[::]:843"   # address and UDP port; IPv6 addresses in brackets
+listen = "[::]:843"   # address and UDP port; IPv6 addresses in brackets; [::] also accepts IPv4
 log_level = "info"    # error, warn, info, debug or trace; -v and -q override it
 ```
 The Client has no settings yet.
 
 # Build
-Requires Rust 1.99 or newer, installed with rustup (distribution packages are usually older), and a C linker (`build-essential` on Debian).
+Requires Rust 1.99 or newer, installed with rustup (distribution packages are usually older), and a C compiler: `build-essential` on Debian, the Visual Studio Build Tools (C++) on Windows. The cryptographic library (AWS-LC) is compiled from C.
 
 ```
 cargo build --release

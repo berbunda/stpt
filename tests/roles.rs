@@ -4,17 +4,25 @@ mod common;
 
 use common::{config_file, stderr, stpt};
 
+#[cfg(unix)]
+#[test]
+fn server_role() {
+    let config = config_file("roles-server", "");
+    let lines = common::server_until_listening(&["--listen", "127.0.0.1:0", "--config", &config]);
+    let last = lines.last().expect("Server logs");
+    assert!(last.contains("listening listen=127.0.0.1:"), "{lines:?}");
+}
+
+#[cfg(windows)]
 #[test]
 fn server_role() {
     let config = config_file("roles-server", "");
     let out = stpt(&["server", "--listen", "127.0.0.1:0", "--config", &config]);
     assert_eq!(out.status.code(), Some(255));
-    let expected = if cfg!(unix) {
-        "stpt: server: not implemented yet"
-    } else {
+    assert_eq!(
+        stderr(&out),
         "stpt: server: Server mode is not available on this platform"
-    };
-    assert_eq!(stderr(&out), expected);
+    );
 }
 
 #[test]

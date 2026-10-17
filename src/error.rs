@@ -4,6 +4,7 @@
 use std::fmt;
 
 use crate::config;
+use crate::quic;
 
 /// Exit code for STPT and Connection errors, as ssh.
 pub const EXIT_STPT_ERROR: u8 = 255;
@@ -11,6 +12,7 @@ pub const EXIT_STPT_ERROR: u8 = 255;
 #[derive(Debug)]
 pub enum Error {
     Config(config::Error),
+    Transport(quic::Error),
     /// Server mode on a platform without it (gate G2).
     ServerUnavailable,
     /// Subcommand that is recognised but not implemented yet.
@@ -20,7 +22,10 @@ pub enum Error {
 impl Error {
     pub fn exit_code(&self) -> u8 {
         match self {
-            Self::Config(_) | Self::ServerUnavailable | Self::NotImplemented(_) => EXIT_STPT_ERROR,
+            Self::Config(_)
+            | Self::Transport(_)
+            | Self::ServerUnavailable
+            | Self::NotImplemented(_) => EXIT_STPT_ERROR,
         }
     }
 }
@@ -29,6 +34,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Config(e) => write!(f, "config: {e}"),
+            Self::Transport(e) => write!(f, "transport: {e}"),
             Self::ServerUnavailable => {
                 f.write_str("server: Server mode is not available on this platform")
             }
@@ -41,6 +47,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Config(e) => Some(e),
+            Self::Transport(e) => Some(e),
             Self::ServerUnavailable | Self::NotImplemented(_) => None,
         }
     }
@@ -49,6 +56,12 @@ impl std::error::Error for Error {
 impl From<config::Error> for Error {
     fn from(e: config::Error) -> Self {
         Self::Config(e)
+    }
+}
+
+impl From<quic::Error> for Error {
+    fn from(e: quic::Error) -> Self {
+        Self::Transport(e)
     }
 }
 

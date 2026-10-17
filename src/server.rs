@@ -4,11 +4,15 @@ use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use quinn::{Endpoint, Incoming};
+
 use crate::cli::Common;
 use crate::config::{self, ServerConfig};
 use crate::destination::DEFAULT_PORT;
 use crate::error::Error;
 use crate::logging::{self, Role};
+use crate::quic;
+use crate::tls::ServerKey;
 
 /// Server mode needs a Unix PTY; Windows Server mode (ConPTY) comes with RC008 (gate G2).
 pub const AVAILABLE: bool = cfg!(unix);
@@ -32,8 +36,39 @@ pub fn run(listen: Option<SocketAddr>, common: &Common) -> Result<ExitCode, Erro
     config::log_source(path.as_deref());
 
     let listen = listen_address(listen, &config);
-    tracing::debug!(%listen, "listen address");
-    Err(Error::NotImplemented("server"))
+    // A persistent Server Identity comes with RB003.
+    let key = ServerKey::generate();
+    tracing::warn!("temporary Server key, replaced at every start");
+    quic::runtime()?.block_on(async {
+        let endpoint = quic::listen(listen, &key)?;
+        let local = endpoint.local_addr().map_err(|source| quic::Error::Bind {
+            addr: listen,
+            source,
+        })?;
+        tracing::info!(listen = %local, "listening");
+        serve(endpoint).await;
+        Ok(ExitCode::SUCCESS)
+    })
+}
+
+async fn serve(endpoint: Endpoint) {
+    while let Some(incoming) = endpoint.accept().await {
+        tokio::spawn(connection(incoming));
+    }
+}
+
+/// One Connection. Until HELLO (RB004) the Server only keeps it open until the
+/// Client closes it or the idle timeout expires.
+async fn connection(incoming: Incoming) {
+    let remote = incoming.remote_address();
+    match quic::accept(incoming).await {
+        Ok(connection) => {
+            tracing::info!(%remote, "Connection established");
+            let reason = connection.closed().await;
+            tracing::info!(%remote, ?reason, "Connection closed");
+        }
+        Err(error) => tracing::info!(%remote, ?error, "handshake failed"),
+    }
 }
 
 /// `--listen`, else the configuration, else [`DEFAULT_LISTEN`].

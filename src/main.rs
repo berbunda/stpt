@@ -4,7 +4,9 @@ mod config;
 mod destination;
 mod error;
 mod logging;
+mod quic;
 mod server;
+mod tls;
 
 use std::process::ExitCode;
 
