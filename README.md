@@ -21,6 +21,26 @@ Every command with `ACCOUNT@HOST` also accepts `--fingerprint SHA256:...` (see S
 - `stpt help COMMAND` shows the options of a command.
 - Messages go to standard error. `-v` shows more (`-vv`, `-vvv` even more), `-q` errors only. The Server logs to standard error, which systemd keeps in the journal.
 
+# Private key, public key, fingerprint
+Three different texts appear around keys. Do not mix them up.
+
+**Private key** — a file of three lines. Secret: it never leaves its machine; never copy, send or paste it anywhere (also not into `--fingerprint`). Files: `/etc/stpt/server_key` on the Server, `id_ed25519` on the Client.
+```
+-----BEGIN PRIVATE KEY-----
+MC4CAQAwBQYDK2VwBCIE…
+-----END PRIVATE KEY-----
+```
+
+**Public key** — one line of 60 characters starting with `MCowBQYDK2VwAyEA`. Not secret. The user gives it to the administrator, who puts it into the authorized keys of the Account. `openssl pkey -in id_ed25519 -pubout` shows it as its second line.
+```
+MCowBQYDK2VwAyEAk9YxouLpNL+A/ZjwtDwMeKhGGVbPOnq2vhNQXSwd7Q4=
+```
+
+**Fingerprint** — `SHA256:` and 43 characters, computed from a public key (this one from the public key above). Not secret. It is what you compare, in full, and what `--fingerprint` takes. `stpt server --fingerprint` prints the one of the Server key; `stpt trust list` and the Client messages show fingerprints too.
+```
+SHA256:mskzIR8pKPbyewk8I+WgXjvBQaQbFA9RwVO8MvQ0apc
+```
+
 # Server key
 The Server proves its identity with a key, as an ssh host key. It creates the key at its first start, in the file `/etc/stpt/server_key` (setting `identity_key`), readable by its owner only; the Server refuses a key file that others can read.
 
