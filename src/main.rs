@@ -4,6 +4,7 @@ mod cbor;
 mod cli;
 mod client;
 mod config;
+mod control;
 mod destination;
 mod error;
 mod hello;

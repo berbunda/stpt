@@ -11,6 +11,7 @@ use tokio::time::timeout;
 use crate::auth::{self, UserKey};
 use crate::cli::{ClientCommand, Common, Remote, TrustAction};
 use crate::config::{self, ClientConfig};
+use crate::control::{self, Sender, State};
 use crate::destination::Address;
 use crate::error::Error;
 use crate::hello::{AUTH_PUBLICKEY_ED25519, ClientHello, ServerHello};
@@ -190,9 +191,10 @@ impl Connection {
         let (send, recv) = self
             .control
             .insert(self.connection.open_bi().await.map_err(StreamError::Lost)?);
+        let _ = send.set_priority(control::CONTROL_PRIORITY);
         let offer = ClientHello::ours();
         wire::write_message(send, &offer.to_message(), DEFAULT_MESSAGE_LIMIT).await?;
-        let message = reply(recv, deadline, "SERVER_HELLO").await?;
+        let message = reply(recv, deadline, "SERVER_HELLO", State::Handshaking).await?;
         let hello = ServerHello::from_message(&message)?;
         hello.check(&offer)?;
         if !hello.auth_methods.contains(&AUTH_PUBLICKEY_ED25519) {
@@ -215,28 +217,30 @@ impl Connection {
             .expect("HELLO opened the control stream");
         let request = key.request(&exporter, account);
         wire::write_message(send, &request.to_message(), self.peer_limit).await?;
-        let message = reply(recv, deadline, "AUTH_RESULT").await?;
+        let message = reply(recv, deadline, "AUTH_RESULT", State::Established).await?;
         Ok(auth::result_from_message(&message)?)
     }
 }
 
-/// The next message from the Server within `deadline`; `what` names the expected one.
+/// The next message from the Server within `deadline`, permitted from the Server in
+/// `state` (§8.1); `what` names the expected one.
 async fn reply(
     recv: &mut quinn::RecvStream,
     deadline: Duration,
     what: &str,
+    state: State,
 ) -> Result<wire::Message, StreamError> {
-    Ok(
-        timeout(deadline, wire::read_message(recv, DEFAULT_MESSAGE_LIMIT))
-            .await
-            .map_err(|_| {
-                Failure::new(
-                    wire::Code::Timeout,
-                    format!("no {what} within {} s", deadline.as_secs_f32()),
-                )
-            })??
-            .ok_or_else(|| Failure::violation("the Server ended the control stream"))?,
-    )
+    let message = timeout(deadline, wire::read_message(recv, DEFAULT_MESSAGE_LIMIT))
+        .await
+        .map_err(|_| {
+            Failure::new(
+                wire::Code::Timeout,
+                format!("no {what} within {} s", deadline.as_secs_f32()),
+            )
+        })??
+        .ok_or_else(|| Failure::violation("the Server ended the control stream"))?;
+    control::check(message.kind, Sender::Server, state)?;
+    Ok(message)
 }
 
 /// Connects to the Server at `addr` and verifies its key against the trust store

@@ -8,10 +8,7 @@ use aws_lc_rs::signature::{self, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use crate::cbor::{self, Value};
 use crate::hello::AUTH_PUBLICKEY_ED25519;
 use crate::identity::{self, KeyFileError, PublicKey};
-use crate::wire::{Code, Failure, Message};
-
-pub const AUTH_REQUEST: u64 = 4;
-pub const AUTH_RESULT: u64 = 5;
+use crate::wire::{AUTH_REQUEST, AUTH_RESULT, Code, Failure, Message};
 
 /// Maximum length of an Account name in bytes (§13.4).
 pub const MAX_ACCOUNT_LEN: usize = 256;

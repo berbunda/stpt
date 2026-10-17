@@ -10,17 +10,18 @@ use std::time::Duration;
 use quinn::{Connection, Endpoint, Incoming, VarInt};
 use tokio::time::{Instant, sleep_until, timeout, timeout_at};
 
-use crate::auth::{self, AUTH_REQUEST, AuthRequest};
+use crate::auth::{self, AuthRequest};
 use crate::authorized::{self, Accepted, Authorizer, SystemAccounts};
 use crate::cli::Common;
 use crate::config::{self, ServerConfig};
+use crate::control::{self, Sender, State};
 use crate::destination::DEFAULT_PORT;
 use crate::error::Error;
 use crate::hello::{AUTH_PUBLICKEY_ED25519, ClientHello, ServerHello};
 use crate::identity::{self, ServerKey};
 use crate::logging::{self, Role};
 use crate::quic;
-use crate::wire::{self, CLIENT_HELLO, Code, DEFAULT_MESSAGE_LIMIT, Failure, StreamError};
+use crate::wire::{self, Code, DEFAULT_MESSAGE_LIMIT, Failure, StreamError};
 
 /// Server mode needs a Unix PTY; Windows Server mode (ConPTY) comes with RC008 (gate G2).
 pub const AVAILABLE: bool = cfg!(unix);
@@ -180,7 +181,9 @@ async fn serve_connection(
     let deadlines = shared.deadlines;
     let (mut send, mut recv, message) = timeout(deadlines.hello, async {
         let (send, mut recv) = connection.accept_bi().await.map_err(StreamError::Lost)?;
-        let message = control_message(&mut recv).await?;
+        // §8.1: control messages go before Channel data.
+        let _ = send.set_priority(control::CONTROL_PRIORITY);
+        let message = control_message(&mut recv, State::Handshaking).await?;
         Ok::<_, End>((send, recv, message))
     })
     .await
@@ -190,7 +193,6 @@ async fn serve_connection(
             format!("no CLIENT_HELLO within {} s", deadlines.hello.as_secs_f32()),
         )
     })??;
-    // §10.1: nothing but CLIENT_HELLO may come first.
     let hello = ClientHello::from_message(&message)?;
     let answer = ServerHello::answer(&hello)?;
     let peer_limit = hello.limits.max_message;
@@ -218,19 +220,23 @@ async fn serve_connection(
     );
     // §8.2, §14.5: Channels become available.
     connection.set_max_concurrent_bi_streams(VarInt::from_u32(1 + MAX_CHANNELS));
-    tokio::spawn(reject_channels(connection.clone()));
+    tokio::spawn(accept_channels(connection.clone()));
 
-    // Session requests come with RB007 and Tier RD.
-    let message = control_message(&mut recv).await?;
-    Err(match message.kind {
-        AUTH_REQUEST => Failure::violation("AUTH_REQUEST on an Authenticated Connection"),
-        CLIENT_HELLO => Failure::violation("second CLIENT_HELLO"),
-        kind => Failure::new(
-            Code::InternalError,
-            format!("message type {kind}: not implemented yet"),
-        ),
+    // §8.4: requests. Their operations come with Tier RD; until then each is
+    // answered with INTERNAL_ERROR, and the Connection stays open.
+    loop {
+        let message = control_message(&mut recv, State::Authenticated).await?;
+        debug_assert!(control::is_request(message.kind));
+        let id = control::request_id(&message)?;
+        tracing::debug!(
+            remote = %connection.remote_address(),
+            kind = message.kind,
+            id,
+            "request not implemented yet"
+        );
+        let result = control::request_result(id, Code::InternalError);
+        wire::write_message(&mut send, &result, peer_limit).await?;
     }
-    .into())
 }
 
 /// The control stream of an Established Connection.
@@ -254,7 +260,7 @@ async fn authenticate(
     let exporter = auth::exporter(control.connection)?;
     let mut failures = 0;
     loop {
-        let message = timeout_at(deadline, control_message(control.recv))
+        let message = timeout_at(deadline, control_message(control.recv, State::Established))
             .await
             .map_err(|_| {
                 Failure::new(
@@ -265,16 +271,6 @@ async fn authenticate(
                     ),
                 )
             })??;
-        match message.kind {
-            AUTH_REQUEST => {}
-            CLIENT_HELLO => return Err(Failure::violation("second CLIENT_HELLO").into()),
-            kind => {
-                return Err(Failure::violation(format!(
-                    "message type {kind} before authentication"
-                ))
-                .into());
-            }
-        }
         let received = Instant::now();
         let request = AuthRequest::from_message(&message)?;
         if request.method != AUTH_PUBLICKEY_ED25519 {
@@ -316,21 +312,62 @@ async fn authenticate(
     }
 }
 
-/// Channels come with Tier RC: every stream the Client opens is rejected with
-/// CHANNEL_REJECTED (§8.3).
-async fn reject_channels(connection: Connection) {
-    let code = Code::ChannelRejected.varint();
-    while let Ok((mut send, mut recv)) = connection.accept_bi().await {
-        let _ = send.reset(code);
-        let _ = recv.stop(code);
+/// Streams the Client opens on an Authenticated Connection: each must start with
+/// CHANNEL_OPEN (§8.3). No channel kind is implemented yet (terminal: Tier RC), so
+/// every Channel is rejected with CHANNEL_REJECTED; the Connection stays open.
+async fn accept_channels(connection: Connection) {
+    while let Ok((send, recv)) = connection.accept_bi().await {
+        tokio::spawn(open_channel(connection.clone(), send, recv));
     }
 }
 
-/// The next message on the control stream; its end is an error (§8.1).
-async fn control_message(recv: &mut quinn::RecvStream) -> Result<wire::Message, StreamError> {
-    wire::read_message(recv, DEFAULT_MESSAGE_LIMIT)
+async fn open_channel(
+    connection: Connection,
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+) {
+    let remote = connection.remote_address();
+    let failure = match wire::read_message(&mut recv, DEFAULT_MESSAGE_LIMIT).await {
+        Ok(Some(message)) => match control::channel_kind(&message) {
+            Ok(kind) => {
+                let why = if kind == control::TERMINAL {
+                    "terminal Channels are not implemented yet"
+                } else {
+                    "unknown channel kind"
+                };
+                tracing::info!(%remote, kind, reason = why, "Channel rejected");
+                let code = Code::ChannelRejected.varint();
+                let _ = send.reset(code);
+                let _ = recv.stop(code);
+                return;
+            }
+            Err(failure) => failure,
+        },
+        Ok(None) => Failure::violation("Channel stream ended before CHANNEL_OPEN"),
+        Err(StreamError::Failure(failure)) => failure,
+        // The Client gave up the stream, or the Connection is gone.
+        Err(StreamError::Reset(_) | StreamError::Lost(_)) => return,
+    };
+    connection.close(failure.code.varint(), b"");
+    tracing::info!(
+        %remote,
+        code = failure.code.name(),
+        reason = %failure.reason,
+        "Connection closed by the Server"
+    );
+}
+
+/// The next message on the control stream, permitted from the Client in `state`;
+/// the end of the stream is an error (§8.1).
+async fn control_message(
+    recv: &mut quinn::RecvStream,
+    state: State,
+) -> Result<wire::Message, StreamError> {
+    let message = wire::read_message(recv, DEFAULT_MESSAGE_LIMIT)
         .await?
-        .ok_or_else(|| Failure::violation("control stream ended").into())
+        .ok_or_else(|| Failure::violation("control stream ended"))?;
+    control::check(message.kind, Sender::Client, state)?;
+    Ok(message)
 }
 
 /// Failure for a stream error other than a lost Connection.
@@ -370,6 +407,7 @@ mod tests {
     use super::*;
     use crate::auth::UserKey;
     use crate::authorized::Accounts;
+    use crate::cbor::Value;
     use crate::hello::WIRE_VERSION;
     use crate::tls::{Expected, ServerKeyCheck};
     use crate::wire::{Message, SERVER_HELLO, frame};
@@ -453,6 +491,16 @@ mod tests {
             (send, recv)
         }
 
+        /// HELLO and successful authentication as `alice`.
+        async fn authenticated(&self) -> (quinn::SendStream, quinn::RecvStream) {
+            let (mut send, mut recv) = self.hello().await;
+            send.write_all(&self.request(&self.user, "alice"))
+                .await
+                .unwrap();
+            assert!(auth_result(&mut recv).await);
+            (send, recv)
+        }
+
         /// AUTH_REQUEST of `key` for `account`, signed for this Connection.
         fn request(&self, key: &UserKey, account: &str) -> Vec<u8> {
             let exporter = auth::exporter(&self.connection).unwrap();
@@ -485,29 +533,96 @@ mod tests {
     #[tokio::test]
     async fn authentication_then_channels_rejected() {
         let peer = Peer::start(Deadlines::default()).await;
-        let (mut send, mut recv) = peer.hello().await;
-        send.write_all(&peer.request(&peer.user, "alice"))
-            .await
-            .unwrap();
-        assert!(auth_result(&mut recv).await);
+        let (mut send, mut recv) = peer.authenticated().await;
 
-        // §8.2: the Client may open Channels now; there are none yet, so each is
-        // rejected with CHANNEL_REJECTED (§8.3).
-        let (mut channel, mut channel_recv) = peer.connection.open_bi().await.unwrap();
-        channel.write_all(b"\x01").await.unwrap();
-        let mut buf = [0u8; 1];
-        match channel_recv.read(&mut buf).await {
-            Err(quinn::ReadError::Reset(code)) => {
-                assert_eq!(code, Code::ChannelRejected.varint());
+        // §8.2: the Client may open Channels now; no kind is implemented yet, so each
+        // is rejected with CHANNEL_REJECTED (§8.3), and the Connection stays.
+        for kind in [control::TERMINAL, 77] {
+            let (mut channel, mut channel_recv) = peer.connection.open_bi().await.unwrap();
+            channel
+                .write_all(&frame(&channel_open(kind).encode()))
+                .await
+                .unwrap();
+            let mut buf = [0u8; 1];
+            match channel_recv.read(&mut buf).await {
+                Err(quinn::ReadError::Reset(code)) => {
+                    assert_eq!(code, Code::ChannelRejected.varint());
+                }
+                other => panic!("{other:?}"),
             }
-            other => panic!("{other:?}"),
         }
+        assert_eq!(request(&mut send, &mut recv, 1).await, Code::InternalError);
 
         // The Account of a Connection never changes (§12.4).
         send.write_all(&peer.request(&peer.user, "alice"))
             .await
             .unwrap();
         assert_eq!(peer.closed_with().await, Some(Code::ProtocolViolation));
+    }
+
+    fn channel_open(kind: u64) -> Message {
+        Message::new(wire::CHANNEL_OPEN, vec![(0, Value::Uint(kind))])
+    }
+
+    /// Sends SESSION_LIST with request ID `id`; returns the error code of its result.
+    async fn request(send: &mut quinn::SendStream, recv: &mut quinn::RecvStream, id: u64) -> Code {
+        let list = Message::new(wire::SESSION_LIST, vec![(0, Value::Uint(id))]);
+        send.write_all(&frame(&list.encode())).await.unwrap();
+        let result = wire::read_message(recv, DEFAULT_MESSAGE_LIMIT)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.kind, wire::REQUEST_RESULT);
+        assert_eq!(result.field(0), Some(&Value::Uint(id)));
+        Code::from_value(result.field(1).and_then(Value::as_uint).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn requests_get_results_and_keep_the_connection() {
+        let peer = Peer::start(Deadlines::default()).await;
+        let (mut send, mut recv) = peer.authenticated().await;
+        for id in [7, 8, u64::MAX] {
+            assert_eq!(request(&mut send, &mut recv, id).await, Code::InternalError);
+        }
+    }
+
+    #[tokio::test]
+    async fn control_violations_after_authentication() {
+        let violation = Some(Code::ProtocolViolation);
+        let after = async |message: Message| {
+            let peer = Peer::start(Deadlines::default()).await;
+            let (mut send, _recv) = peer.authenticated().await;
+            send.write_all(&frame(&message.encode())).await.unwrap();
+            peer.closed_with().await
+        };
+        let cases = [
+            Message::new(wire::SESSION_LIST, vec![]),
+            Message::new(wire::REQUEST_RESULT, vec![(0, Value::Uint(1))]),
+            Message::new(wire::TERMINAL_DATA, vec![]),
+            channel_open(control::TERMINAL),
+            Message::new(999, vec![]),
+        ];
+        for message in cases {
+            assert_eq!(after(message.clone()).await, violation, "{message:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn channel_must_start_with_channel_open() {
+        let violation = Some(Code::ProtocolViolation);
+        let first = async |bytes: Vec<u8>| {
+            let peer = Peer::start(Deadlines::default()).await;
+            let (_send, _recv) = peer.authenticated().await;
+            let (mut channel, _channel_recv) = peer.connection.open_bi().await.unwrap();
+            channel.write_all(&bytes).await.unwrap();
+            channel.finish().unwrap();
+            peer.closed_with().await
+        };
+        let data = Message::new(wire::TERMINAL_DATA, vec![(0, Value::Bytes(vec![1]))]);
+        assert_eq!(first(frame(&data.encode())).await, violation);
+        let no_kind = Message::new(wire::CHANNEL_OPEN, vec![]);
+        assert_eq!(first(frame(&no_kind.encode())).await, violation);
+        assert_eq!(first(vec![0x9f]).await, violation);
     }
 
     #[tokio::test]

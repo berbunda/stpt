@@ -11,8 +11,23 @@ use crate::cbor::{self, Value};
 /// larger one (§7.2, §13.4).
 pub const DEFAULT_MESSAGE_LIMIT: u64 = 65535;
 
+// Core message types (§11.3).
 pub const CLIENT_HELLO: u64 = 1;
 pub const SERVER_HELLO: u64 = 2;
+pub const CHANNEL_OPEN: u64 = 3;
+pub const AUTH_REQUEST: u64 = 4;
+pub const AUTH_RESULT: u64 = 5;
+pub const TERMINAL_ATTACHED: u64 = 6;
+pub const TERMINAL_DATA: u64 = 7;
+pub const TERMINAL_STDERR: u64 = 8;
+pub const TERMINAL_EOF: u64 = 24;
+pub const TERMINAL_RESIZE: u64 = 25;
+pub const TERMINAL_SIGNAL: u64 = 26;
+pub const TERMINAL_EXIT: u64 = 27;
+pub const SESSION_TERMINATE: u64 = 28;
+pub const REQUEST_RESULT: u64 = 29;
+pub const SESSION_DETACH: u64 = 30;
+pub const SESSION_LIST: u64 = 31;
 
 /// Error codes (§13.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

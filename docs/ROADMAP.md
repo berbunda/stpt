@@ -18,7 +18,7 @@ IDs A001–D008 were renamed to RA001–RD008 on 2026-10-11 (prefix scheme chang
 - [x] RB004  client ↔ server handshake ← PB006 ✅ 2026-10-17
 - [x] RB005  STPT protocol negotiation ← PB007 ✅ 2026-10-17
 - [x] RB006  authentication ← PB008 ✅ 2026-10-17
-- [ ] RB007  control stream ← PB003, PB004
+- [x] RB007  control stream ← PB003, PB004 ✅ 2026-10-17
 
 # 3	Tier RC — Terminal MVP
 - [ ] RC001  Linux PTY
