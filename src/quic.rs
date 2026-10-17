@@ -12,6 +12,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::identity::ServerKey;
 use crate::tls::{self, ServerKeyCheck};
+use crate::wire::Code;
 
 /// QUIC version 1 (RFC 9000); no other version is offered or accepted.
 const QUIC_V1: u32 = 1;
@@ -59,12 +60,14 @@ fn fmt_connection_error(e: &quinn::ConnectionError, f: &mut fmt::Formatter<'_>) 
             close.error_code,
             reason(&close.reason)
         ),
-        quinn::ConnectionError::ApplicationClosed(close) => write!(
-            f,
-            "closed by the peer: code {}{}",
-            close.error_code,
-            reason(&close.reason)
-        ),
+        quinn::ConnectionError::ApplicationClosed(close) => {
+            let code = close.error_code.into_inner();
+            match Code::from_value(code) {
+                Some(name) => write!(f, "closed by the peer: {}", name.name())?,
+                None => write!(f, "closed by the peer: code {code}")?,
+            }
+            f.write_str(&reason(&close.reason))
+        }
         other => fmt::Display::fmt(other, f),
     }
 }
@@ -297,7 +300,7 @@ mod tests {
             let text = Error::Connection(client.unwrap().closed().await).to_string();
             assert_eq!(
                 text,
-                r#"closed by the peer: code 7, reason "\u{1b}]52;c;evil\u{7}\nstpt: fake""#
+                r#"closed by the peer: CHANNEL_REJECTED, reason "\u{1b}]52;c;evil\u{7}\nstpt: fake""#
             );
         });
     }

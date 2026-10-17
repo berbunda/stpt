@@ -13,16 +13,19 @@ Single Cargo package `stpt` (binary crate, edition 2024). Minimum Rust version (
 | `src/server.rs` | Server role: `stpt server` |
 | `src/config.rs` | configuration files of both roles |
 | `src/destination.rs` | parsing of `account@host[:port]` and `host[:port]` |
+| `src/cbor.rs` | strict CBOR codec of the STPT subset |
 | `src/error.rs` | error type ending the program, exit codes |
+| `src/hello.rs` | HELLO messages, version selection, capabilities, limits, GREASE |
 | `src/identity.rs` | Server Identity: key pair and key file, public key, fingerprint |
 | `src/logging.rs` | log levels and log output |
 | `src/quic.rs` | QUIC transport: Endpoints, transport parameters, sockets |
 | `src/tls.rs` | TLS 1.3 profile, verification of the Server key |
 | `src/trust.rs` | trust store of the Client |
+| `src/wire.rs` | frames, messages, message types, error codes |
 
 # 2	Command line
 - One binary, one explicit subcommand per operation: `server`, `connect`, `exec`, `sessions`, `detach`, `terminate`, `trust list`, `trust remove`.
-- `server` accepts Connections (§6); `server --fingerprint` prints the fingerprint of the Server key and exits (§7). The Client commands with a destination establish a Connection and verify the Server key (§7), then close it and print `not implemented yet`. `trust` manages the trust store.
+- `server` accepts Connections (§6); `server --fingerprint` prints the fingerprint of the Server key and exits (§7). The Client commands with a destination establish a Connection, verify the Server key (§7) and exchange HELLO (§8), then close it regularly and print `not implemented yet`. `trust` manages the trust store.
 - The destination and `--fingerprint SHA256:...` form `cli::Remote`, flattened into every Client command with a destination.
 - Destination `account@host[:port]`: the last `@` separates the Account (so `user@domain` Accounts work), IPv6 addresses go in brackets, the default port is 843, the Account name is at most 256 bytes (PROTOCOL.md §13.4).
 - Server address (`destination::Address`, also `trust remove HOST[:PORT]`): normalized at parsing, so equal addresses compare equal: DNS names in lower case, IP addresses in canonical form (`[0::1]` = `[::1]`). A host with a space, control character or bracket is refused, so it cannot break a trust store line.
@@ -46,7 +49,7 @@ Single Cargo package `stpt` (binary crate, edition 2024). Minimum Rust version (
 - Keys: Server `listen`, `log_level`, `identity_key` (Server key file, default `/etc/stpt/server_key`).
 
 # 5	Errors and logging
-- A role returns `Result<ExitCode, error::Error>`. `main` prints an error once as `stpt: <error>` on standard error and exits with `Error::exit_code` (now always 255). Command line errors are clap's (exit 2). Lower modules have their own error types (`config::Error`, `quic::Error`, `identity::KeyFileError`, `trust::Error`), converted with `From`. Errors of the Server key check are multi-line (§7).
+- A role returns `Result<ExitCode, error::Error>`. `main` prints an error once as `stpt: <error>` on standard error and exits with `Error::exit_code` (now always 255). Command line errors are clap's (exit 2). Lower modules have their own error types (`config::Error`, `quic::Error`, `identity::KeyFileError`, `trust::Error`), converted with `From`. Errors of the Server key check are multi-line (§7). A protocol failure found by the Client (`wire::Failure`: code and local reason) is `Error::Protocol`, printed as `stpt: protocol: <reason> (<CODE>)`; a close by the Server is a transport error printed with the code name (`stpt: transport: closed by the peer: VERSION_NEGOTIATION_FAILED`).
 - The final error is printed directly, not as a log event: it is also shown when the configuration fails, before logging starts, and under `-q`.
 - Log events: `tracing` with a `tracing-subscriber` fmt subscriber on standard error, installed once after the configuration is read; no ANSI colours, no log files (under systemd standard error goes to the journal, RK001).
 - Level: `-q` error; `-v` info, `-vv` debug, `-vvv` trace; else the Server's `log_level`; else Client warn, Server info.
@@ -64,7 +67,7 @@ PROTOCOL.md §6–§8.2, §13.3. `quinn` (QUIC) over `rustls` (TLS 1.3) with the
 - Server key: Ed25519 Raw Public Key (RFC 7250) of the Server Identity (§7).
 - Client verification (`tls::ServerKeyCheck`, a rustls `ServerCertVerifier`): only Raw Public Keys, signature scheme Ed25519 only, the handshake signature verified with the presented key. The verifier decides on the presented SubjectPublicKeyInfo with the stored key and the `--fingerprint` (`Expected`) and records the key with its `Verdict`: `Trusted` lets the handshake go on; `Unknown`, `Changed`, `Mismatch` abort it, and the Client reads the verdict to report the reason (§7).
 - Client Endpoint: `quic::client` binds once per command; `quic::connect` may run on it several times (reconnect after a confirmation, §7). A regular close sends NO_ERROR (`quic::NO_ERROR`) and waits until the Endpoint is idle, so the Server sees the close.
-- Server Connection lifecycle: accept, handshake, log `Connection established` with the remote address, keep the Connection until the Client closes it or the idle timeout expires, log the close reason. Handshake failures are logged with their reason (info). HELLO and its deadline come with RB004, the control stream with RB007. The Server runs until it is killed; graceful shutdown comes later.
+- Server Connection lifecycle: accept, TLS handshake (failures logged with their reason, info), HELLO (§8), then wait for user authentication until its deadline; log the close with the remote address and either the Client's close reason or the Server's code and exact reason. The Server runs until it is killed; graceful shutdown comes later.
 - `rustls` is built without its `logging` feature and `quinn` without `log`, so no `log` bridge is needed; handshake errors reach the log through the `quinn` error values.
 - Close reasons: `stpt` closes with an empty reason phrase (`quic::NO_ERROR`, `b""`). After a failed TLS handshake `quinn` itself sends the `rustls` error text in the transport close (e.g. `invalid peer certificate: UnknownIssuer`); quinn has no option to suppress it, and PROTOCOL.md §13.1 allows it. A received reason phrase is never acted on; it is shown only escaped (`quic::Error` writes it with Debug escaping, as quinn's own Display writes it unchanged), so a peer cannot put line breaks or terminal control sequences into the Client's error message.
 
@@ -85,7 +88,19 @@ PROTOCOL.md §9.
 - The host is resolved with the system resolver; only the first address is used for now.
 - Not yet: key rotation (PI003/RI004), hashing of host names in the trust store, system-wide trust store.
 
-# 8	Dependencies
+# 8	Messages and HELLO
+PROTOCOL.md §7, §8.1, §10, §11, §13.
+
+- CBOR (`cbor`): own codec of the subset STPT uses (`Value`: unsigned and negative integers, byte and text strings, arrays, maps, booleans, null). The encoder writes deterministic encoding: shortest arguments, definite lengths, map keys sorted bytewise by their encoding. The decoder accepts only that: it rejects indefinite lengths, tags, floats, other simple values, reserved additional information, arguments longer than needed, map keys out of order or duplicate, invalid UTF-8, nesting deeper than 16 (the message array is depth 1) and bytes after the item. A claimed array, map or string length larger than the remaining input is refused before any allocation.
+- Frames (`wire`): QUIC varint length (any valid form accepted, shortest written), then one CBOR item. A frame of length 0 is a protocol violation; a length over the receiver limit (65535, the minimum and default of §13.4; `stpt` announces no larger one) is refused with LIMIT_EXCEEDED before the payload is read. The end of a stream inside a frame is a protocol violation. `Message` is `[type, {* int => any}]`; unknown body keys are kept and never asked for.
+- `wire::Failure` (error code and reason) is a locally found reason to close; the peer gets only the code with an empty reason phrase (PROTOCOL.md §13.1), the reason goes to the Server log or the Client's error message. `wire::Code` holds the codes of §13.2 and their names.
+- HELLO (`hello`): wire version 0xFF000001 only. The Client offers it plus one random GREASE version (0x?A?A?A?A, repeated digit) and one random GREASE capability with parameter null; no capabilities are defined yet, so the Server selects none. Limits are sent only when they differ from the default. The Server selects the highest common final version, else the highest common draft version, never GREASE; none: VERSION_NEGOTIATION_FAILED. SERVER_HELLO lists method 1 (`publickey-ed25519`).
+- Validation: CLIENT_HELLO needs a non-empty list of uint versions; capabilities a map with uint ids; limits a map with integer keys and a message size of at least 65535. The Client checks SERVER_HELLO: a version it offered and not GREASE, only capabilities it offered and not GREASE, a non-empty list of methods. Every violation is PROTOCOL_VIOLATION.
+- Server sequence (`server::serve_connection`): accept the control stream and read CLIENT_HELLO within 10 s (TIMEOUT); the first message must be CLIENT_HELLO; answer SERVER_HELLO; Established. Until user authentication (RB006) every further message is refused (a second CLIENT_HELLO or any other type: PROTOCOL_VIOLATION), the end or a reset of the control stream is PROTOCOL_VIOLATION, and the authentication deadline (60 s) closes with TIMEOUT. Deadlines are `server::Deadlines` (shorter in tests).
+- Client sequence (`client::Connection::hello`): open the control stream, send CLIENT_HELLO, read SERVER_HELLO within 10 s (TIMEOUT, PROTOCOL.md §13.3), check it. The Client keeps both directions of the control stream until it closes the Connection: dropping a quinn stream sends FIN, which the Server would treat as a violation.
+- Not yet (RB007): the control stream after authentication, message dispatch by Connection state, stream priority.
+
+# 9	Dependencies
 | Crate | Purpose | Why |
 |---|---|---|
 | `clap` (derive) | command line parsing | de facto standard Rust parser: help, error messages and later shell completion (RK003) without own parsing code |

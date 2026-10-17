@@ -1,14 +1,17 @@
+mod cbor;
 mod cli;
 mod client;
 mod config;
 mod destination;
 mod error;
+mod hello;
 mod identity;
 mod logging;
 mod quic;
 mod server;
 mod tls;
 mod trust;
+mod wire;
 
 use std::process::ExitCode;
 

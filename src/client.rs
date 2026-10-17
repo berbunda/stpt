@@ -3,16 +3,22 @@
 use std::io::{self, IsTerminal, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use crate::cli::{ClientCommand, Common, Remote, TrustAction};
 use crate::config::{self, ClientConfig};
 use crate::destination::Address;
 use crate::error::Error;
+use crate::hello::{ClientHello, ServerHello};
 use crate::identity::Fingerprint;
 use crate::logging::{self, Role};
 use crate::quic;
 use crate::tls::{Expected, ServerKeyCheck, Verdict};
 use crate::trust::{self, TrustStore};
+use crate::wire::{self, DEFAULT_MESSAGE_LIMIT, Failure, StreamError};
+
+/// SERVER_HELLO received after CLIENT_HELLO was sent (§13.3).
+pub const SERVER_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn run(command: ClientCommand, common: &Common) -> Result<ExitCode, Error> {
     let (_config, path) =
@@ -35,8 +41,13 @@ pub fn run(command: ClientCommand, common: &Common) -> Result<ExitCode, Error> {
     let runtime = quic::runtime()?;
     let _guard = runtime.enter();
     let addr = resolve(&remote.destination.address)?;
-    let connection = runtime.block_on(connect(&remote, addr, &mut store, ask_user))?;
-    // Until HELLO (RB004) there is nothing to do on the Connection.
+    let mut connection = runtime.block_on(connect(&remote, addr, &mut store, ask_user))?;
+    let hello = runtime.block_on(connection.hello(SERVER_HELLO_TIMEOUT))?;
+    tracing::info!(
+        version = format_args!("{:#x}", hello.version),
+        "Connection established"
+    );
+    // User authentication comes with RB006.
     runtime.block_on(connection.close());
     Err(Error::NotImplemented(name))
 }
@@ -79,10 +90,13 @@ fn resolve(address: &Address) -> Result<SocketAddr, Error> {
         })
 }
 
-/// Established Connection with a trusted Server key.
+/// Connection with a trusted Server key.
 pub struct Connection {
     endpoint: quinn::Endpoint,
     connection: quinn::Connection,
+    /// Control stream once opened; kept until the Connection is closed, as dropping
+    /// it would end the stream, which the Server treats as an error (§8.1).
+    control: Option<(quinn::SendStream, quinn::RecvStream)>,
 }
 
 impl Connection {
@@ -90,6 +104,46 @@ impl Connection {
     async fn close(self) {
         self.connection.close(quic::NO_ERROR, b"");
         self.endpoint.wait_idle().await;
+    }
+
+    /// HELLO exchange (§10): CLIENT_HELLO on the new control stream, SERVER_HELLO
+    /// within `deadline`, checked against the offer. A violation by the Server
+    /// closes the Connection with its code; the reason is reported locally only.
+    async fn hello(&mut self, deadline: Duration) -> Result<ServerHello, Error> {
+        let failure = match self.exchange_hello(deadline).await {
+            Ok(hello) => return Ok(hello),
+            Err(StreamError::Lost(reason)) => {
+                return Err(quic::Error::Connection(reason).into());
+            }
+            Err(StreamError::Failure(failure)) => failure,
+            Err(StreamError::Reset(code)) => {
+                Failure::violation(format!("the Server reset the control stream ({code})"))
+            }
+        };
+        self.connection.close(failure.code.varint(), b"");
+        self.endpoint.wait_idle().await;
+        Err(Error::Protocol(failure))
+    }
+
+    async fn exchange_hello(&mut self, deadline: Duration) -> Result<ServerHello, StreamError> {
+        let (send, recv) = self
+            .control
+            .insert(self.connection.open_bi().await.map_err(StreamError::Lost)?);
+        let offer = ClientHello::ours();
+        wire::write_message(send, &offer.to_message(), DEFAULT_MESSAGE_LIMIT).await?;
+        let message =
+            tokio::time::timeout(deadline, wire::read_message(recv, DEFAULT_MESSAGE_LIMIT))
+                .await
+                .map_err(|_| {
+                    Failure::new(
+                        wire::Code::Timeout,
+                        format!("no SERVER_HELLO within {} s", deadline.as_secs_f32()),
+                    )
+                })??
+                .ok_or_else(|| Failure::violation("the Server ended the control stream"))?;
+        let hello = ServerHello::from_message(&message)?;
+        hello.check(&offer)?;
+        Ok(hello)
     }
 }
 
@@ -120,10 +174,11 @@ async fn connect(
                     store.add(address.clone(), key)?;
                     tracing::info!(%address, "Server key verified by fingerprint and stored");
                 }
-                tracing::info!(%address, "Connection established");
+                tracing::debug!(%address, "TLS handshake completed, Server key trusted");
                 return Ok(Connection {
                     endpoint,
                     connection,
+                    control: None,
                 });
             }
             Err(error) => error,
@@ -333,5 +388,121 @@ mod tests {
         assert_eq!(presented, server.key.fingerprint());
         assert_eq!(stored(&path, &server), Some(old));
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// What a fake Server does after it received CLIENT_HELLO.
+    enum Reply {
+        Bytes(Vec<u8>),
+        Nothing,
+        Close(wire::Code),
+    }
+
+    /// Runs a fake Server for one Connection and the Client HELLO against it.
+    /// Returns the result of the Client and the code the Client closed with.
+    async fn hello_against(
+        reply: impl FnOnce(&ClientHello) -> Reply + Send + 'static,
+    ) -> (Result<ServerHello, Error>, Option<wire::Code>) {
+        let key = ServerKey::generate();
+        let endpoint = quic::listen("127.0.0.1:0".parse().unwrap(), &key).unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let connection = quic::accept(endpoint.accept().await.unwrap())
+                .await
+                .unwrap();
+            let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+            let message = wire::read_message(&mut recv, DEFAULT_MESSAGE_LIMIT)
+                .await
+                .unwrap()
+                .unwrap();
+            match reply(&ClientHello::from_message(&message).unwrap()) {
+                Reply::Bytes(bytes) => send.write_all(&bytes).await.unwrap(),
+                Reply::Nothing => {}
+                Reply::Close(code) => connection.close(code.varint(), b""),
+            }
+            match connection.closed().await {
+                quinn::ConnectionError::ApplicationClosed(close) => {
+                    wire::Code::from_value(close.error_code.into_inner())
+                }
+                _ => None,
+            }
+        });
+        let path = store_path(&format!("hello-{}", addr.port()));
+        let mut store = TrustStore::load(path.clone()).unwrap();
+        let remote = Remote {
+            destination: format!("alice@{addr}").parse().unwrap(),
+            fingerprint: Some(key.public_key().fingerprint()),
+        };
+        let mut connection = connect(&remote, addr, &mut store, never_asked)
+            .await
+            .unwrap();
+        let result = connection.hello(Duration::from_millis(300)).await;
+        if result.is_ok() {
+            connection.close().await;
+        }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        (result, server.await.unwrap())
+    }
+
+    fn answer_frame(answer: &ServerHello) -> Reply {
+        Reply::Bytes(wire::frame(&answer.to_message().encode()))
+    }
+
+    #[tokio::test]
+    async fn hello_succeeds() {
+        let (result, closed) =
+            hello_against(|offer| answer_frame(&ServerHello::answer(offer).unwrap())).await;
+        assert_eq!(result.unwrap().version, crate::hello::WIRE_VERSION);
+        assert_eq!(closed, Some(wire::Code::NoError));
+    }
+
+    fn protocol_code(result: Result<ServerHello, Error>) -> wire::Code {
+        match result {
+            Err(Error::Protocol(failure)) => failure.code,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_answers_close_with_violation() {
+        let violation = Some(wire::Code::ProtocolViolation);
+        let not_offered = |offer: &ClientHello| {
+            let mut answer = ServerHello::answer(offer).unwrap();
+            answer.version = 0xFF00_0002;
+            answer_frame(&answer)
+        };
+        let grease = |offer: &ClientHello| {
+            let mut answer = ServerHello::answer(offer).unwrap();
+            answer.version = offer.versions[1];
+            answer_frame(&answer)
+        };
+        let garbage = |_: &ClientHello| Reply::Bytes(wire::frame(&[0xf9, 0x3c, 0x00]));
+        let client_hello =
+            |offer: &ClientHello| Reply::Bytes(wire::frame(&offer.to_message().encode()));
+        for (result, closed) in [
+            hello_against(not_offered).await,
+            hello_against(grease).await,
+            hello_against(garbage).await,
+            hello_against(client_hello).await,
+        ] {
+            assert_eq!(protocol_code(result), wire::Code::ProtocolViolation);
+            assert_eq!(closed, violation);
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_answer_times_out() {
+        let (result, closed) = hello_against(|_| Reply::Nothing).await;
+        assert_eq!(protocol_code(result), wire::Code::Timeout);
+        assert_eq!(closed, Some(wire::Code::Timeout));
+    }
+
+    #[tokio::test]
+    async fn server_close_is_reported_by_name() {
+        let (result, _) =
+            hello_against(|_| Reply::Close(wire::Code::VersionNegotiationFailed)).await;
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "transport: closed by the peer: VERSION_NEGOTIATION_FAILED"
+        );
     }
 }

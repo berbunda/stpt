@@ -1,7 +1,7 @@
 # stpt
 Secure terminal access over QUIC: a single program acting as client and server, with Sessions that survive the loss of a connection.
 
-Status: early development. The Client connects to the Server and verifies the Server key; nothing else happens on the Connection yet, so the Client commands end with `not implemented yet`.
+Status: early development. The Client connects to the Server, verifies the Server key and agrees on the protocol version; user login and terminals are not there yet, so the Client commands end with `not implemented yet`.
 
 ```
 stpt server [--listen ADDR:PORT] [--fingerprint]

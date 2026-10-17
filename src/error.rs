@@ -9,6 +9,7 @@ use crate::destination::Address;
 use crate::identity::{self, Fingerprint};
 use crate::quic;
 use crate::trust;
+use crate::wire;
 
 /// Exit code for STPT and Connection errors, as ssh.
 pub const EXIT_STPT_ERROR: u8 = 255;
@@ -50,6 +51,9 @@ pub enum Error {
         presented: Fingerprint,
     },
     Terminal(io::Error),
+    /// The Server violated the protocol or a deadline expired; the Connection was
+    /// closed with the code of the failure.
+    Protocol(wire::Failure),
 }
 
 impl Error {
@@ -110,6 +114,7 @@ impl fmt::Display for Error {
                  presented: {presented}"
             ),
             Self::Terminal(e) => write!(f, "terminal: {e}"),
+            Self::Protocol(failure) => write!(f, "protocol: {failure}"),
         }
     }
 }
