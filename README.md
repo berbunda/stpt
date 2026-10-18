@@ -45,7 +45,7 @@ stpt terminate alice@host work                 # end it: HUP, KILL after 5 s (--
 - Several Clients may be attached to one Session at once; all see the output, all may type. `--read-only` only watches; `--takeover` detaches the others first. The size of the window that typed last applies.
 - Attaching shows the last output of the Session first (up to 16 KiB), so a full-screen program redraws.
 - A Session whose program has exited stays until a Client has seen its exit status (at most 24 hours), so `stpt connect --attach` still shows how it ended.
-- In `connect`, `~.` is recognized only at the start of a line; type `~~` for a `~` there.
+- In `connect`, `~.` is recognized only at the start of a line, right after Enter; type `~~` for a `~` there. Some terminal emulators send input of their own between the keys (focus changes, mouse movement in programs such as htop); then press Enter again just before `~.`. With a non-English keyboard layout, switch to English for `~`.
 - Stopping the Server ends all Sessions.
 
 # Private key, public key, fingerprint

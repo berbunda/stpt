@@ -239,6 +239,12 @@ mod server {
         assert!(table.contains("work"), "{table}");
         assert!(table.contains("running"), "{table}");
 
+        // A read-only Attachment sends nothing of what is typed; `~.` still detaches.
+        let args = s.args("connect", &["--attach", "work", "--read-only"]);
+        let (text, code) = in_terminal(&s, &args, b"ls\r~.");
+        assert_eq!(code, Some(0), "{text}");
+        assert!(text.contains("stpt: detached; Session "), "{text}");
+
         // Attach by name: the earlier output is replayed.
         let args = s.args("connect", &["--attach", "work"]);
         let (text, code) = in_terminal(&s, &args, b"exit 3\n");

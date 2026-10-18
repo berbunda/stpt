@@ -21,6 +21,7 @@ use tokio::time::{Instant, sleep_until, timeout};
 
 use crate::authorized::KeyInfo;
 use crate::buffer::{OutputBuffer, Piece, Replay};
+use crate::modes::Modes;
 use crate::process::{self, Account, Io, Program};
 use crate::pty::{Master, Pty};
 use crate::terminal::{Command, Exit, Open, SessionId, Size};
@@ -68,6 +69,9 @@ const EVENT_QUEUE: usize = 8;
 
 /// How often Retention Policy is applied.
 const REAPER_TICK: Duration = Duration::from_secs(1);
+
+/// How long the PTY keeps the other size during a redraw, so the programs see it.
+const REDRAW_PAUSE: Duration = Duration::from_millis(100);
 
 /// After KILL, how long a termination waits for the processes before it is done
 /// anyway: a process in an uninterruptible wait must not delay it (§15.6).
@@ -184,6 +188,7 @@ impl Store {
                 size: open.size,
                 idle_since: Some(Instant::now()),
                 exited_at: None,
+                modes: Modes::new(),
             }),
             terminated: watch::channel(false).0,
         });
@@ -317,6 +322,8 @@ struct Inner {
     /// Since when the Session has no Attachment.
     idle_since: Option<Instant>,
     exited_at: Option<Instant>,
+    /// Terminal modes of the PTY output (§15.11).
+    modes: Modes,
 }
 
 enum SessionIo {
@@ -357,6 +364,8 @@ pub struct Attachment {
     pub end: watch::Receiver<Option<Code>>,
     /// Whether output was lost for this Client, so the screen is to be redrawn.
     pub redraw: bool,
+    /// The sequence that sets the terminal modes as the programs left them (§15.11).
+    pub modes: Vec<u8>,
 }
 
 /// How an Attachment wants to attach (§14.6, §15.9, §15.11).
@@ -492,6 +501,7 @@ impl Session {
             events,
             end,
             redraw: lost && exited.is_none() && self.pty(),
+            modes: inner.modes.restore(),
         })
     }
 
@@ -627,10 +637,32 @@ impl Session {
         }
     }
 
-    /// SIGWINCH, so full-screen programs redraw the screen for a new Client (§15.11).
+    /// Makes full-screen programs redraw the screen for a new Client (§15.11): the
+    /// PTY is one row smaller for a moment, as most redraw completely only when the
+    /// size really changes; each change sends SIGWINCH to the foreground group.
     pub async fn redraw(&self) {
-        if self.pty() {
-            self.signal(Signal::SIGWINCH).await;
+        let SessionIo::Pty(master) = &self.io else {
+            return;
+        };
+        let Some(size) = self.lock().size else {
+            return;
+        };
+        let rows = if size.rows > 1 {
+            size.rows - 1
+        } else {
+            size.rows + 1
+        };
+        if let Err(e) = master.resize(Size { rows, ..size }) {
+            tracing::debug!(error = %e, "PTY resize failed");
+            return;
+        }
+        tokio::time::sleep(REDRAW_PAUSE).await;
+        // Unless an Attachment set another size meanwhile.
+        let inner = self.lock();
+        if inner.size == Some(size)
+            && let Err(e) = master.resize(size)
+        {
+            tracing::debug!(error = %e, "PTY resize failed");
         }
     }
 
@@ -803,6 +835,9 @@ impl Session {
     async fn publish(&self, piece: Piece) {
         let targets = {
             let mut inner = self.lock();
+            if self.pty() {
+                inner.modes.feed(&piece.1);
+            }
             inner.buffer.push(piece.0, piece.1.clone());
             targets(&inner)
         };

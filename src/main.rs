@@ -16,6 +16,7 @@ mod hello;
 mod identity;
 mod listing;
 mod logging;
+mod modes;
 #[cfg(unix)]
 mod process;
 #[cfg(unix)]

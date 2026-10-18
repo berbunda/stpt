@@ -337,24 +337,28 @@ fn environment(value: &Value) -> Result<Vec<(String, String)>, Failure> {
 }
 
 /// TERMINAL_ATTACHED (§14.3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attached {
     pub session: SessionId,
     pub attachment: u64,
     /// Output offset of the first output byte that follows (§15.11).
     pub offset: u64,
+    /// The sequence that sets the terminal modes of the Session's programs; written
+    /// before the replay, not output (§15.11).
+    pub modes: Vec<u8>,
 }
 
 impl Attached {
-    pub fn to_message(self) -> Message {
-        Message::new(
-            TERMINAL_ATTACHED,
-            vec![
-                (0, Value::Bytes(self.session.0.to_vec())),
-                (1, Value::Uint(self.attachment)),
-                (2, Value::Uint(self.offset)),
-            ],
-        )
+    pub fn to_message(&self) -> Message {
+        let mut body = vec![
+            (0, Value::Bytes(self.session.0.to_vec())),
+            (1, Value::Uint(self.attachment)),
+            (2, Value::Uint(self.offset)),
+        ];
+        if !self.modes.is_empty() {
+            body.push((3, Value::Bytes(self.modes.clone())));
+        }
+        Message::new(TERMINAL_ATTACHED, body)
     }
 
     pub fn from_message(message: &Message) -> Result<Self, Failure> {
@@ -378,6 +382,11 @@ impl Attached {
                 .ok_or_else(invalid)?,
             attachment: uint(1)?,
             offset: uint(2)?,
+            modes: match message.field(3) {
+                None => Vec::new(),
+                Some(Value::Bytes(modes)) => modes.clone(),
+                Some(_) => return Err(invalid()),
+            },
         })
     }
 }
@@ -647,8 +656,17 @@ mod tests {
             session: SessionId::generate(),
             attachment: 1,
             offset: 0,
+            modes: Vec::new(),
         };
-        assert_eq!(Attached::from_message(&attached.to_message()), Ok(attached));
+        let message = attached.to_message();
+        assert_eq!(message.field(3), None);
+        assert_eq!(Attached::from_message(&message), Ok(attached));
+        let with_modes = Attached {
+            modes: b"\x1b[?1049h".to_vec(),
+            ..Attached::from_message(&message).unwrap()
+        };
+        let message = with_modes.to_message();
+        assert_eq!(Attached::from_message(&message), Ok(with_modes));
         let data = data(TERMINAL_DATA, b"x");
         assert!(Attached::from_message(&data).is_err());
     }

@@ -21,6 +21,7 @@ use crate::error::Error;
 use crate::hello::{AUTH_PUBLICKEY_ED25519, ClientHello, ServerHello};
 use crate::identity::Fingerprint;
 use crate::logging::{self, Role};
+use crate::modes::Modes;
 use crate::quic;
 use crate::terminal::{self, Attached, Command, Exit, Open, SessionId, Size};
 use crate::tls::{Expected, ServerKeyCheck, Verdict};
@@ -450,6 +451,13 @@ impl Connection {
 
         let terminated = console::termination().map_err(Error::Signals)?;
         let local = Console::setup(pty).map_err(Error::Terminal)?;
+        // The terminal modes the Session's programs set (§15.11).
+        let mut modes = Modes::new();
+        if pty && !attached.modes.is_empty() {
+            modes.feed(&attached.modes);
+            console::write_out(&attached.modes).map_err(Error::Terminal)?;
+        }
+        let read_only = open.read_only == Some(true);
         let (input, inputs) = mpsc::channel(16);
         let from_stdin = input.clone();
         console::read_input(move |data| {
@@ -457,30 +465,53 @@ impl Connection {
             from_stdin.blocking_send(input).is_ok()
         });
         let (detach, mut detached) = tokio::sync::oneshot::channel();
-        let sender = tokio::spawn(send_input(send, inputs, pty, self.peer_limit, detach));
+        let input_mode = InputMode { pty, read_only };
+        let sender = tokio::spawn(send_input(
+            send,
+            inputs,
+            input_mode,
+            self.peer_limit,
+            detach,
+        ));
+        // A read-only Attachment sends no input at all, not even its size (§15.9).
         let watcher = match open.size {
-            Some(size) if console::size().is_some() => {
+            Some(size) if !read_only && console::size().is_some() => {
                 Some(tokio::spawn(watch_size(input.clone(), size)))
             }
             _ => None,
         };
+        let session = attached.session;
         let interrupted = async {
-            if pty {
-                // Ctrl+C is input for the remote PTY.
-                std::future::pending().await
-            } else {
-                interrupts(input.clone()).await
+            match (pty, read_only) {
+                // Ctrl+C is input for the remote PTY (dropped when read-only).
+                (true, _) => std::future::pending().await,
+                (false, true) => {
+                    let _ = tokio::signal::ctrl_c().await;
+                    Ok(Outcome::Detached(session))
+                }
+                (false, false) => {
+                    interrupts(input.clone()).await;
+                    Err(Received::Local(Error::Interrupted))
+                }
             }
         };
-        let session = attached.session;
         let result = tokio::select! {
-            result = receive_output(&mut recv, pty) => result.map(Outcome::Exited),
-            () = interrupted => Err(Received::Local(Error::Interrupted)),
+            result = receive_output(&mut recv, pty, &mut modes) => result.map(Outcome::Exited),
+            result = interrupted => result,
             by = terminated => Err(Received::Local(Error::Terminated(by))),
             Ok(()) = &mut detached => Ok(Outcome::Detached(session)),
         };
         if let Some(watcher) = watcher {
             watcher.abort();
+        }
+        if pty {
+            // Leave the modes the remote programs set; after an early end also their
+            // colours, and continue on a new line.
+            let mut tail = modes.reset();
+            if !matches!(result, Ok(Outcome::Exited(_))) {
+                tail.extend_from_slice(b"\x1b[0m\r\n");
+            }
+            let _ = console::write_out(&tail);
         }
         drop(local);
         // The Client's FIN: after the exit status, or a detach when the Client ends
@@ -650,19 +681,28 @@ async fn watch_size(input: mpsc::Sender<Input>, mut last: Size) {
 /// Sends local input as TERMINAL_DATA and size changes as TERMINAL_RESIZE; at the
 /// end of standard input TERMINAL_EOF without a PTY, nothing with one (Ctrl-D is
 /// in-band, §14.7).
+/// What the input of a terminal Channel may carry.
+#[derive(Clone, Copy)]
+struct InputMode {
+    pty: bool,
+    /// Nothing is sent; only the escape is followed.
+    read_only: bool,
+}
+
 async fn send_input(
     mut send: quinn::SendStream,
     mut inputs: mpsc::Receiver<Input>,
-    pty: bool,
+    mode: InputMode,
     limit: u64,
     detach: tokio::sync::oneshot::Sender<()>,
 ) {
+    let pty = mode.pty;
     let mut escape = Escape::new();
     while let Some(input) = inputs.recv().await {
         let message = match input {
             Input::Data(data) if pty => {
                 let (data, detaching) = escape.filter(&data);
-                if !data.is_empty() {
+                if !data.is_empty() && !mode.read_only {
                     let message = terminal::data(TERMINAL_DATA, &data);
                     if wire::write_message(&mut send, &message, limit)
                         .await
@@ -678,6 +718,9 @@ async fn send_input(
                     let _ = send.stopped().await;
                     return;
                 }
+                continue;
+            }
+            Input::Data(_) | Input::Eof | Input::Resize(_) | Input::Signal(_) if mode.read_only => {
                 continue;
             }
             Input::Data(data) => terminal::data(TERMINAL_DATA, &data),
@@ -718,15 +761,26 @@ impl From<Failure> for Received {
     }
 }
 
-/// Writes remote output until TERMINAL_EXIT (§14.7, §14.10).
-async fn receive_output(recv: &mut quinn::RecvStream, pty: bool) -> Result<Exit, Received> {
+/// Writes remote output until TERMINAL_EXIT (§14.7, §14.10), following the terminal
+/// modes in it.
+async fn receive_output(
+    recv: &mut quinn::RecvStream,
+    pty: bool,
+    modes: &mut Modes,
+) -> Result<Exit, Received> {
     let local = |e| Received::Local(Error::Terminal(e));
     loop {
         let Some(message) = wire::read_message(recv, DEFAULT_MESSAGE_LIMIT).await? else {
             return Err(Received::Local(Error::TerminalEnded));
         };
         match message.kind {
-            TERMINAL_DATA => console::write_out(terminal::data_of(&message)?).map_err(local)?,
+            TERMINAL_DATA => {
+                let data = terminal::data_of(&message)?;
+                if pty {
+                    modes.feed(data);
+                }
+                console::write_out(data).map_err(local)?;
+            }
             TERMINAL_STDERR if !pty => {
                 console::write_err(terminal::data_of(&message)?).map_err(local)?;
             }

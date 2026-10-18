@@ -217,6 +217,7 @@ async fn relay(
         session: session.id,
         attachment: attachment.id,
         offset: attachment.offset,
+        modes: attachment.modes.clone(),
     };
     wire::write_message(send, &attached.to_message(), limit).await?;
     for (kind, data) in &attachment.replay {

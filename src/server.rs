@@ -1481,6 +1481,23 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn attach_restores_modes_and_redraws() {
+            let a = authenticated().await;
+            let line = format!("printf '\\033[?1049h\\033[?25l'; trap 'echo winch' WINCH; {LOOP}");
+            let (mut send, mut recv) = a.open(&command(&line, true)).await;
+            let created = attached(&mut recv).await;
+            assert!(created.modes.is_empty());
+            read_until(&mut recv, "ready").await;
+            detach(&mut send, &mut recv).await;
+
+            let (_send, mut recv) = a.attach(attach_to(created.session)).await;
+            let again = attached(&mut recv).await;
+            assert_eq!(again.modes, b"\x1b[?25l\x1b[?1049h");
+            // The size changes for a moment: the program sees SIGWINCH.
+            read_until(&mut recv, "winch").await;
+        }
+
+        #[tokio::test]
         async fn resume_continues_without_gap() {
             let a = authenticated().await;
             let line = "echo line1; sleep 0.3; echo line2; echo line3; read x";
