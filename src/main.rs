@@ -11,6 +11,8 @@ mod hello;
 mod identity;
 mod logging;
 #[cfg(unix)]
+mod process;
+#[cfg(unix)]
 mod pty;
 mod quic;
 mod server;

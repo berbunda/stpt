@@ -22,7 +22,7 @@ IDs A001–D008 were renamed to RA001–RD008 on 2026-10-11 (prefix scheme chang
 
 # 3	Tier RC — Terminal MVP
 - [x] RC001  Linux PTY ✅ 2026-10-18
-- [ ] RC002  shell spawning
+- [x] RC002  shell spawning ✅ 2026-10-18
 - [ ] RC003  terminal I/O ← PC001, PC003
 - [ ] RC004  terminal resize ← PC004
 - [ ] RC005  signals / Ctrl+C ← PC005

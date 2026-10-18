@@ -21,6 +21,7 @@ Single Cargo package `stpt` (binary crate, edition 2024). Minimum Rust version (
 | `src/hello.rs` | HELLO messages, version selection, capabilities, limits, GREASE |
 | `src/identity.rs` | Server Identity: key pair and key file, public key, fingerprint |
 | `src/logging.rs` | log levels and log output |
+| `src/process.rs` | processes of a Session: Account, login shell or command (Unix) |
 | `src/pty.rs` | pseudo-terminals of the Server (Unix) |
 | `src/quic.rs` | QUIC transport: Endpoints, transport parameters, sockets |
 | `src/tls.rs` | TLS 1.3 profile, verification of the Server key |
@@ -124,7 +125,12 @@ PROTOCOL.md §14.6, §14.8.
 
 - PTY (`pty`, Unix only): `Pty::open` opens a master/slave pair (`openpty`) with the window size of the Channel (`pty::Size`: columns, rows, pixel sizes). Termios: system defaults plus `IUTF8` on Linux (and Apple systems); no modes come from the Client. Both descriptors are close-on-exec.
 - Master: non-blocking, registered with the Tokio reactor (`AsyncFd`), so reading output and writing input wait without a thread per terminal. `read` returning 0 means end of output: no process holds the slave any more (Linux reports EIO). `resize` sets the size with `TIOCSWINSZ`; the kernel sends SIGWINCH to the foreground process group.
-- Not used by the Server yet: shells (RC002) and the terminal Channel (RC003) follow.
+- Processes (`process`, Unix only): `Account::lookup` reads the Account from the user database (`getpwnam`, groups with `getgrouplist`; an empty shell means `/bin/sh`). `spawn_on_pty` starts the Session's program with `tokio::process` (exit status awaited without a thread):
+  - always through the Account's shell, so `nologin` or `git-shell` keep their effect: login shell with argument 0 `-NAME` (as login and sshd), a command line with `-c`, an argument vector with `-c` and each element in single quotes (`'` as `'\''`), so it is neither split nor expanded;
+  - in the child before exec (`pre_exec`, system calls only, nothing allocated): `setsid`, the slave (already standard input, output and error) becomes the controlling terminal (`TIOCSCTTY`), then `setgroups`, `setgid`, `setuid` when the Server runs as root; a Server not running as root can start processes only for its own Account; working directory the home, else `/` with a notice on the terminal;
+  - environment built from scratch: `HOME`, `USER`, `LOGNAME`, `SHELL`, `PATH` (Debian `login.defs` values, root gets the `sbin` directories), `TERM` and the variables the Client sent that passed the allowlist; nothing of the Server's environment;
+  - not done (unlike sshd with PAM): PAM sessions and limits, utmp/wtmp/lastlog, systemd-logind sessions.
+- Not used by the Server yet: the terminal Channel (RC003) follows.
 
 # 11	Dependencies
 | Crate | Purpose | Why |
@@ -137,7 +143,7 @@ PROTOCOL.md §14.6, §14.8.
 | `quinn` (`runtime-tokio`, `rustls-aws-lc-rs`) | QUIC | the established Rust QUIC implementation (DECISIONS §5); without default features: no `ring`, no platform certificate verifier (no X.509), no `log` |
 | `rustls` (`aws_lc_rs`, `std`) | TLS 1.3 | memory-safe TLS used by `quinn`; supports Raw Public Keys and X25519MLKEM768; without TLS 1.2 and `logging` |
 | `aws-lc-rs` | Ed25519 key generation, SHA-256 of fingerprints | the crypto provider of `rustls` already, so no further library; the only one of the `rustls` providers with X25519MLKEM768. Built from C (AWS-LC): a C compiler is needed |
-| `tokio` (`net`, `rt-multi-thread`, `time`) | async runtime | the runtime `quinn` runs on; `net` for `AsyncFd` (PTY master) |
+| `tokio` (`net`, `process`, `rt-multi-thread`, `time`) | async runtime | the runtime `quinn` runs on; `net` for `AsyncFd` (PTY master), `process` for Session processes (brings `signal-hook-registry` for SIGCHLD) |
 | `socket2` | UDP socket options | explicit dual-stack; already used inside `tokio` and `quinn` |
-| `nix` (`user`, `term`, `fs`, `ioctl`; Unix only) | Account lookup (`getpwnam_r`), file owner check (`geteuid`), PTY (`openpty`, termios, `fcntl`, `TIOCSWINSZ`) | safe wrappers of the Unix calls instead of own `unsafe` FFI; later also processes and signals (Tier RC) |
+| `nix` (`user`, `term`, `fs`, `ioctl`, `process`; Unix only) | Account lookup (`getpwnam_r`, `getgrouplist`), file owner check (`geteuid`), PTY (`openpty`, termios, `fcntl`, `TIOCSWINSZ`), process start (`setsid`, `TIOCSCTTY`, `setgroups`, `setgid`, `setuid`) | safe wrappers of the Unix calls instead of own `unsafe` FFI; later also signals (RC005) |
 | `base64` (`std` only) | fingerprints, PEM key file, trust store | the standard Rust base64 crate; strict decoding (no non-canonical trailing bits); without the default `simd-unsafe` feature |

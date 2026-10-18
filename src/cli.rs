@@ -108,7 +108,7 @@ pub enum ClientCommand {
         #[command(flatten)]
         remote: Remote,
 
-        /// Run the command as an argument vector, without the Account's shell
+        /// Pass the arguments unchanged, without splitting or expansion by the shell
         #[arg(long)]
         no_shell: bool,
 
