@@ -681,6 +681,23 @@ async fn watch_size(input: mpsc::Sender<Input>, mut last: Size) {
 /// Sends local input as TERMINAL_DATA and size changes as TERMINAL_RESIZE; at the
 /// end of standard input TERMINAL_EOF without a PTY, nothing with one (Ctrl-D is
 /// in-band, §14.7).
+/// The shape of input for the log, to diagnose the escape without logging what is
+/// typed (passwords): letters, digits and other printable characters become `x`,
+/// non-ASCII bytes `?`; `~`, `.`, line ends, ESC and other control bytes are kept.
+fn shape(data: &[u8]) -> String {
+    data.iter()
+        .map(|&b| match b {
+            b'~' | b'.' => (b as char).to_string(),
+            b'\r' => "\\r".into(),
+            b'\n' => "\\n".into(),
+            0x1b => "^[".into(),
+            0..0x20 | 0x7f => format!("^{}", (b ^ 0x40) as char),
+            0x20..0x7f => "x".into(),
+            _ => "?".into(),
+        })
+        .collect()
+}
+
 /// What the input of a terminal Channel may carry.
 #[derive(Clone, Copy)]
 struct InputMode {
@@ -701,6 +718,7 @@ async fn send_input(
     while let Some(input) = inputs.recv().await {
         let message = match input {
             Input::Data(data) if pty => {
+                tracing::trace!(input = %shape(&data), "terminal input");
                 let (data, detaching) = escape.filter(&data);
                 if !data.is_empty() && !mode.read_only {
                     let message = terminal::data(TERMINAL_DATA, &data);
@@ -1261,6 +1279,12 @@ mod tests {
             ),
             wire::Code::Timeout
         );
+    }
+
+    #[test]
+    fn input_shape_hides_what_is_typed() {
+        assert_eq!(shape(b"secret1!\r~."), "xxxxxxxx\\r~.");
+        assert_eq!(shape(b"\x1b[A\x03\x7f\xd0\x81"), "^[xx^C^???");
     }
 
     #[test]

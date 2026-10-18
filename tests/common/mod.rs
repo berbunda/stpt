@@ -194,9 +194,24 @@ impl RunningServer {
     }
 }
 
+/// Stops the Server with TERM, so its Sessions end with it; KILL would leave their
+/// processes running.
 #[cfg(unix)]
 impl Drop for RunningServer {
     fn drop(&mut self) {
+        // Stopped already (`stop`): its process ID may belong to another process now.
+        if let Ok(Some(_)) = self.child.try_wait() {
+            return;
+        }
+        let pid = self.child.id().to_string();
+        let _ = Command::new("kill").args(["-TERM", &pid]).status();
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_secs(10) {
+            if let Ok(Some(_)) = self.child.try_wait() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
