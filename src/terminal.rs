@@ -11,7 +11,7 @@ use crate::cbor::Value;
 use crate::control::TERMINAL;
 use crate::wire::{
     CHANNEL_OPEN, Code, Failure, Message, TERMINAL_ATTACHED, TERMINAL_DATA, TERMINAL_EOF,
-    TERMINAL_EXIT, TERMINAL_RESIZE, TERMINAL_STDERR,
+    TERMINAL_EXIT, TERMINAL_RESIZE, TERMINAL_SIGNAL, TERMINAL_STDERR,
 };
 
 /// Length of a Session ID in bytes (§15.1).
@@ -414,18 +414,41 @@ pub fn signal_name(id: u64) -> Option<&'static str> {
     SIGNALS.get(id as usize).copied().filter(|n| !n.is_empty())
 }
 
+/// Signal id INT, which a Client sends when the user interrupts a command (§14.9).
+pub const SIGNAL_INT: u64 = 1;
+
+/// Highest signal id a Client may send; higher ids are "report only" (§14.9).
+pub const MAX_SENDABLE_SIGNAL: u64 = 7;
+
+/// Platform signal numbers of the ids 1–14 (§14.9).
+#[cfg(unix)]
+const PLATFORM_SIGNALS: [i32; 14] = {
+    use nix::libc::*;
+    [
+        SIGINT, SIGQUIT, SIGHUP, SIGTERM, SIGKILL, SIGUSR1, SIGUSR2, SIGABRT, SIGSEGV, SIGPIPE,
+        SIGBUS, SIGFPE, SIGILL, SIGALRM,
+    ]
+};
+
 /// Signal id of a platform signal number; 0 for a signal not in §14.9.
 #[cfg(unix)]
 pub fn signal_id(number: i32) -> u64 {
-    use nix::libc::*;
-    let table = [
-        SIGINT, SIGQUIT, SIGHUP, SIGTERM, SIGKILL, SIGUSR1, SIGUSR2, SIGABRT, SIGSEGV, SIGPIPE,
-        SIGBUS, SIGFPE, SIGILL, SIGALRM,
-    ];
-    table
+    PLATFORM_SIGNALS
         .iter()
         .position(|s| *s == number)
         .map_or(0, |i| i as u64 + 1)
+}
+
+/// Platform signal number of a signal id; `None` for id 0 and unknown ids.
+#[cfg(unix)]
+pub fn platform_signal(id: u64) -> Option<i32> {
+    let index = usize::try_from(id).ok()?.checked_sub(1)?;
+    PLATFORM_SIGNALS.get(index).copied()
+}
+
+/// TERMINAL_SIGNAL with signal id `id` (§14.9).
+pub fn signal(id: u64) -> Message {
+    Message::new(TERMINAL_SIGNAL, vec![(0, Value::Uint(id))])
 }
 
 /// Exit status of the primary process (§14.10).
@@ -700,5 +723,10 @@ mod tests {
         assert_eq!(signal_id(SIGKILL), 5);
         assert_eq!(signal_id(SIGALRM), 14);
         assert_eq!(signal_id(SIGWINCH), 0);
+        for id in 1..=14 {
+            assert_eq!(signal_id(platform_signal(id).unwrap()), id);
+        }
+        assert_eq!(platform_signal(0), None);
+        assert_eq!(platform_signal(15), None);
     }
 }

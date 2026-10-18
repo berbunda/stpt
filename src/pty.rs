@@ -83,6 +83,11 @@ impl Master {
         Ok(())
     }
 
+    /// The foreground process group of the terminal, the target of signals (§14.9).
+    pub fn foreground_group(&self) -> io::Result<nix::unistd::Pid> {
+        Ok(nix::unistd::tcgetpgrp(self.0.get_ref())?)
+    }
+
     /// Sets the window size; the kernel sends SIGWINCH to the foreground process group.
     pub fn resize(&self, size: Size) -> io::Result<()> {
         // SAFETY: the descriptor is open and the pointer refers to a valid winsize.

@@ -14,7 +14,9 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use nix::unistd::{Gid, Uid, User};
+use nix::sys::signal::{Signal, kill};
+use nix::sys::wait::{WaitStatus, waitpid};
+use nix::unistd::{ForkResult, Gid, Pid, Uid, User};
 use tokio::process::{Child, Command};
 
 /// PATH of the Account's processes, as Debian's `login.defs` sets it.
@@ -159,6 +161,41 @@ pub fn spawn(
     command.spawn()
 }
 
+/// Sends `signal` to the process group `group` with the permissions of `account`
+/// (§14.9): the result is that of kill(2) called by the Account, so it never reaches a
+/// process the Account could not signal itself (e.g. one started with sudo). As root,
+/// a child process takes the groups, group and user of the Account and signals; it
+/// runs no program, so it makes system calls only.
+pub async fn signal_group(account: &Account, group: Pid, signal: Signal) -> io::Result<()> {
+    let target = Pid::from_raw(-group.as_raw());
+    if !nix::unistd::geteuid().is_root() {
+        // A Server not running as root runs as the Account itself (`spawn`).
+        return Ok(kill(target, signal)?);
+    }
+    let (uid, gid, groups) = (account.uid, account.gid, account.groups.clone());
+    tokio::task::spawn_blocking(move || {
+        // SAFETY: the child makes system calls only, allocates nothing and ends with
+        // _exit; everything it needs is prepared before the fork.
+        match unsafe { nix::unistd::fork() }? {
+            ForkResult::Child => {
+                let result = nix::unistd::setgroups(&groups)
+                    .and_then(|()| nix::unistd::setgid(gid))
+                    .and_then(|()| nix::unistd::setuid(uid))
+                    .and_then(|()| kill(target, signal));
+                let code = result.map_or_else(|errno| errno as i32, |()| 0);
+                // SAFETY: ends the child without running any code of the parent.
+                unsafe { nix::libc::_exit(code) }
+            }
+            ForkResult::Parent { child } => match waitpid(child, None)? {
+                WaitStatus::Exited(_, 0) => Ok(()),
+                WaitStatus::Exited(_, errno) => Err(io::Error::from_raw_os_error(errno)),
+                other => Err(io::Error::other(format!("signal helper: {other:?}"))),
+            },
+        }
+    })
+    .await?
+}
+
 /// The command for `program`: a login shell gets `-` before the name of the shell as
 /// its argument 0, as login(1) and sshd start it. An argument vector also goes
 /// through the Account's shell, quoted, so a disabled or restricted shell (`nologin`,
@@ -191,7 +228,7 @@ fn login_name(shell: &Path) -> std::ffi::OsString {
 mod tests {
     use super::*;
     use crate::pty::{Master, Pty, Size};
-    use std::os::unix::process::ExitStatusExt;
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
 
     const SIZE: Size = Size {
         columns: 80,
@@ -319,6 +356,72 @@ mod tests {
         assert_eq!(out, "no-ctty\nown-group\n0\n");
         assert!(err.ends_with("got hi\n"), "{err}");
         assert_eq!(child.wait().await.unwrap().code(), Some(4));
+    }
+
+    /// Starts `line` with pipes as `account` and waits until it printed `ready`.
+    async fn running(account: &Account, line: &str) -> Child {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let line = format!("{line}; echo ready; while :; do sleep 0.1; done");
+        let mut child = spawn(account, &Program::Shell(line), &[], Io::Pipes).unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let mut lines = BufReader::new(stdout).lines();
+        assert_eq!(lines.next_line().await.unwrap().as_deref(), Some("ready"));
+        child.stdout = None;
+        child
+    }
+
+    fn group_of(child: &Child) -> Pid {
+        Pid::from_raw(child.id().unwrap() as i32)
+    }
+
+    #[tokio::test]
+    async fn signal_to_own_group() {
+        let me = me();
+        let mut child = running(&me, "trap 'exit 3' USR1").await;
+        signal_group(&me, group_of(&child), Signal::SIGUSR1)
+            .await
+            .unwrap();
+        assert_eq!(child.wait().await.unwrap().code(), Some(3));
+        let gone = signal_group(&me, group_of_exited(), Signal::SIGUSR1).await;
+        assert_eq!(gone.unwrap_err().raw_os_error(), Some(nix::libc::ESRCH));
+    }
+
+    /// A process group that no longer exists.
+    fn group_of_exited() -> Pid {
+        let mut child = std::process::Command::new("true")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        Pid::from_raw(pid as i32)
+    }
+
+    /// As root: `sudo target/debug/deps/stpt-* --ignored signal_with_account_permissions`.
+    #[tokio::test]
+    #[ignore = "needs root"]
+    async fn signal_with_account_permissions() {
+        let mut nobody = Account::lookup("nobody").unwrap().unwrap();
+        nobody.shell = PathBuf::from("/bin/sh");
+        let mut own = running(&nobody, "true").await;
+        signal_group(&nobody, group_of(&own), Signal::SIGTERM)
+            .await
+            .unwrap();
+        let status = own.wait().await.unwrap();
+        assert_eq!(status.signal(), Some(nix::libc::SIGTERM));
+
+        // A process group of root: the Account may not signal it.
+        let mut root = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let group = Pid::from_raw(root.id() as i32);
+        let refused = signal_group(&nobody, group, Signal::SIGKILL).await;
+        assert_eq!(refused.unwrap_err().raw_os_error(), Some(nix::libc::EPERM));
+        assert!(root.try_wait().unwrap().is_none(), "root process survived");
+        root.kill().unwrap();
+        root.wait().unwrap();
     }
 
     #[tokio::test]

@@ -70,6 +70,8 @@ pub enum Error {
     ChannelReset(u64),
     /// The Server ended the terminal Channel without an exit status.
     TerminalEnded,
+    /// The user pressed Ctrl+C repeatedly while a remote command ran without a PTY.
+    Interrupted,
 }
 
 impl Error {
@@ -161,6 +163,7 @@ impl fmt::Display for Error {
                 write!(f, "terminal: reset by the Server: {}", code_name(*code))
             }
             Self::TerminalEnded => f.write_str("terminal: ended by the Server"),
+            Self::Interrupted => f.write_str("interrupted"),
         }
     }
 }

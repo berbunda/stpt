@@ -957,6 +957,52 @@ mod tests {
             assert_eq!(exit, Exit::Code(0));
         }
 
+        /// Reads output until it contains `text`.
+        async fn until(recv: &mut quinn::RecvStream, text: &str) {
+            let mut out = Vec::new();
+            while !String::from_utf8_lossy(&out).contains(text) {
+                let message = wire::read_message(recv, DEFAULT_MESSAGE_LIMIT)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                out.extend(terminal::data_of(&message).unwrap());
+            }
+        }
+
+        const LOOP: &str = "echo ready; while :; do sleep 0.1; done";
+
+        #[tokio::test]
+        async fn signals_reach_the_program() {
+            let a = authenticated().await;
+            // With a PTY: the foreground process group.
+            let line = format!("trap 'exit 4' INT; {LOOP}");
+            let (mut send, mut recv) = a.open(&command(&line, true)).await;
+            attached(&mut recv).await;
+            until(&mut recv, "ready").await;
+            write(&mut send, &terminal::signal(terminal::SIGNAL_INT)).await;
+            assert_eq!(output(&mut recv).await.2, Exit::Code(4));
+
+            // Without a PTY: the process group of the command, also after EOF.
+            let line = format!("trap 'exit 3' USR1; {LOOP}");
+            let (mut send, mut recv) = a.open(&command(&line, false)).await;
+            attached(&mut recv).await;
+            until(&mut recv, "ready").await;
+            write(&mut send, &terminal::eof()).await;
+            write(&mut send, &terminal::signal(6)).await;
+            assert_eq!(output(&mut recv).await.2, Exit::Code(3));
+
+            // KILL cannot be caught.
+            let (mut send, mut recv) = a.open(&command(LOOP, false)).await;
+            attached(&mut recv).await;
+            until(&mut recv, "ready").await;
+            write(&mut send, &terminal::signal(5)).await;
+            let killed = Exit::Signal {
+                id: 5,
+                core_dumped: false,
+            };
+            assert_eq!(output(&mut recv).await.2, killed);
+        }
+
         #[tokio::test]
         async fn resize_applies_between_inputs() {
             let a = authenticated().await;
@@ -1055,13 +1101,10 @@ mod tests {
                 (true, vec![terminal::eof()]),
                 (true, vec![empty]),
                 (true, vec![Exit::Code(0).to_message()]),
-                (
-                    true,
-                    vec![Message::new(
-                        wire::TERMINAL_SIGNAL,
-                        vec![(0, Value::Uint(8))],
-                    )],
-                ),
+                // Report-only and unknown signal ids (§14.9).
+                (true, vec![terminal::signal(8)]),
+                (false, vec![terminal::signal(0)]),
+                (false, vec![terminal::signal(99)]),
                 (
                     true,
                     vec![Message::new(

@@ -11,6 +11,8 @@
 use std::future::pending;
 use std::time::Duration;
 
+use nix::sys::signal::Signal;
+use nix::unistd::Pid;
 use quinn::{RecvStream, SendStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
@@ -89,7 +91,7 @@ pub async fn serve(mut channel: Channel, open: &Message, grace: Duration) -> Res
         return Ok(());
     }
     let session = SessionId::generate();
-    let started = match start(&channel.account, &open, session).await {
+    let (account, started) = match start(&channel.account, &open, session).await {
         Ok(started) => started,
         Err(reason) => {
             reject(&mut channel, Failure::new(Code::ChannelRejected, reason));
@@ -115,7 +117,7 @@ pub async fn serve(mut channel: Channel, open: &Message, grace: Duration) -> Res
     )
     .await
     {
-        Ok(()) => relay(&mut channel, started, grace).await,
+        Ok(()) => relay(&mut channel, &account, started, grace).await,
         Err(error) => Err(error.into()),
     };
     match result {
@@ -160,8 +162,13 @@ fn allowed(name: &str) -> bool {
     name == "LANG" || name.starts_with("LC_")
 }
 
-/// Starts the program of a new Session; a failure is the reason to reject it.
-async fn start(account: &str, open: &Open, session: SessionId) -> Result<Started, String> {
+/// Starts the program of a new Session as the Account; a failure is the reason to
+/// reject it.
+async fn start(
+    account: &str,
+    open: &Open,
+    session: SessionId,
+) -> Result<(Account, Started), String> {
     let name = account.to_owned();
     let account = tokio::task::spawn_blocking(move || Account::lookup(&name))
         .await
@@ -189,12 +196,12 @@ async fn start(account: &str, open: &Open, session: SessionId) -> Result<Started
                 term: term.clone(),
             };
             let child = process::spawn(&account, &program, &env, io).map_err(spawn_failed)?;
-            Ok(Started::Pty { master, child })
+            Ok((account, Started::Pty { master, child }))
         }
         _ => {
             let child =
                 process::spawn(&account, &program, &env, Io::Pipes).map_err(spawn_failed)?;
-            Ok(Started::Pipes { child })
+            Ok((account, Started::Pipes { child }))
         }
     }
 }
@@ -217,12 +224,17 @@ impl std::fmt::Display for End {
 }
 
 /// Relays input and output until the program exits or the Client detaches.
-async fn relay(channel: &mut Channel, started: Started, grace: Duration) -> Result<End, Stop> {
+async fn relay(
+    channel: &mut Channel,
+    account: &Account,
+    started: Started,
+    grace: Duration,
+) -> Result<End, Stop> {
     let limit = channel.peer_limit;
     let (exit, send, recv) = match started {
         Started::Pty { master, mut child } => {
             let mut source = Output::Pty(&master);
-            let input = pty_input(&master, &mut channel.recv);
+            let input = pty_input(&master, account, &mut channel.recv);
             let output = pump(&mut source, &mut child, &mut channel.send, limit, grace);
             match first(input, output).await? {
                 Either::Input => return detached(&mut channel.send),
@@ -231,12 +243,14 @@ async fn relay(channel: &mut Channel, started: Started, grace: Duration) -> Resu
         }
         Started::Pipes { mut child } => {
             let stdin = child.stdin.take();
+            // The program leads its own process group (`process::spawn`).
+            let group = child.id().map(|pid| Pid::from_raw(pid as i32));
             let mut source = Output::Pipes {
                 stdout: child.stdout.take(),
                 stderr: child.stderr.take(),
                 buf: vec![0; READ_SIZE],
             };
-            let input = pipe_input(stdin, &mut channel.recv);
+            let input = pipe_input(stdin, group, account, &mut channel.recv);
             let output = pump(&mut source, &mut child, &mut channel.send, limit, grace);
             match first(input, output).await? {
                 Either::Input => return detached(&mut channel.send),
@@ -284,7 +298,9 @@ async fn next_input(recv: &mut RecvStream) -> Result<Option<Message>, Stop> {
         }
         TERMINAL_EOF => {}
         TERMINAL_RESIZE => check_resize(&message)?,
-        TERMINAL_SIGNAL => check_signal(&message)?,
+        TERMINAL_SIGNAL => {
+            signal_of(&message)?;
+        }
         kind => {
             return Err(Failure::violation(format!(
                 "message type {kind} on a terminal Channel from the Client"
@@ -299,16 +315,31 @@ fn check_resize(message: &Message) -> Result<(), Failure> {
     terminal::Size::from_resize(message).map(|_| ())
 }
 
-/// Signal ids the Client may send: those not marked "report only" (§14.9).
-fn check_signal(message: &Message) -> Result<(), Failure> {
+/// The signal of a TERMINAL_SIGNAL: an id the Client may send, not one marked
+/// "report only" (§14.9).
+fn signal_of(message: &Message) -> Result<Signal, Failure> {
+    let invalid = || Failure::violation("TERMINAL_SIGNAL: invalid signal id");
     match message.field(0) {
-        Some(Value::Uint(1..=7)) => Ok(()),
-        _ => Err(Failure::violation("TERMINAL_SIGNAL: invalid signal id")),
+        Some(Value::Uint(id @ 1..=terminal::MAX_SENDABLE_SIGNAL)) => terminal::platform_signal(*id)
+            .and_then(|number| Signal::try_from(number).ok())
+            .ok_or_else(invalid),
+        _ => Err(invalid()),
+    }
+}
+
+/// Sends a signal to a process group of the Session with the permissions of the
+/// Account; a target that no longer exists ignores it (§14.9).
+async fn deliver(account: &Account, group: Pid, signal: Signal) {
+    match process::signal_group(account, group, signal).await {
+        Ok(()) => tracing::debug!(?signal, group = group.as_raw(), "signal delivered"),
+        Err(e) => {
+            tracing::debug!(?signal, group = group.as_raw(), error = %e, "signal not delivered")
+        }
     }
 }
 
 /// Input of a PTY Session until the Client's FIN.
-async fn pty_input(master: &Master, recv: &mut RecvStream) -> Result<(), Stop> {
+async fn pty_input(master: &Master, account: &Account, recv: &mut RecvStream) -> Result<(), Stop> {
     while let Some(message) = next_input(recv).await? {
         match message.kind {
             TERMINAL_DATA => {
@@ -326,15 +357,27 @@ async fn pty_input(master: &Master, recv: &mut RecvStream) -> Result<(), Stop> {
                     tracing::debug!(error = %e, "PTY resize failed");
                 }
             }
-            // Applied with RC005.
-            _ => tracing::debug!(kind = message.kind, "not applied yet"),
+            // §14.9: to the foreground process group of the PTY.
+            _ => {
+                let signal = signal_of(&message)?;
+                match master.foreground_group() {
+                    Ok(group) => deliver(account, group, signal).await,
+                    Err(e) => tracing::debug!(error = %e, "no foreground process group"),
+                }
+            }
         }
     }
     Ok(())
 }
 
-/// Input of a Session without a PTY until the Client's FIN.
-async fn pipe_input(mut stdin: Option<ChildStdin>, recv: &mut RecvStream) -> Result<(), Stop> {
+/// Input of a Session without a PTY until the Client's FIN; signals go to the
+/// process group `group` of the command.
+async fn pipe_input(
+    mut stdin: Option<ChildStdin>,
+    group: Option<Pid>,
+    account: &Account,
+    recv: &mut RecvStream,
+) -> Result<(), Stop> {
     let mut eof = false;
     while let Some(message) = next_input(recv).await? {
         match message.kind {
@@ -360,8 +403,13 @@ async fn pipe_input(mut stdin: Option<ChildStdin>, recv: &mut RecvStream) -> Res
             TERMINAL_RESIZE => {
                 return Err(Failure::violation("TERMINAL_RESIZE without a PTY").into());
             }
-            // Applied with RC005.
-            _ => tracing::debug!(kind = message.kind, "not applied yet"),
+            // §14.9: also after TERMINAL_EOF.
+            _ => {
+                let signal = signal_of(&message)?;
+                if let Some(group) = group {
+                    deliver(account, group, signal).await;
+                }
+            }
         }
     }
     Ok(())

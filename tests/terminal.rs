@@ -106,6 +106,61 @@ mod server {
         assert_eq!(out.status.code(), Some(255));
     }
 
+    /// Starts `exec` of `line` with output piped and waits for the line `ready`.
+    fn exec_until_ready(
+        s: &Setup,
+        line: &str,
+    ) -> (
+        std::process::Child,
+        impl Iterator<Item = std::io::Result<String>>,
+    ) {
+        use std::io::{BufRead, BufReader};
+        let line = format!("{line}; echo ready; while :; do sleep 0.1; done");
+        let mut child = Command::new(env!("CARGO_BIN_EXE_stpt"))
+            .args(s.args("exec", &[&line]))
+            .env("HOME", &s.home)
+            .env("XDG_CONFIG_HOME", &s.home)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+        assert_eq!(lines.next().unwrap().unwrap(), "ready");
+        (child, lines)
+    }
+
+    fn interrupt(child: &std::process::Child) {
+        let pid = child.id().to_string();
+        assert!(
+            Command::new("kill")
+                .args(["-INT", &pid])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    #[test]
+    fn ctrl_c_interrupts_the_remote_command() {
+        let s = Setup::new("terminal-interrupt");
+        let (mut child, lines) = exec_until_ready(&s, "trap 'echo got INT; exit 9' INT");
+        interrupt(&child);
+        assert_eq!(child.wait().unwrap().code(), Some(9));
+        let rest: Vec<String> = lines.map(Result::unwrap).collect();
+        assert_eq!(rest, ["got INT"]);
+
+        // A command that ignores INT: the third Ctrl+C ends the Client.
+        let (child, _lines) = exec_until_ready(&s, "trap '' INT");
+        for _ in 0..3 {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            interrupt(&child);
+        }
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(stderr(&out), "stpt: interrupted");
+        assert_eq!(out.status.code(), Some(255));
+    }
+
     #[test]
     fn connect_runs_the_login_shell_on_a_pty() {
         let s = Setup::new("terminal-connect");

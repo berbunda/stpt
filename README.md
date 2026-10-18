@@ -25,7 +25,8 @@ Every command with `ACCOUNT@HOST` also accepts `--fingerprint SHA256:...` (see S
 `stpt connect alice@host` starts the login shell of the Account `alice` on the Server in a new Session, with a terminal. `stpt exec alice@host COMMAND...` runs a command without a terminal: its output and error output arrive separately, and `stpt` exits with the exit code of the command.
 
 - As with ssh, the arguments of `exec` form one command line for the shell of the Account: `stpt exec alice@host 'ls *.log'` expands `*` on the Server. `--no-shell` passes each argument unchanged.
-- Exit code 255: an STPT or connection error, or the remote program was killed by a signal (`stpt` names it).
+- Ctrl+C during `exec` interrupts the remote command; a command that ignores it keeps running, and pressing Ctrl+C three times ends `stpt` itself. In `connect` Ctrl+C goes to the remote shell, as in a local terminal.
+- Exit code 255: an STPT or connection error, the remote program was killed by a signal (`stpt` names it), or `stpt` was interrupted.
 - Sessions do not outlive the connection yet: closing the window or losing the connection ends the shell, as closing a terminal does.
 - The Server starts the shell as the Account, so it must run as root (or as that Account). Of the Client's environment only `LANG` and `LC_*` reach the shell; `STPT_SESSION` holds the Session ID.
 

@@ -96,9 +96,9 @@ pub fn run(command: ClientCommand, common: &Common) -> Result<ExitCode, Error> {
         runtime.block_on(connection.close());
         return Err(Error::NotImplemented(name));
     };
-    let exit = runtime.block_on(connection.terminal(open))?;
+    let result = runtime.block_on(connection.terminal(open));
     runtime.block_on(connection.close());
-    Ok(exit_code(exit))
+    Ok(exit_code(result?))
 }
 
 /// Window size when standard output is not a terminal.
@@ -356,7 +356,18 @@ impl Connection {
             }
             _ => None,
         };
-        let result = receive_output(&mut recv, pty).await;
+        let interrupted = async {
+            if pty {
+                // Ctrl+C is input for the remote PTY.
+                std::future::pending().await
+            } else {
+                interrupts(input.clone()).await
+            }
+        };
+        let result = tokio::select! {
+            result = receive_output(&mut recv, pty) => result,
+            () = interrupted => Err(Received::Local(Error::Interrupted)),
+        };
         if let Some(watcher) = watcher {
             watcher.abort();
         }
@@ -382,8 +393,26 @@ enum Input {
     Eof,
     /// New size of the local window (with a PTY only).
     Resize(Size),
+    /// A signal id for the remote program (§14.9).
+    Signal(u64),
     /// The Channel is over: end the Client's direction.
     Finish,
+}
+
+/// Ctrl+C presses that end the Client while the remote command runs on.
+const INTERRUPTS_TO_QUIT: u32 = 3;
+
+/// Ctrl+C without a PTY (§14.9): each press sends INT to the remote command; the
+/// third ends the Client, for a command that ignores INT. Returns then.
+async fn interrupts(input: mpsc::Sender<Input>) {
+    for _ in 1..INTERRUPTS_TO_QUIT {
+        if tokio::signal::ctrl_c().await.is_err() {
+            return std::future::pending().await;
+        }
+        tracing::info!("interrupt sent to the remote command");
+        let _ = input.send(Input::Signal(terminal::SIGNAL_INT)).await;
+    }
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 /// Sends the size of the local window whenever it changes (§14.8); a burst of
@@ -419,6 +448,7 @@ async fn send_input(
             Input::Eof if pty => continue,
             Input::Eof => terminal::eof(),
             Input::Resize(size) => size.resize_message(),
+            Input::Signal(id) => terminal::signal(id),
             Input::Finish => break,
         };
         if wire::write_message(&mut send, &message, limit)
