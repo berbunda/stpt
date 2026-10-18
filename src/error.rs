@@ -72,6 +72,11 @@ pub enum Error {
     TerminalEnded,
     /// The user pressed Ctrl+C repeatedly while a remote command ran without a PTY.
     Interrupted,
+    /// The Client was told to end (window closed, logoff, TERM): it detached and
+    /// closed the Connection.
+    Terminated(&'static str),
+    /// Signal handlers could not be set up.
+    Signals(io::Error),
 }
 
 impl Error {
@@ -164,6 +169,8 @@ impl fmt::Display for Error {
             }
             Self::TerminalEnded => f.write_str("terminal: ended by the Server"),
             Self::Interrupted => f.write_str("interrupted"),
+            Self::Terminated(by) => write!(f, "terminated by {by}"),
+            Self::Signals(e) => write!(f, "signal handling: {e}"),
         }
     }
 }
@@ -183,6 +190,7 @@ impl std::error::Error for Error {
             Self::Resolve { source, .. } => Some(source),
             Self::Terminal(e) => Some(e),
             Self::UserKey(e) => Some(e),
+            Self::Signals(e) => Some(e),
             _ => None,
         }
     }

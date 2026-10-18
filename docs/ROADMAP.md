@@ -27,7 +27,7 @@ IDs A001–D008 were renamed to RA001–RD008 on 2026-10-11 (prefix scheme chang
 - [x] RC004  terminal resize ← PC004 ✅ 2026-10-18
 - [x] RC005  signals / Ctrl+C ← PC005 ✅ 2026-10-18
 - [x] RC006  interactive applications ← PC002 ✅ 2026-10-18
-- [ ] RC007  graceful disconnect ← PC006
+- [x] RC007  graceful disconnect ← PC006 ✅ 2026-10-18
 - [ ] RC008  Windows PTY (ConPTY), Server mode on Windows ➕ 2026-10-17
 
 # 4	Tier RD — Session Model

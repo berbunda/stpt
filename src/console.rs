@@ -43,6 +43,15 @@ impl SizeChanges {
     }
 }
 
+/// Prepares for the Client being told to end: on Unix HUP (the terminal window was
+/// closed) and TERM; on Windows closing the console window, logoff, shutdown and
+/// Ctrl+Break. Until then they end the process at once; afterwards the returned future
+/// completes with the name of the event, so the Client can detach and close the
+/// Connection regularly first. Windows gives the process 5 s after a close event.
+pub fn termination() -> io::Result<impl Future<Output = &'static str>> {
+    sys::termination()
+}
+
 /// Writes remote output to standard output, unbuffered.
 pub fn write_out(data: &[u8]) -> io::Result<()> {
     sys::write(sys::Stream::Out, data)
@@ -123,6 +132,18 @@ mod sys {
             rows: w.ws_row,
             width: w.ws_xpixel,
             height: w.ws_ypixel,
+        })
+    }
+
+    pub fn termination() -> io::Result<impl Future<Output = &'static str>> {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut hangup = signal(SignalKind::hangup())?;
+        let mut terminate = signal(SignalKind::terminate())?;
+        Ok(async move {
+            tokio::select! {
+                _ = hangup.recv() => "HUP",
+                _ = terminate.recv() => "TERM",
+            }
         })
     }
 
@@ -269,6 +290,22 @@ mod sys {
             rows: (window.Bottom - window.Top + 1).max(0) as u16,
             width: 0,
             height: 0,
+        })
+    }
+
+    pub fn termination() -> io::Result<impl Future<Output = &'static str>> {
+        use tokio::signal::windows::{ctrl_break, ctrl_close, ctrl_logoff, ctrl_shutdown};
+        let mut close = ctrl_close()?;
+        let mut logoff = ctrl_logoff()?;
+        let mut shutdown = ctrl_shutdown()?;
+        let mut ctrl_break = ctrl_break()?;
+        Ok(async move {
+            tokio::select! {
+                _ = close.recv() => "closing the console",
+                _ = logoff.recv() => "logoff",
+                _ = shutdown.recv() => "shutdown",
+                _ = ctrl_break.recv() => "Ctrl+Break",
+            }
         })
     }
 

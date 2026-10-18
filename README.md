@@ -27,7 +27,8 @@ Every command with `ACCOUNT@HOST` also accepts `--fingerprint SHA256:...` (see S
 - As with ssh, the arguments of `exec` form one command line for the shell of the Account: `stpt exec alice@host 'ls *.log'` expands `*` on the Server. `--no-shell` passes each argument unchanged.
 - Ctrl+C during `exec` interrupts the remote command; a command that ignores it keeps running, and pressing Ctrl+C three times ends `stpt` itself. In `connect` Ctrl+C goes to the remote shell, as in a local terminal.
 - Exit code 255: an STPT or connection error, the remote program was killed by a signal (`stpt` names it), or `stpt` was interrupted.
-- Sessions do not outlive the connection yet: closing the window or losing the connection ends the shell, as closing a terminal does.
+- Sessions do not outlive the connection yet: closing the window or losing the connection ends the shell, as closing a terminal does. When the window is closed, `stpt` tells the Server at once; after a lost connection the Server notices within 60 s.
+- Stopping the Server (`systemctl stop`, TERM, or Ctrl+C in the foreground) ends all Sessions; the Clients report `closed by the peer: SERVER_SHUTDOWN`.
 - The Server starts the shell as the Account, so it must run as root (or as that Account). The environment is that of a login: `PATH` and the locale come from `/etc/environment` and `/etc/default/locale` (or `/etc/locale.conf`) on the Server. Of the Client's environment only `LANG` and `LC_*` reach the shell and replace the Server's locale; `STPT_SESSION` holds the Session ID.
 - If the Client's locale is not installed on the Server, programs fall back to ASCII and warn (`locale: Cannot set LC_CTYPE`), as with ssh: install it on the Server (`sudo locale-gen ru_RU.UTF-8` on Debian) or unset `LANG` on the Client.
 
@@ -112,6 +113,7 @@ listen = "[::]:843"   # address and UDP port; IPv6 addresses in brackets; [::] a
 log_level = "info"    # error, warn, info, debug or trace; -v and -q override it
 identity_key = "/etc/stpt/server_key"   # Server key file, created if missing
 authorized_keys = "/etc/stpt/authorized_keys"   # directory of authorized user keys, one file per Account
+exit_grace = 1   # seconds output is still sent after the program of a Session exited (0–60)
 ```
 </details>
 

@@ -23,7 +23,7 @@ mod server {
     /// A running Server that authorizes the test key for the Account of the test,
     /// and a Client home with that key.
     struct Setup {
-        _server: RunningServer,
+        server: RunningServer,
         home: PathBuf,
         dest: String,
         fingerprint: String,
@@ -46,7 +46,7 @@ mod server {
             user_key(&home);
             Self {
                 dest: format!("{}@127.0.0.1:{}", account(), server.port),
-                _server: server,
+                server,
                 home,
                 fingerprint,
             }
@@ -112,7 +112,7 @@ mod server {
         line: &str,
     ) -> (
         std::process::Child,
-        impl Iterator<Item = std::io::Result<String>>,
+        impl Iterator<Item = std::io::Result<String>> + use<>,
     ) {
         use std::io::{BufRead, BufReader};
         let line = format!("{line}; echo ready; while :; do sleep 0.1; done");
@@ -139,6 +139,39 @@ mod server {
                 .unwrap()
                 .success()
         );
+    }
+
+    #[test]
+    fn hangup_detaches_and_closes_at_once() {
+        let s = Setup::new("terminal-hangup");
+        let (child, _lines) = exec_until_ready(&s, "true");
+        let pid = child.id().to_string();
+        assert!(
+            Command::new("kill")
+                .args(["-HUP", &pid])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(stderr(&out), "stpt: terminated by HUP");
+        assert_eq!(out.status.code(), Some(255));
+        // The Server knows at once, not after the idle timeout of 60 s.
+        assert!(s.server.wait_for_log("Session ended") || s.server.wait_for_log("abandoned"));
+    }
+
+    #[test]
+    fn server_shutdown_closes_connections() {
+        let s = Setup::new("terminal-shutdown");
+        let (child, _lines) = exec_until_ready(&s, "true");
+        assert!(s.server.wait_for_log("Session created"));
+        assert_eq!(s.server.stop(), Some(0));
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(
+            stderr(&out),
+            "stpt: transport: closed by the peer: SERVER_SHUTDOWN"
+        );
+        assert_eq!(out.status.code(), Some(255));
     }
 
     #[test]

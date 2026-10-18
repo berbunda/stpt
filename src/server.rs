@@ -101,8 +101,12 @@ pub fn run(
         .clone()
         .unwrap_or_else(|| PathBuf::from(authorized::AUTHORIZED_KEYS_DIR));
     tracing::info!(path = %keys_dir.display(), "authorized keys directory");
+    let deadlines = Deadlines {
+        exit_grace: config.exit_grace.unwrap_or(Deadlines::DEFAULT.exit_grace),
+        ..Deadlines::DEFAULT
+    };
     let shared = Arc::new(Shared {
-        deadlines: Deadlines::default(),
+        deadlines,
         authorizer: Authorizer::new(keys_dir, Box::new(SystemAccounts)),
     });
 
@@ -113,10 +117,47 @@ pub fn run(
             addr: listen,
             source,
         })?;
+        let stop = stop_signal().map_err(Error::Signals)?;
         tracing::info!(listen = %local, "listening");
-        serve(endpoint, shared).await;
+        tokio::select! {
+            () = serve(endpoint.clone(), shared) => {}
+            signal = stop => shut_down(&endpoint, signal).await,
+        }
         Ok(ExitCode::SUCCESS)
     })
+}
+
+/// Longest wait for the Clients to learn of the shutdown.
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(3);
+
+/// Waits for TERM (systemd stopping the service) or INT (Ctrl+C in the foreground);
+/// returns the name of the signal. Set up before the Server listens.
+#[cfg(unix)]
+fn stop_signal() -> std::io::Result<impl Future<Output = &'static str>> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = signal(SignalKind::terminate())?;
+    let mut int = signal(SignalKind::interrupt())?;
+    Ok(async move {
+        tokio::select! {
+            _ = term.recv() => "TERM",
+            _ = int.recv() => "INT",
+        }
+    })
+}
+
+/// Server mode is Unix only for now (gate G2).
+#[cfg(not(unix))]
+fn stop_signal() -> std::io::Result<impl Future<Output = &'static str>> {
+    Ok(std::future::pending())
+}
+
+/// Closes every Connection with SERVER_SHUTDOWN (§13.2) and waits briefly until the
+/// Clients are told. The Sessions end with the process: their PTYs are closed, so
+/// their processes get SIGHUP.
+async fn shut_down(endpoint: &Endpoint, signal: &str) {
+    tracing::info!(signal, "shutting down");
+    endpoint.close(Code::ServerShutdown.varint(), b"");
+    let _ = timeout(SHUTDOWN_WAIT, endpoint.wait_idle()).await;
 }
 
 async fn serve(endpoint: Endpoint, shared: Arc<Shared>) {

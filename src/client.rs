@@ -160,7 +160,8 @@ fn exit_code(exit: Exit) -> ExitCode {
     match exit {
         Exit::Code(code) => ExitCode::from(u8::try_from(code).unwrap_or(u8::MAX)),
         Exit::Signal { id, core_dumped } => {
-            eprintln!(
+            let _ = writeln!(
+                io::stderr(),
                 "stpt: the remote program was killed by signal {}{}",
                 terminal::signal_name(id).unwrap_or("(unknown)"),
                 if core_dumped { " (core dumped)" } else { "" }
@@ -342,6 +343,7 @@ impl Connection {
         };
         tracing::info!(session = %attached.session, attachment = attached.attachment, "attached");
 
+        let terminated = console::termination().map_err(Error::Signals)?;
         let local = Console::setup(pty).map_err(Error::Terminal)?;
         let (input, inputs) = mpsc::channel(16);
         let from_stdin = input.clone();
@@ -367,12 +369,14 @@ impl Connection {
         let result = tokio::select! {
             result = receive_output(&mut recv, pty) => result,
             () = interrupted => Err(Received::Local(Error::Interrupted)),
+            by = terminated => Err(Received::Local(Error::Terminated(by))),
         };
         if let Some(watcher) = watcher {
             watcher.abort();
         }
         drop(local);
-        // The Client's FIN after the exit status (§14.10); not worth waiting long for.
+        // The Client's FIN: after the exit status, or a detach when the Client ends
+        // early (§14.10); not worth waiting long for. The caller closes the Connection.
         let _ = input.try_send(Input::Finish);
         let _ = timeout(Duration::from_secs(1), sender).await;
         match result {

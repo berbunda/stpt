@@ -10,8 +10,10 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
-use serde::de::DeserializeOwned;
+use std::time::Duration;
+
+use serde::de::{DeserializeOwned, Error as _};
+use serde::{Deserialize, Deserializer};
 
 use crate::logging;
 
@@ -34,6 +36,21 @@ pub struct ServerConfig {
     pub identity_key: Option<PathBuf>,
     /// Directory with one file of authorized user keys per Account.
     pub authorized_keys: Option<PathBuf>,
+    /// Output still sent after the primary process of a Session exited: 0–60 seconds,
+    /// fractions allowed (PROTOCOL.md §14.10).
+    #[serde(default, deserialize_with = "exit_grace")]
+    pub exit_grace: Option<Duration>,
+}
+
+/// Longest exit grace period accepted, in seconds.
+const MAX_EXIT_GRACE: f64 = 60.0;
+
+fn exit_grace<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Duration>, D::Error> {
+    let seconds = f64::deserialize(d)?;
+    if !(0.0..=MAX_EXIT_GRACE).contains(&seconds) {
+        return Err(D::Error::custom("exit_grace must be 0 to 60 seconds"));
+    }
+    Ok(Some(Duration::from_secs_f64(seconds)))
 }
 
 #[derive(Debug)]
@@ -145,6 +162,26 @@ mod tests {
         assert!(parse::<ServerConfig>(r#"lisen = "[::]:843""#).is_err());
         assert!(parse::<ClientConfig>("detach_timeout = 60").is_err());
         assert!(parse::<ClientConfig>("").is_ok());
+    }
+
+    #[test]
+    fn exit_grace() {
+        let grace = |text: &str| parse::<ServerConfig>(text).map(|c| c.exit_grace).ok();
+        assert_eq!(grace(""), Some(None));
+        assert_eq!(grace("exit_grace = 2"), Some(Some(Duration::from_secs(2))));
+        assert_eq!(
+            grace("exit_grace = 0.25"),
+            Some(Some(Duration::from_millis(250)))
+        );
+        assert_eq!(grace("exit_grace = 0"), Some(Some(Duration::ZERO)));
+        for bad in [
+            "exit_grace = -1",
+            "exit_grace = 60.5",
+            "exit_grace = nan",
+            "exit_grace = \"1\"",
+        ] {
+            assert!(grace(bad).is_none(), "{bad}");
+        }
     }
 
     #[test]

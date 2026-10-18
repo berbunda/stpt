@@ -24,13 +24,15 @@ mod tls;
 mod trust;
 mod wire;
 
+use std::io::Write;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
     match cli::run(cli::Cli::parse_args()) {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("stpt: {e}");
+            // Standard error may be gone (closed terminal window); eprintln would panic.
+            let _ = writeln!(std::io::stderr(), "stpt: {e}");
             ExitCode::from(e.exit_code())
         }
     }

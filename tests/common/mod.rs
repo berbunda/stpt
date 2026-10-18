@@ -122,6 +122,8 @@ pub fn server_until_listening(args: &[&str]) -> Vec<String> {
 pub struct RunningServer {
     child: std::process::Child,
     pub port: u16,
+    /// Log lines after `listening`, collected while it runs.
+    log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 #[cfg(unix)]
@@ -151,8 +153,44 @@ impl RunningServer {
             log.push(line);
         };
         // Keep reading, so the Server never blocks on a full pipe.
-        std::thread::spawn(move || lines.for_each(drop));
-        Self { child, port }
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collected = log.clone();
+        std::thread::spawn(move || {
+            for line in lines.map_while(Result::ok) {
+                collected.lock().unwrap().push(line);
+            }
+        });
+        Self { child, port, log }
+    }
+
+    /// Waits up to 5 s for a log line containing `text`.
+    pub fn wait_for_log(&self, text: &str) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_secs(5) {
+            if self.log.lock().unwrap().iter().any(|l| l.contains(text)) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        false
+    }
+
+    /// Stops the Server with TERM, as systemd does; returns its exit code.
+    pub fn stop(mut self) -> Option<i32> {
+        let pid = self.child.id().to_string();
+        let sent = Command::new("kill").args(["-TERM", &pid]).status().unwrap();
+        assert!(sent.success());
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                return status.code();
+            }
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(10),
+                "Server still runs"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 }
 
