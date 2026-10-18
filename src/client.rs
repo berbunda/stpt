@@ -591,10 +591,62 @@ fn shutting_down(reason: &quinn::ConnectionError) -> bool {
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The escape of the local terminal, as in ssh: after a line end, `~.` detaches and
-/// `~~` sends one `~`; `~` before anything else is sent with it.
+/// `~~` sends one `~`; `~` before anything else is sent with it. What the terminal
+/// emulator sends on its own (mouse, focus, answers to queries) is not typing, and
+/// keypad Enter (`ESC O M`, sent in application keypad mode) is a line end.
 struct Escape {
     line_start: bool,
     after_tilde: bool,
+    /// An escape sequence still coming in.
+    sequence: Vec<u8>,
+}
+
+/// Longest escape sequence followed; a longer one counts as typing.
+const MAX_SEQUENCE: usize = 64;
+
+/// What a complete escape sequence in the input means for the escape.
+#[derive(Debug, PartialEq, Eq)]
+enum Sequence {
+    Pending,
+    /// A key: arrows, function keys, Alt with a key.
+    Typed,
+    /// Keypad Enter.
+    LineEnd,
+    /// Sent by the terminal emulator itself: mouse, focus, answers to queries.
+    Report,
+}
+
+fn classify(sequence: &[u8]) -> Sequence {
+    use Sequence::*;
+    let long = sequence.len() >= MAX_SEQUENCE;
+    match sequence {
+        [_] | [_, b'[' | b'O' | b']'] => Pending,
+        [_, b'O', b'M'] => LineEnd,
+        // Alt with a key, or another SS3 key.
+        [_, _] | [_, b'O', _] => Typed,
+        // OSC answer, ended by BEL or ST.
+        [_, b']', rest @ ..] if rest.ends_with(b"\x07") || rest.ends_with(b"\x1b\\") => Report,
+        [_, b']', ..] if long => Report,
+        [_, b']', ..] => Pending,
+        // X10 mouse report: three bytes follow.
+        [_, b'[', b'M', rest @ ..] if rest.len() >= 3 => Report,
+        [_, b'[', b'M', ..] => Pending,
+        [_, b'[', rest @ ..] => match rest.last() {
+            Some(&last) if (0x40..=0x7e).contains(&last) => {
+                // Private parameters (`<` mouse, `?` and `>` answers) or a focus
+                // report (`CSI I`, `CSI O`): never a key.
+                let private = matches!(rest.first(), Some(b'<' | b'=' | b'>' | b'?'));
+                if private || (rest.len() == 1 && matches!(last, b'I' | b'O')) {
+                    Report
+                } else {
+                    Typed
+                }
+            }
+            _ if long => Typed,
+            _ => Pending,
+        },
+        _ => Typed,
+    }
 }
 
 impl Escape {
@@ -602,13 +654,27 @@ impl Escape {
         Self {
             line_start: true,
             after_tilde: false,
+            sequence: Vec::new(),
         }
     }
 
     /// The input to send, and whether `~.` was typed (input after it is dropped).
+    /// Each read holds whole keys: an ESC alone at the end of one is the Esc key.
     fn filter(&mut self, data: &[u8]) -> (Vec<u8>, bool) {
         let mut out = Vec::with_capacity(data.len() + 1);
         for &byte in data {
+            if !self.sequence.is_empty() {
+                self.sequence.push(byte);
+                out.push(byte);
+                match classify(&self.sequence) {
+                    Sequence::Pending => continue,
+                    Sequence::Typed => self.line_start = false,
+                    Sequence::LineEnd => self.line_start = true,
+                    Sequence::Report => {}
+                }
+                self.sequence.clear();
+                continue;
+            }
             if self.after_tilde {
                 self.after_tilde = false;
                 match byte {
@@ -625,7 +691,15 @@ impl Escape {
                 continue;
             }
             out.push(byte);
-            self.line_start = byte == b'\r' || byte == b'\n';
+            if byte == 0x1b {
+                self.sequence.push(byte);
+            } else {
+                self.line_start = byte == b'\r' || byte == b'\n';
+            }
+        }
+        if self.sequence == [0x1b] {
+            self.sequence.clear();
+            self.line_start = false;
         }
         (out, false)
     }
@@ -683,19 +757,40 @@ async fn watch_size(input: mpsc::Sender<Input>, mut last: Size) {
 /// in-band, §14.7).
 /// The shape of input for the log, to diagnose the escape without logging what is
 /// typed (passwords): letters, digits and other printable characters become `x`,
-/// non-ASCII bytes `?`; `~`, `.`, line ends, ESC and other control bytes are kept.
+/// non-ASCII bytes `?`; `~`, `.`, line ends and control bytes are kept, and so are
+/// escape sequences, which are keys and reports, not text (Alt with a key shows it).
 fn shape(data: &[u8]) -> String {
-    data.iter()
-        .map(|&b| match b {
-            b'~' | b'.' => (b as char).to_string(),
-            b'\r' => "\\r".into(),
-            b'\n' => "\\n".into(),
-            0x1b => "^[".into(),
-            0..0x20 | 0x7f => format!("^{}", (b ^ 0x40) as char),
-            0x20..0x7f => "x".into(),
-            _ => "?".into(),
-        })
-        .collect()
+    let mut out = String::new();
+    // Bytes since an ESC whose sequence has not ended; 0 outside one.
+    let mut in_sequence = 0usize;
+    for &b in data {
+        if b == 0x1b {
+            out.push_str("^[");
+            in_sequence = 1;
+            continue;
+        }
+        if in_sequence > 0 && (0x20..0x7f).contains(&b) {
+            out.push(b as char);
+            let introducer = in_sequence == 1 && matches!(b, b'[' | b'O' | b']');
+            let ends = !introducer && (0x40..=0x7e).contains(&b);
+            in_sequence = if ends || in_sequence > 32 {
+                0
+            } else {
+                in_sequence + 1
+            };
+            continue;
+        }
+        in_sequence = 0;
+        match b {
+            b'~' | b'.' => out.push(b as char),
+            b'\r' => out.push_str("\\r"),
+            b'\n' => out.push_str("\\n"),
+            0..0x20 | 0x7f => out.push_str(&format!("^{}", (b ^ 0x40) as char)),
+            0x20..0x7f => out.push('x'),
+            _ => out.push('?'),
+        }
+    }
+    out
 }
 
 /// What the input of a terminal Channel may carry.
@@ -1284,7 +1379,56 @@ mod tests {
     #[test]
     fn input_shape_hides_what_is_typed() {
         assert_eq!(shape(b"secret1!\r~."), "xxxxxxxx\\r~.");
-        assert_eq!(shape(b"\x1b[A\x03\x7f\xd0\x81"), "^[xx^C^???");
+        assert_eq!(shape(b"\x1b[Ab\x03\x7f\xd0\x81"), "^[[Ax^C^???");
+        assert_eq!(shape(b"\x1b[<35;1;2Mab"), "^[[<35;1;2Mxx");
+        assert_eq!(shape(b"\x1bOMa"), "^[OMx");
+    }
+
+    #[test]
+    fn escape_ignores_reports_and_takes_keypad_enter() {
+        let detaches = |reads: &[&[u8]]| {
+            let mut escape = Escape::new();
+            escape.filter(b"x");
+            reads.iter().any(|read| escape.filter(read).1)
+        };
+        // Mouse motion and focus after Enter do not count as typing.
+        assert!(detaches(&[
+            b"\r",
+            b"\x1b[<35;10;20M",
+            b"\x1b[I",
+            b"~",
+            b"."
+        ]));
+        assert!(detaches(&[b"\r\x1b[M #!~."]));
+        // Answers to queries.
+        assert!(detaches(&[
+            b"\r",
+            b"\x1b[?1;2c",
+            b"\x1b]11;rgb:0/0/0\x1b\\",
+            b"~."
+        ]));
+        // Keypad Enter in application keypad mode is a line end.
+        assert!(detaches(&[b"\x1bOM", b"~", b"."]));
+        // Keys are typing: an arrow, F10, Alt+x, the Esc key alone.
+        assert!(!detaches(&[b"\r", b"\x1b[A", b"~."]));
+        assert!(!detaches(&[b"\r\x1b[21~", b"~."]));
+        assert!(!detaches(&[b"\r\x1bx~."]));
+        assert!(!detaches(&[b"\r", b"\x1b", b"~."]));
+        // A `~` inside a sequence is not the escape, and all input goes through.
+        let mut escape = Escape::new();
+        assert_eq!(escape.filter(b"\x1b[21~."), (b"\x1b[21~.".to_vec(), false));
+    }
+
+    #[test]
+    fn sequences_are_classified() {
+        use Sequence::*;
+        assert_eq!(classify(b"\x1b"), Pending);
+        assert_eq!(classify(b"\x1b[1;5"), Pending);
+        assert_eq!(classify(b"\x1b[1;5D"), Typed);
+        assert_eq!(classify(b"\x1b[O"), Report);
+        assert_eq!(classify(b"\x1b[24;80R"), Typed);
+        assert_eq!(classify(b"\x1b]10;x\x07"), Report);
+        assert_eq!(classify(&[0x1b, b'[', b'1'].repeat(30)), Typed);
     }
 
     #[test]
