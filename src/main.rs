@@ -10,6 +10,8 @@ mod error;
 mod hello;
 mod identity;
 mod logging;
+#[cfg(unix)]
+mod pty;
 mod quic;
 mod server;
 mod tls;

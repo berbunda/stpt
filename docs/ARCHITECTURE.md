@@ -21,6 +21,7 @@ Single Cargo package `stpt` (binary crate, edition 2024). Minimum Rust version (
 | `src/hello.rs` | HELLO messages, version selection, capabilities, limits, GREASE |
 | `src/identity.rs` | Server Identity: key pair and key file, public key, fingerprint |
 | `src/logging.rs` | log levels and log output |
+| `src/pty.rs` | pseudo-terminals of the Server (Unix) |
 | `src/quic.rs` | QUIC transport: Endpoints, transport parameters, sockets |
 | `src/tls.rs` | TLS 1.3 profile, verification of the Server key |
 | `src/trust.rs` | trust store of the Client |
@@ -62,7 +63,7 @@ Single Cargo package `stpt` (binary crate, edition 2024). Minimum Rust version (
 # 6	Transport
 PROTOCOL.md §6–§8.2, §13.3. `quinn` (QUIC) over `rustls` (TLS 1.3) with the `aws-lc-rs` crypto provider.
 
-- Async: one multi-threaded `tokio` runtime per process (`quic::runtime`), created by the role; the rest of the program is synchronous.
+- Async: one multi-threaded `tokio` runtime per process (`quic::runtime`), created by the role; Connections and PTY masters (§10) run on it, the rest of the program is synchronous.
 - Sockets: created with `socket2`. `[::]` is set dual-stack explicitly (`IPV6_V6ONLY` off), so it does not depend on the system default (Linux `net.ipv6.bindv6only`, Windows on by default); a specific address listens on that address only. The Client binds the unspecified address of the Server's family, port 0.
 - QUIC: version 1 only (`EndpointConfig::supported_versions`). Transport parameters: no unidirectional streams; bidirectional stream limit for the peer 1 on the Server (the control stream), 0 on the Client, raised only after authentication (RB006); no datagrams; idle timeout 60 s; Client keep-alive PING after 15 s idle; Server migration on.
 - TLS (`tls`): provider reduced to TLS 1.3 with AES-128-GCM, ChaCha20-Poly1305, AES-256-GCM and the groups X25519MLKEM768, X25519 (this order); ALPN `stpt` only, a Client offering no or another ALPN fails the handshake; no client certificates, no 0-RTT, no session resumption (no tickets, no session cache on either side). SNI: a DNS name is sent, an IP address is not (rustls `ServerName`).
@@ -118,7 +119,14 @@ PROTOCOL.md §12, §13.3, §13.4.
 - Authenticated Connection: the Server logs Account, key fingerprint and label and raises the bidirectional stream limit to 1 + 10 (§8.2, §14.5); Channels and requests then follow §8. A further AUTH_REQUEST or CLIENT_HELLO is PROTOCOL_VIOLATION.
 - Client (`client::Connection::authenticate`): one key, one AUTH_REQUEST, AUTH_RESULT within 10 s (TIMEOUT). Refused: the Client closes regularly and ends with the key fingerprint and its authorized keys line for the administrator.
 
-# 10	Dependencies
+# 10	Terminals
+PROTOCOL.md §14.6, §14.8.
+
+- PTY (`pty`, Unix only): `Pty::open` opens a master/slave pair (`openpty`) with the window size of the Channel (`pty::Size`: columns, rows, pixel sizes). Termios: system defaults plus `IUTF8` on Linux (and Apple systems); no modes come from the Client. Both descriptors are close-on-exec.
+- Master: non-blocking, registered with the Tokio reactor (`AsyncFd`), so reading output and writing input wait without a thread per terminal. `read` returning 0 means end of output: no process holds the slave any more (Linux reports EIO). `resize` sets the size with `TIOCSWINSZ`; the kernel sends SIGWINCH to the foreground process group.
+- Not used by the Server yet: shells (RC002) and the terminal Channel (RC003) follow.
+
+# 11	Dependencies
 | Crate | Purpose | Why |
 |---|---|---|
 | `clap` (derive) | command line parsing | de facto standard Rust parser: help, error messages and later shell completion (RK003) without own parsing code |
@@ -129,7 +137,7 @@ PROTOCOL.md §12, §13.3, §13.4.
 | `quinn` (`runtime-tokio`, `rustls-aws-lc-rs`) | QUIC | the established Rust QUIC implementation (DECISIONS §5); without default features: no `ring`, no platform certificate verifier (no X.509), no `log` |
 | `rustls` (`aws_lc_rs`, `std`) | TLS 1.3 | memory-safe TLS used by `quinn`; supports Raw Public Keys and X25519MLKEM768; without TLS 1.2 and `logging` |
 | `aws-lc-rs` | Ed25519 key generation, SHA-256 of fingerprints | the crypto provider of `rustls` already, so no further library; the only one of the `rustls` providers with X25519MLKEM768. Built from C (AWS-LC): a C compiler is needed |
-| `tokio` (`rt-multi-thread`, `time`) | async runtime | the runtime `quinn` runs on |
+| `tokio` (`net`, `rt-multi-thread`, `time`) | async runtime | the runtime `quinn` runs on; `net` for `AsyncFd` (PTY master) |
 | `socket2` | UDP socket options | explicit dual-stack; already used inside `tokio` and `quinn` |
-| `nix` (`user` only; Unix only) | Account lookup (`getpwnam_r`), file owner check (`geteuid`) | safe wrappers of the Unix calls instead of own `unsafe` FFI; needed later for PTY, processes and signals (Tier RC) |
+| `nix` (`user`, `term`, `fs`, `ioctl`; Unix only) | Account lookup (`getpwnam_r`), file owner check (`geteuid`), PTY (`openpty`, termios, `fcntl`, `TIOCSWINSZ`) | safe wrappers of the Unix calls instead of own `unsafe` FFI; later also processes and signals (Tier RC) |
 | `base64` (`std` only) | fingerprints, PEM key file, trust store | the standard Rust base64 crate; strict decoding (no non-canonical trailing bits); without the default `simd-unsafe` feature |
