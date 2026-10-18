@@ -28,7 +28,8 @@ Every command with `ACCOUNT@HOST` also accepts `--fingerprint SHA256:...` (see S
 - Ctrl+C during `exec` interrupts the remote command; a command that ignores it keeps running, and pressing Ctrl+C three times ends `stpt` itself. In `connect` Ctrl+C goes to the remote shell, as in a local terminal.
 - Exit code 255: an STPT or connection error, the remote program was killed by a signal (`stpt` names it), or `stpt` was interrupted.
 - Sessions do not outlive the connection yet: closing the window or losing the connection ends the shell, as closing a terminal does.
-- The Server starts the shell as the Account, so it must run as root (or as that Account). Of the Client's environment only `LANG` and `LC_*` reach the shell; `STPT_SESSION` holds the Session ID.
+- The Server starts the shell as the Account, so it must run as root (or as that Account). The environment is that of a login: `PATH` and the locale come from `/etc/environment` and `/etc/default/locale` (or `/etc/locale.conf`) on the Server. Of the Client's environment only `LANG` and `LC_*` reach the shell and replace the Server's locale; `STPT_SESSION` holds the Session ID.
+- If the Client's locale is not installed on the Server, programs fall back to ASCII and warn (`locale: Cannot set LC_CTYPE`), as with ssh: install it on the Server (`sudo locale-gen ru_RU.UTF-8` on Debian) or unset `LANG` on the Client.
 
 # Private key, public key, fingerprint
 Three different texts appear around keys. Do not mix them up.

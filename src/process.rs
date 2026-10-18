@@ -3,9 +3,10 @@
 //! The Server starts the login shell or the command of a Session as the Account: in a
 //! new session (`setsid`), with a PTY slave as controlling terminal and as standard
 //! input, output and error, or with three pipes; groups, group and user of the
-//! Account; working directory
-//! its home (`/` if that fails); an environment built from scratch, so nothing of the
-//! Server's own environment reaches the Account.
+//! Account; working directory its home (`/` if that fails); an environment built from
+//! scratch, so nothing of the Server's own environment reaches the Account: the
+//! Server's own variables, the system-wide login environment (as pam_env gives it to
+//! sshd and login) and the variables the Client may set.
 
 use std::ffi::{CString, OsStr};
 use std::io;
@@ -25,6 +26,71 @@ const PATH_ROOT: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin
 
 /// Shell of an Account without one in the user database.
 const DEFAULT_SHELL: &str = "/bin/sh";
+
+/// Files with the system-wide environment of a login, read by pam_env for sshd and
+/// login: `/etc/environment` (e.g. PATH), the locale of systemd systems and of
+/// Debian. `KEY=VALUE` lines; a later file wins.
+pub const SYSTEM_ENVIRONMENT: [&str; 3] = [
+    "/etc/environment",
+    "/etc/locale.conf",
+    "/etc/default/locale",
+];
+
+/// Variables only the Server sets; neither system files nor the Client change them.
+const SERVER_VARIABLES: [&str; 6] = ["HOME", "USER", "LOGNAME", "SHELL", "TERM", "STPT_SESSION"];
+
+/// The system-wide login environment from `files`; missing files are skipped. Blocks.
+pub fn system_environment(files: &[&str]) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = Vec::new();
+    for file in files {
+        let text = match std::fs::read_to_string(file) {
+            Ok(text) => text,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                tracing::warn!(file, error = %e, "system environment not read");
+                continue;
+            }
+        };
+        for (name, value) in parse_environment(&text) {
+            env.retain(|(n, _)| *n != name);
+            env.push((name, value));
+        }
+    }
+    env
+}
+
+/// `KEY=VALUE` lines as pam_env reads them: `#` comments, an optional `export `,
+/// the value optionally in single or double quotes, no expansion. Invalid names and
+/// the Server's own variables are skipped.
+fn parse_environment(text: &str) -> Vec<(String, String)> {
+    let unquote = |value: &str| {
+        for quote in ['"', '\''] {
+            if value.len() >= 2 && value.starts_with(quote) && value.ends_with(quote) {
+                return value[1..value.len() - 1].to_owned();
+            }
+        }
+        value.to_owned()
+    };
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.starts_with('#') {
+                return None;
+            }
+            let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
+            let (name, value) = line.split_once('=')?;
+            let name = name.trim_end();
+            let valid = name.bytes().enumerate().all(|(i, b)| {
+                b == b'_' || b.is_ascii_alphabetic() || (i > 0 && b.is_ascii_digit())
+            });
+            if name.is_empty() || !valid || SERVER_VARIABLES.contains(&name) {
+                return None;
+            }
+            let value = unquote(value.trim());
+            (!value.contains('\0')).then(|| (name.to_owned(), value))
+        })
+        .collect()
+}
 
 /// An operating system Account, as found in the user database.
 #[derive(Debug, Clone)]
@@ -83,9 +149,9 @@ pub enum Io {
 nix::ioctl_write_int_bad!(set_controlling_terminal, nix::libc::TIOCSCTTY);
 
 /// Starts `program` as `account` in a new session, which is also its own process
-/// group (§14.9). `env` holds further variables: those taken from the Client, already
-/// checked against the allowlist, and `STPT_SESSION`. The Server must run as root, or
-/// as the Account itself.
+/// group (§14.9). `env` holds further variables in rising precedence: the system
+/// environment, those taken from the Client (already checked against the allowlist)
+/// and `STPT_SESSION`. The Server must run as root, or as the Account itself.
 pub fn spawn(
     account: &Account,
     program: &Program,
@@ -290,6 +356,62 @@ mod tests {
         assert!(root.uid.is_root());
         assert_eq!(root.home, Path::new("/root"));
         assert!(root.groups.contains(&root.gid));
+    }
+
+    #[test]
+    fn environment_file_format() {
+        let text = "# comment\n\
+                    PATH=\"/usr/local/bin:/usr/bin:/snap/bin\"\n\
+                    export LANG='en_US.UTF-8'\n\
+                    \n\
+                    LC_TIME = C\n\
+                    EMPTY=\n\
+                    1BAD=x\n\
+                    BAD-NAME=x\n\
+                    no equals sign\n\
+                    HOME=/elsewhere\n\
+                    TERM=vt100\n\
+                    PLAIN=a \"b\" c\n";
+        let env = parse_environment(text);
+        let expected = [
+            ("PATH", "/usr/local/bin:/usr/bin:/snap/bin"),
+            ("LANG", "en_US.UTF-8"),
+            ("LC_TIME", "C"),
+            ("EMPTY", ""),
+            ("PLAIN", "a \"b\" c"),
+        ];
+        let env: Vec<(&str, &str)> = env.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
+        assert_eq!(env, expected);
+    }
+
+    #[test]
+    fn later_environment_files_win() {
+        let dir = std::env::temp_dir().join(format!("stpt-env-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = dir.join("environment");
+        let second = dir.join("locale");
+        std::fs::write(&first, "PATH=/a\nLANG=C\n").unwrap();
+        std::fs::write(&second, "LANG=en_US.UTF-8\n").unwrap();
+        let missing = dir.join("missing");
+        let files = [&first, &missing, &second].map(|p| p.to_str().unwrap().to_owned());
+        let files: Vec<&str> = files.iter().map(String::as_str).collect();
+        let env = system_environment(&files);
+        let owned = |n: &str, v: &str| (n.to_owned(), v.to_owned());
+        assert_eq!(env, [owned("PATH", "/a"), owned("LANG", "en_US.UTF-8")]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn later_variables_win() {
+        let env = [
+            ("PATH", "/opt/bin:/usr/bin:/bin"),
+            ("LANG", "C"),
+            ("LANG", "C.UTF-8"),
+        ]
+        .map(|(n, v)| (n.to_owned(), v.to_owned()));
+        let line = "echo \"$PATH $LANG\"".to_owned();
+        let (out, _) = run(&me(), Program::Shell(line), &env).await;
+        assert_eq!(out, "/opt/bin:/usr/bin:/bin C.UTF-8\r\n");
     }
 
     #[test]

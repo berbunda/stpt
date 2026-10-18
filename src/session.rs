@@ -170,9 +170,13 @@ async fn start(
     session: SessionId,
 ) -> Result<(Account, Started), String> {
     let name = account.to_owned();
-    let account = tokio::task::spawn_blocking(move || Account::lookup(&name))
-        .await
-        .map_err(|e| e.to_string())?
+    let (account, system) = tokio::task::spawn_blocking(move || {
+        let system = process::system_environment(&process::SYSTEM_ENVIRONMENT);
+        (Account::lookup(&name), system)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    let account = account
         .map_err(|e| format!("Account lookup: {e}"))?
         .ok_or("the Account no longer exists")?;
     let program = match &open.command {
@@ -180,12 +184,9 @@ async fn start(
         Some(Command::Line(line)) => Program::Shell(line.clone()),
         Some(Command::Argv(argv)) => Program::Argv(argv.clone()),
     };
-    let mut env: Vec<(String, String)> = open
-        .env
-        .iter()
-        .filter(|(name, _)| allowed(name))
-        .cloned()
-        .collect();
+    // Later variables win: the Client's locale over the system's (as AcceptEnv).
+    let mut env = system;
+    env.extend(open.env.iter().filter(|(name, _)| allowed(name)).cloned());
     env.push(("STPT_SESSION".to_owned(), session.to_string()));
     let spawn_failed = |e| format!("starting the program: {e}");
     match (open.size, &open.term) {
