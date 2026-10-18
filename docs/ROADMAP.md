@@ -31,16 +31,16 @@ IDs A001–D008 were renamed to RA001–RD008 on 2026-10-11 (prefix scheme chang
 - [ ] RC008  Windows PTY (ConPTY), Server mode on Windows ➕ 2026-10-17
 
 # 4	Tier RD — Session Model
-- [ ] RD001  Session ID ← PD001
-- [ ] RD002  detached sessions ← PD002
-- [ ] RD003  session persistence after disconnect ← PD002
-- [ ] RD004  session list ← PD004
-- [ ] RD005  session attach ← PD003
-- [ ] RD006  session terminate ← PD002
+- [x] RD001  Session ID ← PD001 ✅ 2026-10-18
+- [x] RD002  detached sessions ← PD002 ✅ 2026-10-18
+- [x] RD003  session persistence after disconnect ← PD002 ✅ 2026-10-18
+- [x] RD004  session list ← PD004 ✅ 2026-10-18
+- [x] RD005  session attach ← PD003 ✅ 2026-10-18
+- [x] RD006  session terminate ← PD002 ✅ 2026-10-18
 - [ ] RD007  automatic reattach ← PD005
 - [ ] RD008  QUIC connection migration ← PD005
 - [ ] RD009  detach timeout in Client config; help, man and README explain that closing the window detaches ← PD002 ➕ 2026-10-13
-- [ ] RD010  detach from another window: all Attachments or one by ID ← PD003 ➕ 2026-10-13
+- [x] RD010  detach from another window: all Attachments or one by ID ← PD003 ➕ 2026-10-13 ✅ 2026-10-18
 
 # 5	Tier RE — File Transfer
 - [ ] RE001  file transfer Channel ← PE001 ➕ 2026-10-13

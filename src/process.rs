@@ -167,6 +167,9 @@ pub fn spawn(
     }
 
     let mut command = command(account, program);
+    // The Session owns the Child until the program exits; if the Server drops it
+    // earlier (shutdown), the program must not outlive the Session (§15.8).
+    command.kill_on_drop(true);
     command
         .env_clear()
         .env("HOME", &account.home)
@@ -270,6 +273,40 @@ pub async fn signal_group(account: &Account, group: Pid, signal: Signal) -> io::
         }
     })
     .await?
+}
+
+/// The process groups that have processes in the session `session` (Linux: from
+/// /proc). A process that left it (`setsid`) is not counted.
+pub fn groups_in_session(session: Pid) -> Vec<Pid> {
+    let mut groups = std::collections::BTreeSet::new();
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    for entry in dir.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        // "pid (comm) state ppid pgrp session ...": comm may hold any character, so
+        // the fields are counted after its last ')'.
+        let Some((_, rest)) = stat.rsplit_once(')') else {
+            continue;
+        };
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        if let (Some(group), Some(sid)) = (fields.get(2), fields.get(3))
+            && sid.parse() == Ok(session.as_raw())
+            && let Ok(group) = group.parse()
+        {
+            groups.insert(group);
+        }
+    }
+    groups.into_iter().map(Pid::from_raw).collect()
 }
 
 /// The command for `program`: a login shell gets `-` before the name of the shell as
@@ -532,6 +569,27 @@ mod tests {
         let waiting = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait());
         let status = waiting.await.expect("QUIT still ignored");
         assert_eq!(status.unwrap().code(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn groups_of_a_terminal_session() {
+        let me = me();
+        let Pty {
+            master: _master,
+            slave,
+        } = Pty::open(SIZE).unwrap();
+        let line = "sleep 30 & sleep 30 & echo ready; while :; do sleep 0.1; done".to_owned();
+        let term = "dumb".to_owned();
+        let child = spawn(&me, &Program::Shell(line), &[], Io::Pty { slave, term }).unwrap();
+        let leader = Pid::from_raw(child.id().unwrap() as i32);
+        let start = std::time::Instant::now();
+        while groups_in_session(leader).is_empty() {
+            assert!(start.elapsed().as_secs() < 5);
+        }
+        // A non-interactive shell (no job control) keeps its jobs in its own group.
+        assert_eq!(groups_in_session(leader), [leader]);
+        let gone = group_of_exited();
+        assert!(groups_in_session(gone).is_empty());
     }
 
     /// A process group that no longer exists.

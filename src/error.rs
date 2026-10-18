@@ -21,8 +21,6 @@ pub enum Error {
     Transport(quic::Error),
     /// Server mode on a platform without it (gate G2).
     ServerUnavailable,
-    /// Subcommand that is recognised but not implemented yet.
-    NotImplemented(&'static str),
     /// Key file of the Server Identity.
     ServerKey(identity::KeyFileError),
     /// Trust store file of the Client.
@@ -77,6 +75,18 @@ pub enum Error {
     Terminated(&'static str),
     /// Signal handlers could not be set up.
     Signals(io::Error),
+    /// A request failed with this error code (§8.4); the command names it.
+    Request(&'static str, u64),
+    /// No Session matches the argument.
+    NoSuchSession(String),
+    /// Several Sessions start with the prefix.
+    AmbiguousSession(String, usize),
+    NoSuchAttachment(String, u64),
+    /// The Connection ended while attached; the Session keeps running.
+    SessionContinues {
+        error: Box<Error>,
+        session: crate::terminal::SessionId,
+    },
 }
 
 impl Error {
@@ -93,7 +103,6 @@ impl fmt::Display for Error {
             Self::ServerUnavailable => {
                 f.write_str("server: Server mode is not available on this platform")
             }
-            Self::NotImplemented(command) => write!(f, "{command}: not implemented yet"),
             Self::ServerKey(e) => write!(f, "server key: {e}"),
             Self::Trust(e) => write!(f, "trust store: {e}"),
             Self::NoTrustStore => f.write_str(if cfg!(windows) {
@@ -171,6 +180,18 @@ impl fmt::Display for Error {
             Self::Interrupted => f.write_str("interrupted"),
             Self::Terminated(by) => write!(f, "terminated by {by}"),
             Self::Signals(e) => write!(f, "signal handling: {e}"),
+            Self::Request(command, code) => write!(f, "{command}: {}", code_name(*code)),
+            Self::NoSuchSession(text) => write!(f, "no Session {text}"),
+            Self::AmbiguousSession(text, n) => {
+                write!(f, "{n} Sessions start with {text}; give more of the ID")
+            }
+            Self::NoSuchAttachment(session, id) => {
+                write!(f, "no Attachment {id} in the Session {session}")
+            }
+            Self::SessionContinues { error, session } => write!(
+                f,
+                "{error}\nThe Session keeps running; attach again with: stpt connect --attach {session}"
+            ),
         }
     }
 }
@@ -226,9 +247,10 @@ mod tests {
 
     #[test]
     fn messages_and_exit_codes() {
-        let e = Error::NotImplemented("connect");
-        assert_eq!(e.to_string(), "connect: not implemented yet");
+        let e = Error::Request("terminate", 9);
+        assert_eq!(e.to_string(), "terminate: SESSION_NOT_FOUND");
         assert_eq!(e.exit_code(), 255);
+        assert_eq!(Error::Request("x", 99).to_string(), "x: error 99");
         assert_eq!(
             Error::ServerUnavailable.to_string(),
             "server: Server mode is not available on this platform"

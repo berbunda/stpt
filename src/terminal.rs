@@ -22,7 +22,7 @@ const MAX_ENV_VARS: usize = 64;
 const MAX_ENV_LEN: usize = 4096;
 
 /// Session ID (§15.1); shown as 32 lowercase hexadecimal digits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SessionId(pub [u8; SESSION_ID_LEN]);
 
 impl SessionId {

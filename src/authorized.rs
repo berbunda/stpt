@@ -47,7 +47,16 @@ impl Accounts for SystemAccounts {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Accepted {
     pub account: String,
+    /// The raw Ed25519 public key that authenticated.
+    pub key: [u8; 32],
     pub fingerprint: Fingerprint,
+    pub label: Option<String>,
+}
+
+/// A user key as the Session list shows it (§15.10): the raw key and its label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyInfo {
+    pub key: [u8; 32],
     pub label: Option<String>,
 }
 
@@ -81,6 +90,7 @@ impl Authorizer {
         match (signature, account, &keys, entry) {
             (true, true, Ok(_), Some(entry)) => Ok(Accepted {
                 account: request.account.clone(),
+                key: request.key,
                 fingerprint: ed25519_spki(&request.key).fingerprint(),
                 label: entry.label.clone(),
             }),

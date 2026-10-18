@@ -8,10 +8,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use quinn::{Connection, Endpoint, Incoming, VarInt};
+use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep_until, timeout, timeout_at};
 
 use crate::auth::{self, AuthRequest};
-use crate::authorized::{self, Accepted, Authorizer, SystemAccounts};
+use crate::authorized::{self, Accepted, Authorizer, KeyInfo, SystemAccounts};
 use crate::cli::Common;
 use crate::config::{self, ServerConfig};
 use crate::control::{self, Sender, State};
@@ -21,6 +22,9 @@ use crate::hello::{AUTH_PUBLICKEY_ED25519, ClientHello, ServerHello};
 use crate::identity::{self, ServerKey};
 use crate::logging::{self, Role};
 use crate::quic;
+#[cfg(unix)]
+use crate::session::{Policy, Store};
+
 use crate::wire::{self, Code, DEFAULT_MESSAGE_LIMIT, Failure, StreamError};
 
 /// Server mode needs a Unix PTY; Windows Server mode (ConPTY) comes with RC008 (gate G2).
@@ -46,8 +50,6 @@ pub struct Deadlines {
     /// A failed attempt is answered no earlier than this after its AUTH_REQUEST, so
     /// the response time does not depend on the reason of the failure (§12.4).
     pub failure_delay: Duration,
-    /// Output still sent after the primary process of a Session exited (§14.10).
-    pub exit_grace: Duration,
 }
 
 impl Deadlines {
@@ -55,7 +57,6 @@ impl Deadlines {
         hello: Duration::from_secs(10),
         auth: Duration::from_secs(60),
         failure_delay: Duration::from_millis(300),
-        exit_grace: Duration::from_secs(1),
     };
 }
 
@@ -69,6 +70,8 @@ impl Default for Deadlines {
 pub struct Shared {
     pub deadlines: Deadlines,
     pub authorizer: Authorizer,
+    #[cfg(unix)]
+    pub store: Arc<Store>,
 }
 
 /// Runs the Server; with `print_fingerprint` only prints the fingerprint of its key.
@@ -101,17 +104,20 @@ pub fn run(
         .clone()
         .unwrap_or_else(|| PathBuf::from(authorized::AUTHORIZED_KEYS_DIR));
     tracing::info!(path = %keys_dir.display(), "authorized keys directory");
-    let deadlines = Deadlines {
-        exit_grace: config.exit_grace.unwrap_or(Deadlines::DEFAULT.exit_grace),
-        ..Deadlines::DEFAULT
+    #[cfg(unix)]
+    let policy = Policy {
+        exit_grace: config.exit_grace.unwrap_or(Policy::DEFAULT.exit_grace),
+        ..Policy::DEFAULT
     };
-    let shared = Arc::new(Shared {
-        deadlines,
-        authorizer: Authorizer::new(keys_dir, Box::new(SystemAccounts)),
-    });
 
     let listen = listen_address(listen, &config);
     quic::runtime()?.block_on(async {
+        let shared = Arc::new(Shared {
+            deadlines: Deadlines::DEFAULT,
+            authorizer: Authorizer::new(keys_dir, Box::new(SystemAccounts)),
+            #[cfg(unix)]
+            store: Store::start(policy),
+        });
         let endpoint = quic::listen(listen, &key)?;
         let local = endpoint.local_addr().map_err(|source| quic::Error::Bind {
             addr: listen,
@@ -266,27 +272,76 @@ async fn serve_connection(
     connection.set_max_concurrent_bi_streams(VarInt::from_u32(1 + MAX_CHANNELS));
     let context = ChannelContext {
         account: accepted.account.clone(),
+        key: KeyInfo {
+            key: accepted.key,
+            label: accepted.label.clone(),
+        },
         peer_limit,
-        exit_grace: deadlines.exit_grace,
+        #[cfg(unix)]
+        store: shared.store.clone(),
+        attached: Default::default(),
     };
     tokio::spawn(accept_channels(connection.clone(), context));
 
-    // §8.4: requests. Their operations come with Tier RD; until then each is
-    // answered with INTERNAL_ERROR, and the Connection stays open.
+    // §8.4: requests run concurrently; their results go out in the order they are
+    // ready, through one writer of the control stream.
+    let (results, mut ready) = mpsc::channel::<wire::Message>(MAX_OUTSTANDING);
+    tokio::spawn(async move {
+        while let Some(result) = ready.recv().await {
+            if wire::write_message(&mut send, &result, peer_limit)
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        // Kept until the Connection ends: dropping it would end the control stream.
+        std::future::pending::<()>().await;
+    });
+    #[cfg(unix)]
+    let context = Arc::new(crate::requests::Context {
+        store: shared.store.clone(),
+        account: accepted.account.clone(),
+        peer_limit,
+    });
+    let outstanding = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
     loop {
         let message = control_message(&mut recv, State::Authenticated).await?;
         debug_assert!(control::is_request(message.kind));
         let id = control::request_id(&message)?;
-        tracing::debug!(
-            remote = %connection.remote_address(),
-            kind = message.kind,
-            id,
-            "request not implemented yet"
-        );
-        let result = control::request_result(id, Code::InternalError);
-        wire::write_message(&mut send, &result, peer_limit).await?;
+        #[cfg(unix)]
+        let request = crate::requests::parse(&message)?;
+        let admitted = {
+            let mut outstanding = outstanding.lock().unwrap();
+            if outstanding.contains(&id) {
+                return Err(Failure::violation(format!("request ID {id} in use")).into());
+            }
+            outstanding.len() < MAX_OUTSTANDING && outstanding.insert(id)
+        };
+        if !admitted {
+            let _ = results
+                .send(control::request_result(id, Code::LimitExceeded))
+                .await;
+            continue;
+        }
+        tracing::debug!(remote = %connection.remote_address(), kind = message.kind, id, "request");
+        let (results, outstanding) = (results.clone(), outstanding.clone());
+        #[cfg(unix)]
+        let context = context.clone();
+        tokio::spawn(async move {
+            #[cfg(unix)]
+            let result = crate::requests::handle(id, request, &context).await;
+            // Server mode is Unix only for now (gate G2).
+            #[cfg(not(unix))]
+            let result = control::request_result(id, Code::InternalError);
+            outstanding.lock().unwrap().remove(&id);
+            let _ = results.send(result).await;
+        });
     }
 }
+
+/// Requests of a Connection without a result yet (§8.4).
+const MAX_OUTSTANDING: usize = 16;
 
 /// The control stream of an Established Connection.
 struct Control<'a> {
@@ -367,8 +422,12 @@ async fn authenticate(
 #[derive(Clone)]
 struct ChannelContext {
     account: String,
+    key: KeyInfo,
     peer_limit: u64,
-    exit_grace: Duration,
+    #[cfg(unix)]
+    store: Arc<Store>,
+    /// Sessions the Connection is attached to (§14.3).
+    attached: Arc<std::sync::Mutex<std::collections::HashSet<crate::terminal::SessionId>>>,
 }
 
 /// Streams the Client opens on an Authenticated Connection: each must start with
@@ -397,14 +456,16 @@ async fn open_channel(
         Ok(Some(message)) => match control::channel_kind(&message) {
             #[cfg(unix)]
             Ok(control::TERMINAL) => {
-                let channel = crate::session::Channel {
+                let channel = crate::attachment::Channel {
                     send,
                     recv,
                     peer_limit: context.peer_limit,
                     account: context.account,
-                    remote,
+                    key: context.key,
+                    connection: connection.clone(),
+                    attached: context.attached,
                 };
-                match crate::session::serve(channel, &message, context.exit_grace).await {
+                match crate::attachment::serve(channel, &message, &context.store).await {
                     Ok(()) => return,
                     Err(failure) => failure,
                 }
@@ -491,7 +552,6 @@ mod tests {
         hello: Duration::from_millis(300),
         auth: Duration::from_millis(300),
         failure_delay: Duration::from_millis(50),
-        exit_grace: Duration::from_millis(300),
     };
 
     const FAST_FAILURES: Deadlines = Deadlines {
@@ -508,13 +568,16 @@ mod tests {
         }
     }
 
-    /// A Client Connection to a Server that serves exactly this Connection; the
-    /// Server authorizes `user` for one Account, `alice` unless started with `start_as`.
+    /// A Client Connection to a test Server, which serves every Connection with one
+    /// store and authorizes `user` for one Account, `alice` unless chosen otherwise.
+    #[cfg_attr(not(unix), allow(dead_code))]
     struct Peer {
         _endpoint: Endpoint,
         connection: Connection,
-        user: UserKey,
+        user: Arc<UserKey>,
         account: String,
+        addr: SocketAddr,
+        server_key: crate::identity::PublicKey,
     }
 
     impl Peer {
@@ -523,31 +586,68 @@ mod tests {
         }
 
         async fn start_as(deadlines: Deadlines, account: &str) -> Self {
+            #[cfg(unix)]
+            let store = Store::start(Policy::DEFAULT);
+            Self::serve(deadlines, account, |authorizer| Shared {
+                deadlines,
+                authorizer,
+                #[cfg(unix)]
+                store,
+            })
+            .await
+        }
+
+        #[cfg(unix)]
+        async fn start_with(policy: Policy, account: &str) -> Self {
+            let store = Store::start(policy);
+            Self::serve(Deadlines::DEFAULT, account, |authorizer| Shared {
+                deadlines: Deadlines::DEFAULT,
+                authorizer,
+                store,
+            })
+            .await
+        }
+
+        async fn serve(
+            _deadlines: Deadlines,
+            account: &str,
+            shared: impl FnOnce(Authorizer) -> Shared,
+        ) -> Self {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static SERVERS: AtomicUsize = AtomicUsize::new(0);
             let key = ServerKey::generate();
             let server = quic::listen("127.0.0.1:0".parse().unwrap(), &key).unwrap();
             let addr = server.local_addr().unwrap();
-            let user = UserKey::generate();
+            let user = Arc::new(UserKey::generate());
             let dir = std::env::temp_dir().join(format!(
                 "stpt-server-keys-{}-{}",
                 std::process::id(),
-                addr.port()
+                SERVERS.fetch_add(1, Ordering::Relaxed)
             ));
             crate::authorized::test_support::keys_file(
                 &dir,
                 account,
                 &format!("{} test\n", user.public_key().to_base64()),
             );
-            let shared = Arc::new(Shared {
-                deadlines,
-                authorizer: Authorizer::new(dir, Box::new(Only(account.to_owned()))),
-            });
+            let authorizer = Authorizer::new(dir, Box::new(Only(account.to_owned())));
+            let shared = Arc::new(shared(authorizer));
             tokio::spawn(async move {
-                let incoming = server.accept().await.unwrap();
-                connection(incoming, shared).await;
+                while let Some(incoming) = server.accept().await {
+                    tokio::spawn(connection(incoming, shared.clone()));
+                }
             });
+            Self::connect(addr, key.public_key(), user, account).await
+        }
+
+        async fn connect(
+            addr: SocketAddr,
+            server_key: crate::identity::PublicKey,
+            user: Arc<UserKey>,
+            account: &str,
+        ) -> Self {
             let endpoint = quic::client(addr).unwrap();
             let check = ServerKeyCheck::new(Expected {
-                stored: Some(key.public_key()),
+                stored: Some(server_key.clone()),
                 fingerprint: None,
             });
             let connection = quic::connect(&endpoint, addr, "localhost", check)
@@ -558,7 +658,21 @@ mod tests {
                 connection,
                 user,
                 account: account.to_owned(),
+                addr,
+                server_key,
             }
+        }
+
+        /// Another Connection to the same Server with the same key.
+        #[cfg_attr(not(unix), allow(dead_code))]
+        async fn again(&self) -> Self {
+            Self::connect(
+                self.addr,
+                self.server_key.clone(),
+                self.user.clone(),
+                &self.account,
+            )
+            .await
         }
 
         /// Opens the control stream and exchanges HELLO.
@@ -634,7 +748,7 @@ mod tests {
                 other => panic!("{other:?}"),
             }
         }
-        assert_eq!(request(&mut send, &mut recv, 1).await, Code::InternalError);
+        assert_eq!(request(&mut send, &mut recv, 1).await, LIST_RESULT);
 
         // The Account of a Connection never changes (§12.4).
         send.write_all(&peer.request(&peer.user, "alice"))
@@ -646,6 +760,13 @@ mod tests {
     fn channel_open(kind: u64) -> Message {
         Message::new(wire::CHANNEL_OPEN, vec![(0, Value::Uint(kind))])
     }
+
+    /// Result code of a Session list: Sessions exist where Server mode does (gate G2).
+    const LIST_RESULT: Code = if cfg!(unix) {
+        Code::NoError
+    } else {
+        Code::InternalError
+    };
 
     /// Sends SESSION_LIST with request ID `id`; returns the error code of its result.
     async fn request(send: &mut quinn::SendStream, recv: &mut quinn::RecvStream, id: u64) -> Code {
@@ -665,7 +786,7 @@ mod tests {
         let peer = Peer::start(Deadlines::default()).await;
         let (mut send, mut recv) = peer.authenticated().await;
         for id in [7, 8, u64::MAX] {
-            assert_eq!(request(&mut send, &mut recv, id).await, Code::InternalError);
+            assert_eq!(request(&mut send, &mut recv, id).await, LIST_RESULT);
         }
     }
 
@@ -890,9 +1011,11 @@ mod tests {
             height: 0,
         };
 
-        const FAST_EXIT: Deadlines = Deadlines {
+        const FAST: Policy = Policy {
             exit_grace: Duration::from_millis(300),
-            ..Deadlines::DEFAULT
+            termination_grace: Duration::from_millis(500),
+            stall_limit: Duration::from_millis(500),
+            ..Policy::DEFAULT
         };
 
         fn me() -> String {
@@ -903,19 +1026,31 @@ mod tests {
         /// An Authenticated Connection; the control stream stays open.
         struct Authenticated {
             peer: Peer,
-            _control: (quinn::SendStream, quinn::RecvStream),
+            control: (quinn::SendStream, quinn::RecvStream),
         }
 
         async fn authenticated() -> Authenticated {
-            let peer = Peer::start_as(FAST_EXIT, &me()).await;
+            authenticated_with(FAST).await
+        }
+
+        async fn authenticated_with(policy: Policy) -> Authenticated {
+            let peer = Peer::start_with(policy, &me()).await;
             let control = peer.authenticated().await;
-            Authenticated {
-                peer,
-                _control: control,
-            }
+            Authenticated { peer, control }
         }
 
         impl Authenticated {
+            /// Another Authenticated Connection to the same Server.
+            async fn again(&self) -> Authenticated {
+                let peer = self.peer.again().await;
+                let control = peer.authenticated().await;
+                Authenticated { peer, control }
+            }
+
+            async fn attach(&self, open: Open) -> (quinn::SendStream, quinn::RecvStream) {
+                self.open(&open).await
+            }
+
             async fn open(&self, open: &Open) -> (quinn::SendStream, quinn::RecvStream) {
                 let (mut send, recv) = self.peer.connection.open_bi().await.unwrap();
                 write(&mut send, &open.to_message()).await;
@@ -1167,35 +1302,358 @@ mod tests {
             }
         }
 
-        #[tokio::test]
-        async fn detach_ends_the_session_with_hangup() {
-            let marker = std::env::temp_dir().join(format!("stpt-hup-{}", std::process::id()));
-            let _ = std::fs::remove_file(&marker);
-            let line = format!(
-                "trap 'echo hup > {}; exit' HUP; echo ready; while :; do sleep 0.1; done",
-                marker.display()
-            );
-            let a = authenticated().await;
-            let (mut send, mut recv) = a.open(&command(&line, true)).await;
-            attached(&mut recv).await;
+        /// Reads output until it contains `text`; returns all output read.
+        async fn read_until(recv: &mut quinn::RecvStream, text: &str) -> Vec<u8> {
             let mut out = Vec::new();
-            while !String::from_utf8_lossy(&out).contains("ready") {
-                let message = wire::read_message(&mut recv, DEFAULT_MESSAGE_LIMIT)
+            while !String::from_utf8_lossy(&out).contains(text) {
+                let message = wire::read_message(recv, DEFAULT_MESSAGE_LIMIT)
                     .await
                     .unwrap()
                     .unwrap();
                 out.extend(terminal::data_of(&message).unwrap());
             }
+            out
+        }
+
+        /// Ends the Client's direction and checks that the Server ends its own
+        /// without TERMINAL_EXIT (§14.10).
+        async fn detach(send: &mut quinn::SendStream, recv: &mut quinn::RecvStream) {
             send.finish().unwrap();
-            // The Server ends its direction without TERMINAL_EXIT (§14.10).
-            let end = wire::read_message(&mut recv, DEFAULT_MESSAGE_LIMIT).await;
-            assert!(end.unwrap().is_none());
+            let end = wire::read_message(recv, DEFAULT_MESSAGE_LIMIT).await;
+            assert!(end.unwrap().is_none(), "FIN without TERMINAL_EXIT");
+        }
+
+        fn attach_to(session: SessionId) -> Open {
+            Open {
+                session: Some(session),
+                size: Some(SIZE),
+                ..Open::default()
+            }
+        }
+
+        /// Attaches until the Server answers SESSION_NOT_FOUND, at most 3 s.
+        async fn gone(a: &Authenticated, session: SessionId) {
+            let start = Instant::now();
+            loop {
+                let (_send, mut recv) = a.attach(attach_to(session)).await;
+                match wire::read_message(&mut recv, DEFAULT_MESSAGE_LIMIT).await {
+                    Err(StreamError::Reset(code)) if code == Code::SessionNotFound.varint() => {
+                        return;
+                    }
+                    _ => assert!(start.elapsed() < Duration::from_secs(3), "Session stays"),
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+
+        /// Sends a request on the control stream and returns its result.
+        async fn ask(a: &mut Authenticated, request: &Message) -> Message {
+            let (send, recv) = &mut a.control;
+            write(send, request).await;
+            wire::read_message(recv, DEFAULT_MESSAGE_LIMIT)
+                .await
+                .unwrap()
+                .unwrap()
+        }
+
+        fn code_of(result: &Message) -> Code {
+            Code::from_value(result.field(1).and_then(Value::as_uint).unwrap()).unwrap()
+        }
+
+        #[tokio::test]
+        async fn list_detach_and_terminate_requests() {
+            use crate::listing::{self, RUNNING};
+            let mut a = authenticated().await;
+            let named = Open {
+                name: Some("work".into()),
+                ..command(LOOP, true)
+            };
+            let (_send_a, mut recv_a) = a.open(&named).await;
+            let created = attached(&mut recv_a).await;
+            read_until(&mut recv_a, "ready").await;
+            let b = a.again().await;
+            let (_send_b, mut recv_b) = b.attach(attach_to(created.session)).await;
+            attached(&mut recv_b).await;
+
+            let result = ask(&mut a, &listing::list_request(1, None, None)).await;
+            assert_eq!(code_of(&result), Code::NoError);
+            let (sessions, more) = listing::list_of(&result).unwrap();
+            assert!(!more);
+            let [session] = sessions.as_slice() else {
+                panic!("{sessions:?}")
+            };
+            assert_eq!(session.id, created.session);
+            assert_eq!(session.name.as_deref(), Some("work"));
+            assert_eq!((session.state, session.pty), (RUNNING, true));
+            assert_eq!(session.command.as_deref(), Some(LOOP));
+            assert_eq!(session.key, a.peer.user.raw_public());
+            let ids: Vec<(u64, bool)> = session
+                .attachments
+                .iter()
+                .map(|a| (a.id, a.active))
+                .collect();
+            assert_eq!(ids, [(1, false), (2, true)]);
+
+            // Detach one Attachment: its Client sees a detach by the Server.
+            let detach = listing::detach_request(2, created.session, Some(2));
+            assert_eq!(code_of(&ask(&mut a, &detach).await), Code::NoError);
+            loop {
+                match wire::read_message(&mut recv_b, DEFAULT_MESSAGE_LIMIT).await {
+                    Ok(Some(_)) => continue,
+                    Ok(None) => break,
+                    other => panic!("{other:?}"),
+                }
+            }
+            let unknown = listing::detach_request(3, created.session, Some(99));
+            assert_eq!(
+                code_of(&ask(&mut a, &unknown).await),
+                Code::AttachmentNotFound
+            );
+
+            // Terminate: HUP ends the shell; the Attachment gets the exit status.
+            let terminate = listing::terminate_request(4, created.session, false);
+            assert_eq!(code_of(&ask(&mut a, &terminate).await), Code::NoError);
+            let hangup = Exit::Signal {
+                id: 3,
+                core_dumped: false,
+            };
+            assert_eq!(output(&mut recv_a).await.2, hangup);
+            let result = ask(&mut a, &listing::list_request(5, None, None)).await;
+            assert!(listing::list_of(&result).unwrap().0.is_empty());
+            let again = listing::terminate_request(6, created.session, false);
+            assert_eq!(code_of(&ask(&mut a, &again).await), Code::SessionNotFound);
+            let only = listing::list_request(7, Some(created.session), None);
+            assert_eq!(code_of(&ask(&mut a, &only).await), Code::SessionNotFound);
+        }
+
+        #[tokio::test]
+        async fn termination_escalates_and_request_ids_are_unique() {
+            use crate::listing;
+            let mut a = authenticated().await;
+            let line = format!("trap '' TERM; {LOOP}");
+            let (_send, mut recv) = a.open(&command(&line, false)).await;
+            let created = attached(&mut recv).await;
+            read_until(&mut recv, "ready").await;
+            // TERM is ignored: KILL follows after the grace period (500 ms here).
+            let start = Instant::now();
+            let terminate = listing::terminate_request(1, created.session, false);
+            assert_eq!(code_of(&ask(&mut a, &terminate).await), Code::NoError);
+            assert!(start.elapsed() >= FAST.termination_grace);
+            let killed = Exit::Signal {
+                id: 5,
+                core_dumped: false,
+            };
+            assert_eq!(output(&mut recv).await.2, killed);
+
+            // A request ID still without a result must not be used again (§8.4).
+            let (_send, mut recv) = a.open(&command(&line, false)).await;
+            let second = attached(&mut recv).await;
+            read_until(&mut recv, "ready").await;
+            let terminate = listing::terminate_request(2, second.session, false);
+            let (send, _) = &mut a.control;
+            write(send, &terminate).await;
+            write(send, &terminate).await;
+            assert_eq!(a.peer.closed_with().await, Some(Code::ProtocolViolation));
+        }
+
+        #[tokio::test]
+        async fn detach_keeps_the_session_and_attach_replays() {
+            let a = authenticated().await;
+            let line = "echo one; read x; echo got $x; exit 4";
+            let (mut send, mut recv) = a.open(&command(line, true)).await;
+            let created = attached(&mut recv).await;
+            read_until(&mut recv, "one").await;
+            detach(&mut send, &mut recv).await;
+
+            // The same Connection attaches again; the output from its start is replayed.
+            let (mut send, mut recv) = a.attach(attach_to(created.session)).await;
+            let again = attached(&mut recv).await;
+            assert_eq!(again.session, created.session);
+            assert_eq!((again.attachment, again.offset), (2, 0));
+            read_until(&mut recv, "one\r\n").await;
+            write(&mut send, &terminal::data(wire::TERMINAL_DATA, b"abc\n")).await;
+            let (out, _, exit) = output(&mut recv).await;
+            assert!(out.ends_with("got abc\r\n"), "{out}");
+            assert_eq!(exit, Exit::Code(4));
+            // The Client's FIN confirms the exit status: the Session is removed.
+            send.finish().unwrap();
+            gone(&a, created.session).await;
+        }
+
+        #[tokio::test]
+        async fn resume_continues_without_gap() {
+            let a = authenticated().await;
+            let line = "echo line1; sleep 0.3; echo line2; echo line3; read x";
+            let (mut send, mut recv) = a.open(&command(line, true)).await;
+            let created = attached(&mut recv).await;
+            let received = read_until(&mut recv, "line1\r\n").await;
+            detach(&mut send, &mut recv).await;
+            tokio::time::sleep(Duration::from_millis(600)).await;
+
+            let resume = Open {
+                resume: Some(received.len() as u64),
+                ..attach_to(created.session)
+            };
+            let (_send, mut recv) = a.attach(resume).await;
+            let again = attached(&mut recv).await;
+            assert_eq!(again.offset, received.len() as u64);
+            let rest = read_until(&mut recv, "line3\r\n").await;
+            assert!(rest.starts_with(b"line2\r\nline3\r\n"), "{rest:?}");
+
+            let beyond = Open {
+                resume: Some(1 << 40),
+                ..attach_to(created.session)
+            };
+            let b = a.again().await;
+            let (_send, mut recv) = b.attach(beyond).await;
+            assert_eq!(reset(&mut recv).await, Code::ChannelRejected);
+        }
+
+        #[tokio::test]
+        async fn attachments_share_output_and_input() {
+            let a = authenticated().await;
+            let line = "read x; echo got $x; read y; echo got $y";
+            let (mut send_a, mut recv_a) = a.open(&command(line, true)).await;
+            let created = attached(&mut recv_a).await;
+            let b = a.again().await;
+            let (mut send_b, mut recv_b) = b.attach(attach_to(created.session)).await;
+            assert_eq!(attached(&mut recv_b).await.attachment, 2);
+
+            write(&mut send_a, &terminal::data(wire::TERMINAL_DATA, b"one\n")).await;
+            read_until(&mut recv_a, "got one").await;
+            read_until(&mut recv_b, "got one").await;
+            write(&mut send_b, &terminal::data(wire::TERMINAL_DATA, b"two\n")).await;
+            read_until(&mut recv_a, "got two").await;
+            read_until(&mut recv_b, "got two").await;
+
+            // One Channel per Session and Connection (§14.3).
+            let (_send, mut recv) = b.attach(attach_to(created.session)).await;
+            assert_eq!(reset(&mut recv).await, Code::ChannelRejected);
+        }
+
+        #[tokio::test]
+        async fn takeover_and_read_only() {
+            let a = authenticated().await;
+            let (_send_a, mut recv_a) = a.open(&command(LOOP, true)).await;
+            let created = attached(&mut recv_a).await;
+            read_until(&mut recv_a, "ready").await;
+
+            // A read-only Attachment must not send input.
+            let b = a.again().await;
+            let read_only = Open {
+                read_only: Some(true),
+                ..attach_to(created.session)
+            };
+            let (mut send_b, mut recv_b) = b.attach(read_only).await;
+            attached(&mut recv_b).await;
+            write(&mut send_b, &terminal::data(wire::TERMINAL_DATA, b"x")).await;
+            assert_eq!(b.peer.closed_with().await, Some(Code::ProtocolViolation));
+
+            // A takeover ends the other Attachments as a detach by the Server.
+            let c = a.again().await;
+            let takeover = Open {
+                takeover: Some(true),
+                ..attach_to(created.session)
+            };
+            let (_send_c, mut recv_c) = c.attach(takeover).await;
+            attached(&mut recv_c).await;
+            loop {
+                match wire::read_message(&mut recv_a, DEFAULT_MESSAGE_LIMIT).await {
+                    Ok(Some(message)) => assert_eq!(message.kind, wire::TERMINAL_DATA),
+                    Ok(None) => break,
+                    other => panic!("{other:?}"),
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn attach_to_an_exited_session() {
+            let a = authenticated().await;
+            let (mut send, mut recv) = a
+                .open(&command("sleep 0.3; echo done; exit 2", false))
+                .await;
+            let created = attached(&mut recv).await;
+            detach(&mut send, &mut recv).await;
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+
+            let (mut send, mut recv) = a.attach(attach_to(created.session)).await;
+            attached(&mut recv).await;
+            assert_eq!(
+                output(&mut recv).await,
+                ("done\n".into(), "".into(), Exit::Code(2))
+            );
+            send.finish().unwrap();
+            gone(&a, created.session).await;
+        }
+
+        #[tokio::test]
+        async fn detach_timeout_zero_ends_with_hangup() {
+            let marker = std::env::temp_dir().join(format!("stpt-hup-{}", std::process::id()));
+            let _ = std::fs::remove_file(&marker);
+            let line = format!("trap 'echo hup > {}; exit' HUP; {LOOP}", marker.display());
+            let a = authenticated().await;
+            let open = Open {
+                detach_timeout: Some(0),
+                ..command(&line, true)
+            };
+            let (mut send, mut recv) = a.open(&open).await;
+            let created = attached(&mut recv).await;
+            read_until(&mut recv, "ready").await;
+            detach(&mut send, &mut recv).await;
             let start = Instant::now();
             while !marker.exists() {
                 assert!(start.elapsed() < Duration::from_secs(5), "no SIGHUP");
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             std::fs::remove_file(&marker).unwrap();
+            gone(&a, created.session).await;
+        }
+
+        #[tokio::test]
+        async fn names_and_limits() {
+            let a = authenticated_with(Policy {
+                sessions_per_account: 2,
+                ..FAST
+            })
+            .await;
+            let named = Open {
+                name: Some("work".into()),
+                ..command(LOOP, false)
+            };
+            let (_s1, mut recv) = a.open(&named).await;
+            attached(&mut recv).await;
+            let (_s2, mut recv) = a.open(&named).await;
+            assert_eq!(reset(&mut recv).await, Code::SessionNameInUse);
+            let (_s3, mut recv) = a.open(&command(LOOP, false)).await;
+            attached(&mut recv).await;
+            let (_s4, mut recv) = a.open(&command(LOOP, false)).await;
+            assert_eq!(reset(&mut recv).await, Code::LimitExceeded);
+        }
+
+        #[tokio::test]
+        async fn stalled_attachment_is_ended() {
+            let a = authenticated().await;
+            let (_send_a, mut recv_a) = a.open(&command("yes", true)).await;
+            let created = attached(&mut recv_a).await;
+            // The first Client reads everything; the second never reads.
+            tokio::spawn(async move {
+                while let Ok(Some(_)) = wire::read_message(&mut recv_a, DEFAULT_MESSAGE_LIMIT).await
+                {
+                }
+            });
+            let b = a.again().await;
+            let (_send_b, mut recv_b) = b.attach(attach_to(created.session)).await;
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            loop {
+                match wire::read_message(&mut recv_b, DEFAULT_MESSAGE_LIMIT).await {
+                    Ok(Some(_)) => continue,
+                    Err(StreamError::Reset(code)) => {
+                        assert_eq!(code, Code::Timeout.varint());
+                        break;
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
         }
 
         #[tokio::test]

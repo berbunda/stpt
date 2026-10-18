@@ -157,7 +157,7 @@ mod server {
         assert_eq!(stderr(&out), "stpt: terminated by HUP");
         assert_eq!(out.status.code(), Some(255));
         // The Server knows at once, not after the idle timeout of 60 s.
-        assert!(s.server.wait_for_log("Session ended") || s.server.wait_for_log("abandoned"));
+        assert!(s.server.wait_for_log("detached by the Client"));
     }
 
     #[test]
@@ -192,6 +192,79 @@ mod server {
         let out = child.wait_with_output().unwrap();
         assert_eq!(stderr(&out), "stpt: interrupted");
         assert_eq!(out.status.code(), Some(255));
+    }
+
+    /// Runs `stpt ARGS` in script(1), so it has a terminal, typing `input`.
+    fn in_terminal(s: &Setup, args: &[&str], input: &[u8]) -> (String, Option<i32>) {
+        let line = format!("{} {}", env!("CARGO_BIN_EXE_stpt"), args.join(" "));
+        let mut child = Command::new("script")
+            .args(["-qec", &line, "/dev/null"])
+            .env("HOME", &s.home)
+            .env("XDG_CONFIG_HOME", &s.home)
+            .env("TERM", "xterm")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(input).unwrap();
+        let out = child.wait_with_output().unwrap();
+        drop(stdin);
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            out.status.code(),
+        )
+    }
+
+    #[test]
+    fn sessions_outlive_the_client() {
+        let s = Setup::new("terminal-sessions");
+
+        // Enter ~ . detaches; the Session keeps running.
+        let args = s.args("connect", &["--name", "work"]);
+        let (text, code) = in_terminal(&s, &args, b"echo $((6 * 7))\n~.");
+        assert_eq!(code, Some(0), "{text}");
+        assert!(text.contains("stpt: detached; Session "), "{text}");
+        let id = text
+            .split("Session ")
+            .nth(1)
+            .and_then(|rest| rest.get(..32))
+            .unwrap()
+            .to_owned();
+
+        let out = stpt_in(&s.home, &s.args("sessions", &[]));
+        let table = stdout(&out);
+        assert!(table.contains(&id[..12]), "{table}");
+        assert!(table.contains("work"), "{table}");
+        assert!(table.contains("running"), "{table}");
+
+        // Attach by name: the earlier output is replayed.
+        let args = s.args("connect", &["--attach", "work"]);
+        let (text, code) = in_terminal(&s, &args, b"exit 3\n");
+        assert!(text.contains("42\r\n"), "{text}");
+        assert_eq!(code, Some(3), "{text}");
+
+        // A Session without a PTY whose Client is gone; terminate it by ID prefix.
+        let (child, _lines) = exec_until_ready(&s, "true");
+        let pid = child.id().to_string();
+        assert!(
+            Command::new("kill")
+                .args(["-HUP", &pid])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let _ = child.wait_with_output();
+        let table = stdout(&stpt_in(&s.home, &s.args("sessions", &[])));
+        let line = table.lines().nth(1).unwrap_or_default();
+        let prefix = line.split_whitespace().next().unwrap().to_owned();
+        let out = stpt_in(&s.home, &s.args("terminate", &[&prefix]));
+        assert!(out.status.success(), "{}", stderr(&out));
+        let table = stdout(&stpt_in(&s.home, &s.args("sessions", &[])));
+        assert_eq!(table.lines().count(), 1, "{table}");
+        let out = stpt_in(&s.home, &s.args("terminate", &[&prefix]));
+        assert_eq!(stderr(&out), format!("stpt: no Session {prefix}"));
     }
 
     #[test]

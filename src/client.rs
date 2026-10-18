@@ -10,7 +10,9 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use crate::auth::{self, UserKey};
+use crate::cbor::Value;
 use crate::cli::{ClientCommand, Common, Remote, TrustAction};
+use crate::commands;
 use crate::config::{self, ClientConfig};
 use crate::console::{self, Console};
 use crate::control::{self, Sender, State};
@@ -20,11 +22,11 @@ use crate::hello::{AUTH_PUBLICKEY_ED25519, ClientHello, ServerHello};
 use crate::identity::Fingerprint;
 use crate::logging::{self, Role};
 use crate::quic;
-use crate::terminal::{self, Attached, Command, Exit, Open, Size};
+use crate::terminal::{self, Attached, Command, Exit, Open, SessionId, Size};
 use crate::tls::{Expected, ServerKeyCheck, Verdict};
 use crate::trust::{self, TrustStore};
 use crate::wire::{
-    self, DEFAULT_MESSAGE_LIMIT, Failure, StreamError, TERMINAL_DATA, TERMINAL_EXIT,
+    self, DEFAULT_MESSAGE_LIMIT, Failure, Message, StreamError, TERMINAL_DATA, TERMINAL_EXIT,
     TERMINAL_STDERR,
 };
 
@@ -46,23 +48,47 @@ pub fn run(command: ClientCommand, common: &Common) -> Result<ExitCode, Error> {
     );
     config::log_source(path.as_deref());
 
-    // The terminal Channel to open; `None` for commands that come with Tier RD.
-    let (name, remote, open) = match command {
+    let (remote, action) = match command {
         ClientCommand::Trust { action } => return trust_command(action),
         ClientCommand::Connect {
             remote,
-            attach: Some(_),
+            attach: Some(session),
+            takeover,
+            read_only,
             ..
-        } => ("connect --attach", remote, None),
-        ClientCommand::Connect { remote, name, .. } => ("connect", remote, Some(interactive(name))),
+        } => (
+            remote,
+            Action::Attach {
+                session,
+                takeover,
+                read_only,
+            },
+        ),
+        ClientCommand::Connect { remote, name, .. } => {
+            (remote, Action::Terminal(interactive(name), true))
+        }
         ClientCommand::Exec {
             remote,
             no_shell,
             command,
-        } => ("exec", remote, Some(exec(command, no_shell))),
-        ClientCommand::Sessions { remote } => ("sessions", remote, None),
-        ClientCommand::Detach { remote, .. } => ("detach", remote, None),
-        ClientCommand::Terminate { remote, .. } => ("terminate", remote, None),
+        } => (remote, Action::Terminal(exec(command, no_shell), false)),
+        ClientCommand::Sessions { remote } => (remote, Action::List),
+        ClientCommand::Detach {
+            remote,
+            session,
+            target,
+        } => (
+            remote,
+            Action::Detach {
+                session,
+                attachment: target.id,
+            },
+        ),
+        ClientCommand::Terminate {
+            remote,
+            session,
+            force,
+        } => (remote, Action::Terminate { session, force }),
     };
     let mut store = trust_store()?;
     let key_path = match &remote.identity {
@@ -92,13 +118,81 @@ pub fn run(command: ClientCommand, common: &Common) -> Result<ExitCode, Error> {
         });
     }
     tracing::info!(%account, key = %key.public_key().fingerprint(), "Connection authenticated");
-    let Some(open) = open else {
-        runtime.block_on(connection.close());
-        return Err(Error::NotImplemented(name));
-    };
-    let result = runtime.block_on(connection.terminal(open));
+    let result = runtime.block_on(perform(&mut connection, action));
     runtime.block_on(connection.close());
-    Ok(exit_code(result?))
+    result
+}
+
+/// What a Client command does once the Connection is Authenticated.
+enum Action {
+    /// A new Session: its terminal Channel, and whether it has a PTY.
+    Terminal(Open, bool),
+    Attach {
+        session: String,
+        takeover: bool,
+        read_only: bool,
+    },
+    List,
+    Terminate {
+        session: String,
+        force: bool,
+    },
+    Detach {
+        session: String,
+        attachment: Option<u64>,
+    },
+}
+
+async fn perform(connection: &mut Connection, action: Action) -> Result<ExitCode, Error> {
+    match action {
+        Action::Terminal(open, pty) => connection.terminal(open, pty).await.map(outcome_code),
+        Action::Attach {
+            session,
+            takeover,
+            read_only,
+        } => {
+            let session = commands::resolve(connection, &session).await?;
+            let open = Open {
+                session: Some(session.id),
+                size: session.pty.then(|| console::size().unwrap_or(DEFAULT_SIZE)),
+                takeover: takeover.then_some(true),
+                read_only: read_only.then_some(true),
+                ..Open::default()
+            };
+            connection
+                .terminal(open, session.pty)
+                .await
+                .map(outcome_code)
+        }
+        Action::List => commands::sessions(connection).await,
+        Action::Terminate { session, force } => {
+            commands::terminate(connection, &session, force).await
+        }
+        Action::Detach {
+            session,
+            attachment,
+        } => commands::detach(connection, &session, attachment).await,
+    }
+}
+
+/// Exit code and message for the end of a terminal Channel.
+fn outcome_code(outcome: Outcome) -> ExitCode {
+    let note = |text: String| {
+        let _ = writeln!(io::stderr(), "stpt: {text}");
+    };
+    match outcome {
+        Outcome::Exited(exit) => exit_code(exit),
+        Outcome::Detached(session) => {
+            note(format!("detached; Session {session} keeps running"));
+            ExitCode::SUCCESS
+        }
+        Outcome::DetachedByServer(session) => {
+            note(format!(
+                "detached by the Server; Session {session} keeps running"
+            ));
+            ExitCode::SUCCESS
+        }
+    }
 }
 
 /// Window size when standard output is not a terminal.
@@ -229,6 +323,8 @@ pub struct Connection {
     control: Option<(quinn::SendStream, quinn::RecvStream)>,
     /// Message size limit of the Server, from SERVER_HELLO.
     peer_limit: u64,
+    /// The last request ID used (§8.4).
+    next_request: u64,
 }
 
 impl Connection {
@@ -265,7 +361,7 @@ impl Connection {
     /// Error of a failed step on the control stream. A violation by the Server or an
     /// expired deadline closes the Connection with its code; the reason is reported
     /// locally only.
-    async fn failed(&self, error: StreamError) -> Error {
+    pub async fn failed(&self, error: StreamError) -> Error {
         let failure = match error {
             StreamError::Lost(reason) => return quic::Error::Connection(reason).into(),
             StreamError::Failure(failure) => failure,
@@ -313,12 +409,21 @@ impl Connection {
     }
 }
 
+/// How a terminal Channel ended for the Client.
+pub enum Outcome {
+    /// The remote program exited.
+    Exited(Exit),
+    /// The user detached (`Enter ~ .`); the Session keeps running.
+    Detached(SessionId),
+    /// The Server ended the Attachment (takeover, detach request).
+    DetachedByServer(SessionId),
+}
+
 impl Connection {
     /// Opens a terminal Channel (§14.3) and relays local input and remote output until
-    /// the remote program exits; returns its exit status. With a PTY the local terminal
-    /// is in raw mode meanwhile.
-    async fn terminal(&mut self, open: Open) -> Result<Exit, Error> {
-        let pty = open.size.is_some();
+    /// the remote program exits or the Attachment ends. With a PTY (`pty`) the local
+    /// terminal is in raw mode meanwhile, and `Enter ~ .` detaches.
+    async fn terminal(&mut self, open: Open, pty: bool) -> Result<Outcome, Error> {
         let (mut send, mut recv) = self
             .connection
             .open_bi()
@@ -351,7 +456,8 @@ impl Connection {
             let input = data.map_or(Input::Eof, Input::Data);
             from_stdin.blocking_send(input).is_ok()
         });
-        let sender = tokio::spawn(send_input(send, inputs, pty, self.peer_limit));
+        let (detach, mut detached) = tokio::sync::oneshot::channel();
+        let sender = tokio::spawn(send_input(send, inputs, pty, self.peer_limit, detach));
         let watcher = match open.size {
             Some(size) if console::size().is_some() => {
                 Some(tokio::spawn(watch_size(input.clone(), size)))
@@ -366,10 +472,12 @@ impl Connection {
                 interrupts(input.clone()).await
             }
         };
+        let session = attached.session;
         let result = tokio::select! {
-            result = receive_output(&mut recv, pty) => result,
+            result = receive_output(&mut recv, pty) => result.map(Outcome::Exited),
             () = interrupted => Err(Received::Local(Error::Interrupted)),
             by = terminated => Err(Received::Local(Error::Terminated(by))),
+            Ok(()) = &mut detached => Ok(Outcome::Detached(session)),
         };
         if let Some(watcher) = watcher {
             watcher.abort();
@@ -380,13 +488,115 @@ impl Connection {
         let _ = input.try_send(Input::Finish);
         let _ = timeout(Duration::from_secs(1), sender).await;
         match result {
-            Ok(exit) => Ok(exit),
+            Ok(outcome) => Ok(outcome),
+            Err(Received::Local(Error::TerminalEnded)) => Ok(Outcome::DetachedByServer(session)),
             Err(Received::Local(error)) => Err(error),
             Err(Received::Stream(StreamError::Reset(code))) => {
                 Err(Error::ChannelReset(code.into_inner()))
             }
+            // When the Server shuts down, its Sessions end too (§15.8).
+            Err(Received::Stream(StreamError::Lost(reason))) if shutting_down(&reason) => {
+                Err(quic::Error::Connection(reason).into())
+            }
+            Err(Received::Stream(StreamError::Lost(reason))) => Err(Error::SessionContinues {
+                error: Box::new(quic::Error::Connection(reason).into()),
+                session,
+            }),
             Err(Received::Stream(error)) => Err(self.failed(error).await),
         }
+    }
+
+    /// Sends the request `build` makes with a new request ID and returns its
+    /// REQUEST_RESULT (§8.4). Requests are sent one at a time.
+    pub async fn request(&mut self, build: impl FnOnce(u64) -> Message) -> Result<Message, Error> {
+        self.next_request += 1;
+        let id = self.next_request;
+        match self.exchange_request(id, build(id)).await {
+            Ok(result) => Ok(result),
+            Err(error) => Err(self.failed(error).await),
+        }
+    }
+
+    async fn exchange_request(
+        &mut self,
+        id: u64,
+        request: Message,
+    ) -> Result<Message, StreamError> {
+        let (send, recv) = self.control.as_mut().expect("authenticated");
+        wire::write_message(send, &request, self.peer_limit).await?;
+        let result = reply(
+            recv,
+            REQUEST_TIMEOUT,
+            "REQUEST_RESULT",
+            State::Authenticated,
+        )
+        .await?;
+        if result.field(0).and_then(Value::as_uint) != Some(id) {
+            return Err(Failure::violation("REQUEST_RESULT for an unknown request ID").into());
+        }
+        Ok(result)
+    }
+
+    /// The error code of a REQUEST_RESULT, `None` for success; a result without a
+    /// code closes the Connection.
+    pub async fn failed_result(&self, result: &Message) -> Result<Option<u64>, Error> {
+        match result.field(1).and_then(Value::as_uint) {
+            Some(0) => Ok(None),
+            Some(code) => Ok(Some(code)),
+            None => Err(self
+                .failed(Failure::violation("REQUEST_RESULT without error code").into())
+                .await),
+        }
+    }
+}
+
+fn shutting_down(reason: &quinn::ConnectionError) -> bool {
+    matches!(reason, quinn::ConnectionError::ApplicationClosed(close)
+        if close.error_code == wire::Code::ServerShutdown.varint())
+}
+
+/// How long the Client waits for a REQUEST_RESULT; a termination may take the
+/// Server's grace period and more.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The escape of the local terminal, as in ssh: after a line end, `~.` detaches and
+/// `~~` sends one `~`; `~` before anything else is sent with it.
+struct Escape {
+    line_start: bool,
+    after_tilde: bool,
+}
+
+impl Escape {
+    fn new() -> Self {
+        Self {
+            line_start: true,
+            after_tilde: false,
+        }
+    }
+
+    /// The input to send, and whether `~.` was typed (input after it is dropped).
+    fn filter(&mut self, data: &[u8]) -> (Vec<u8>, bool) {
+        let mut out = Vec::with_capacity(data.len() + 1);
+        for &byte in data {
+            if self.after_tilde {
+                self.after_tilde = false;
+                match byte {
+                    b'.' => return (out, true),
+                    b'~' => {
+                        out.push(b'~');
+                        continue;
+                    }
+                    _ => out.push(b'~'),
+                }
+            } else if self.line_start && byte == b'~' {
+                self.after_tilde = true;
+                self.line_start = false;
+                continue;
+            }
+            out.push(byte);
+            self.line_start = byte == b'\r' || byte == b'\n';
+        }
+        (out, false)
     }
 }
 
@@ -445,9 +655,31 @@ async fn send_input(
     mut inputs: mpsc::Receiver<Input>,
     pty: bool,
     limit: u64,
+    detach: tokio::sync::oneshot::Sender<()>,
 ) {
+    let mut escape = Escape::new();
     while let Some(input) = inputs.recv().await {
         let message = match input {
+            Input::Data(data) if pty => {
+                let (data, detaching) = escape.filter(&data);
+                if !data.is_empty() {
+                    let message = terminal::data(TERMINAL_DATA, &data);
+                    if wire::write_message(&mut send, &message, limit)
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                if detaching {
+                    // FIN: a detach (§14.10).
+                    let _ = send.finish();
+                    let _ = detach.send(());
+                    let _ = send.stopped().await;
+                    return;
+                }
+                continue;
+            }
             Input::Data(data) => terminal::data(TERMINAL_DATA, &data),
             Input::Eof if pty => continue,
             Input::Eof => terminal::eof(),
@@ -463,6 +695,9 @@ async fn send_input(
         }
     }
     let _ = send.finish();
+    // Closing the Connection drops stream data not yet sent: wait until the Server
+    // has the FIN, which confirms the exit status (§15.7).
+    let _ = send.stopped().await;
 }
 
 /// Why receiving output ended without an exit status.
@@ -560,6 +795,7 @@ async fn connect(
                     connection,
                     control: None,
                     peer_limit: DEFAULT_MESSAGE_LIMIT,
+                    next_request: 0,
                 });
             }
             Err(error) => error,
@@ -971,6 +1207,19 @@ mod tests {
             ),
             wire::Code::Timeout
         );
+    }
+
+    #[test]
+    fn escape_detaches_after_a_line_end() {
+        let mut escape = Escape::new();
+        assert_eq!(escape.filter(b"~."), (vec![], true));
+        let mut escape = Escape::new();
+        assert_eq!(escape.filter(b"ls ~.\r"), (b"ls ~.\r".to_vec(), false));
+        // `~~` sends one `~`; another character after `~` is sent with it.
+        assert_eq!(escape.filter(b"~~x\r~y"), (b"~x\r~y".to_vec(), false));
+        // The escape may arrive split over reads.
+        assert_eq!(escape.filter(b"\n~"), (b"\n".to_vec(), false));
+        assert_eq!(escape.filter(b".rest"), (vec![], true));
     }
 
     #[test]

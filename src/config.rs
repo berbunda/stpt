@@ -38,6 +38,8 @@ pub struct ServerConfig {
     pub authorized_keys: Option<PathBuf>,
     /// Output still sent after the primary process of a Session exited: 0–60 seconds,
     /// fractions allowed (PROTOCOL.md §14.10).
+    // Server mode is Unix only for now (gate G2).
+    #[cfg_attr(not(unix), allow(dead_code))]
     #[serde(default, deserialize_with = "exit_grace")]
     pub exit_grace: Option<Duration>,
 }

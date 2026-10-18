@@ -1,8 +1,12 @@
+#[cfg(unix)]
+mod attachment;
 mod auth;
 mod authorized;
+mod buffer;
 mod cbor;
 mod cli;
 mod client;
+mod commands;
 mod config;
 mod console;
 mod control;
@@ -10,12 +14,15 @@ mod destination;
 mod error;
 mod hello;
 mod identity;
+mod listing;
 mod logging;
 #[cfg(unix)]
 mod process;
 #[cfg(unix)]
 mod pty;
 mod quic;
+#[cfg(unix)]
+mod requests;
 mod server;
 #[cfg(unix)]
 mod session;

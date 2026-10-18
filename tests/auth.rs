@@ -57,7 +57,8 @@ mod server {
         let file = keys.join(&account);
         std::fs::write(&file, format!("{TEST_USER_KEY_LINE} test key\n")).unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert_eq!(stderr(&login()), "stpt: sessions: not implemented yet");
+        let out = login();
+        assert!(out.status.success(), "{}", stderr(&out));
 
         // A file others may change is ignored.
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o666)).unwrap();
@@ -89,6 +90,6 @@ mod server {
                 moved.to_str().unwrap(),
             ],
         );
-        assert_eq!(stderr(&out), "stpt: sessions: not implemented yet");
+        assert!(out.status.success(), "{}", stderr(&out));
     }
 }

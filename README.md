@@ -1,7 +1,7 @@
 # stpt
 Secure terminal access over QUIC: a single program acting as client and server, with Sessions that survive the loss of a connection.
 
-Status: early development. `connect` and `exec` work; Sessions do not outlive the connection yet, and `connect --attach`, `sessions`, `detach` and `terminate` end with `not implemented yet`.
+Status: early development. Terminals and Sessions work; automatic reattach after a lost connection is not there yet.
 
 ```
 stpt server [--listen ADDR:PORT] [--fingerprint]
@@ -27,10 +27,26 @@ Every command with `ACCOUNT@HOST` also accepts `--fingerprint SHA256:...` (see S
 - As with ssh, the arguments of `exec` form one command line for the shell of the Account: `stpt exec alice@host 'ls *.log'` expands `*` on the Server. `--no-shell` passes each argument unchanged.
 - Ctrl+C during `exec` interrupts the remote command; a command that ignores it keeps running, and pressing Ctrl+C three times ends `stpt` itself. In `connect` Ctrl+C goes to the remote shell, as in a local terminal.
 - Exit code 255: an STPT or connection error, the remote program was killed by a signal (`stpt` names it), or `stpt` was interrupted.
-- Sessions do not outlive the connection yet: closing the window or losing the connection ends the shell, as closing a terminal does. When the window is closed, `stpt` tells the Server at once; after a lost connection the Server notices within 60 s.
 - Stopping the Server (`systemctl stop`, TERM, or Ctrl+C in the foreground) ends all Sessions; the Clients report `closed by the peer: SERVER_SHUTDOWN`.
 - The Server starts the shell as the Account, so it must run as root (or as that Account). The environment is that of a login: `PATH` and the locale come from `/etc/environment` and `/etc/default/locale` (or `/etc/locale.conf`) on the Server. Of the Client's environment only `LANG` and `LC_*` reach the shell and replace the Server's locale; `STPT_SESSION` holds the Session ID.
 - If the Client's locale is not installed on the Server, programs fall back to ASCII and warn (`locale: Cannot set LC_CTYPE`), as with ssh: install it on the Server (`sudo locale-gen ru_RU.UTF-8` on Debian) or unset `LANG` on the Client.
+
+# Sessions
+A Session keeps running when its Client goes: after `Enter ~ .` (detach, as the escape of ssh), a closed window or a lost connection. Attach to it again from any computer with a key of the same Account.
+
+```
+stpt sessions alice@host                       # list the Sessions of the Account
+stpt connect alice@host --name work            # a new Session named work
+stpt connect alice@host --attach work          # attach to it again
+stpt detach alice@host work --all              # detach all Attachments (from another window)
+stpt terminate alice@host work                 # end it: HUP, KILL after 5 s (--force: at once)
+```
+- `SESSION` is the Session ID, its name, or a unique beginning of the ID as `stpt sessions` shows it.
+- Several Clients may be attached to one Session at once; all see the output, all may type. `--read-only` only watches; `--takeover` detaches the others first. The size of the window that typed last applies.
+- Attaching shows the last output of the Session first (up to 16 KiB), so a full-screen program redraws.
+- A Session whose program has exited stays until a Client has seen its exit status (at most 24 hours), so `stpt connect --attach` still shows how it ended.
+- In `connect`, `~.` is recognized only at the start of a line; type `~~` for a `~` there.
+- Stopping the Server ends all Sessions.
 
 # Private key, public key, fingerprint
 Three different texts appear around keys. Do not mix them up.
