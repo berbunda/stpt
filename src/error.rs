@@ -65,6 +65,11 @@ pub enum Error {
         /// The key as an authorized keys line: base64 of its SubjectPublicKeyInfo.
         key_line: String,
     },
+    /// The Server rejected or reset the terminal Channel with this error code.
+    ChannelRejected(u64),
+    ChannelReset(u64),
+    /// The Server ended the terminal Channel without an exit status.
+    TerminalEnded,
 }
 
 impl Error {
@@ -149,8 +154,20 @@ impl fmt::Display for Error {
                  keys of the Account (by default /etc/stpt/authorized_keys/{account}):\n  \
                  {key_line}"
             ),
+            Self::ChannelRejected(code) => {
+                write!(f, "terminal: rejected by the Server: {}", code_name(*code))
+            }
+            Self::ChannelReset(code) => {
+                write!(f, "terminal: reset by the Server: {}", code_name(*code))
+            }
+            Self::TerminalEnded => f.write_str("terminal: ended by the Server"),
         }
     }
+}
+
+/// Name of an error code received from the Server; its number if unknown.
+fn code_name(code: u64) -> String {
+    wire::Code::from_value(code).map_or_else(|| format!("error {code}"), |c| c.name().to_owned())
 }
 
 impl std::error::Error for Error {

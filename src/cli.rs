@@ -90,8 +90,9 @@ pub enum ClientCommand {
         #[arg(long, value_name = "SESSION")]
         attach: Option<String>,
 
-        /// Name of the new Session
-        #[arg(long, conflicts_with = "attach")]
+        /// Name of the new Session: 1–64 letters, digits, `.`, `_`, `-`, starting with a
+        /// letter or digit
+        #[arg(long, conflicts_with = "attach", value_parser = session_name)]
         name: Option<String>,
 
         /// Detach all other Attachments of the Session first
@@ -196,6 +197,14 @@ pub struct DetachTarget {
     /// Detach the Attachment with this ID
     #[arg(long, value_name = "ATTACHMENT")]
     pub id: Option<u64>,
+}
+
+fn session_name(name: &str) -> Result<String, &'static str> {
+    if crate::terminal::valid_name(name) {
+        Ok(name.to_owned())
+    } else {
+        Err("1–64 letters, digits, '.', '_' or '-', starting with a letter or digit")
+    }
 }
 
 pub fn run(cli: Cli) -> Result<ExitCode, Error> {

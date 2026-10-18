@@ -4,6 +4,7 @@ mod cbor;
 mod cli;
 mod client;
 mod config;
+mod console;
 mod control;
 mod destination;
 mod error;
@@ -16,6 +17,9 @@ mod process;
 mod pty;
 mod quic;
 mod server;
+#[cfg(unix)]
+mod session;
+mod terminal;
 mod tls;
 mod trust;
 mod wire;

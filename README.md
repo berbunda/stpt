@@ -1,7 +1,7 @@
 # stpt
 Secure terminal access over QUIC: a single program acting as client and server, with Sessions that survive the loss of a connection.
 
-Status: early development. The Client connects to the Server, verifies the Server key, agrees on the protocol version and logs in with the user key; terminals and Sessions are not there yet, so the Client commands end with `not implemented yet`.
+Status: early development. `connect` and `exec` work; Sessions do not outlive the connection yet, and `connect --attach`, `sessions`, `detach` and `terminate` end with `not implemented yet`.
 
 ```
 stpt server [--listen ADDR:PORT] [--fingerprint]
@@ -20,6 +20,14 @@ Every command with `ACCOUNT@HOST` also accepts `--fingerprint SHA256:...` (see S
 - `stpt server` runs the Server, every other command the Client. Server mode is available on Linux only for now; on Windows it comes with terminal support.
 - `stpt help COMMAND` shows the options of a command.
 - Messages go to standard error. `-v` shows more (`-vv`, `-vvv` even more), `-q` errors only. The Server logs to standard error, which systemd keeps in the journal.
+
+# Terminal
+`stpt connect alice@host` starts the login shell of the Account `alice` on the Server in a new Session, with a terminal. `stpt exec alice@host COMMAND...` runs a command without a terminal: its output and error output arrive separately, and `stpt` exits with the exit code of the command.
+
+- As with ssh, the arguments of `exec` form one command line for the shell of the Account: `stpt exec alice@host 'ls *.log'` expands `*` on the Server. `--no-shell` passes each argument unchanged.
+- Exit code 255: an STPT or connection error, or the remote program was killed by a signal (`stpt` names it).
+- Sessions do not outlive the connection yet: closing the window or losing the connection ends the shell, as closing a terminal does.
+- The Server starts the shell as the Account, so it must run as root (or as that Account). Of the Client's environment only `LANG` and `LC_*` reach the shell; `STPT_SESSION` holds the Session ID.
 
 # Private key, public key, fingerprint
 Three different texts appear around keys. Do not mix them up.

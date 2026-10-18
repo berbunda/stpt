@@ -648,7 +648,7 @@ dependencies = [
 
 [[package]]
 name = "stpt"
-version = "0.1.11-0"
+version = "0.1.12-0"
 dependencies = [
  "aws-lc-rs",
  "base64",
@@ -662,6 +662,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

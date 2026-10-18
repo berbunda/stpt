@@ -46,6 +46,8 @@ pub struct Deadlines {
     /// A failed attempt is answered no earlier than this after its AUTH_REQUEST, so
     /// the response time does not depend on the reason of the failure (§12.4).
     pub failure_delay: Duration,
+    /// Output still sent after the primary process of a Session exited (§14.10).
+    pub exit_grace: Duration,
 }
 
 impl Deadlines {
@@ -53,6 +55,7 @@ impl Deadlines {
         hello: Duration::from_secs(10),
         auth: Duration::from_secs(60),
         failure_delay: Duration::from_millis(300),
+        exit_grace: Duration::from_secs(1),
     };
 }
 
@@ -220,7 +223,12 @@ async fn serve_connection(
     );
     // §8.2, §14.5: Channels become available.
     connection.set_max_concurrent_bi_streams(VarInt::from_u32(1 + MAX_CHANNELS));
-    tokio::spawn(accept_channels(connection.clone()));
+    let context = ChannelContext {
+        account: accepted.account.clone(),
+        peer_limit,
+        exit_grace: deadlines.exit_grace,
+    };
+    tokio::spawn(accept_channels(connection.clone(), context));
 
     // §8.4: requests. Their operations come with Tier RD; until then each is
     // answered with INTERNAL_ERROR, and the Connection stays open.
@@ -312,30 +320,56 @@ async fn authenticate(
     }
 }
 
+/// What the Channels of an Authenticated Connection need to know.
+// Unused where Server mode is not available (gate G2).
+#[cfg_attr(not(unix), allow(dead_code))]
+#[derive(Clone)]
+struct ChannelContext {
+    account: String,
+    peer_limit: u64,
+    exit_grace: Duration,
+}
+
 /// Streams the Client opens on an Authenticated Connection: each must start with
-/// CHANNEL_OPEN (§8.3). No channel kind is implemented yet (terminal: Tier RC), so
-/// every Channel is rejected with CHANNEL_REJECTED; the Connection stays open.
-async fn accept_channels(connection: Connection) {
+/// CHANNEL_OPEN (§8.3). Terminal Channels are served; another kind is rejected with
+/// CHANNEL_REJECTED, and the Connection stays open.
+async fn accept_channels(connection: Connection, context: ChannelContext) {
     while let Ok((send, recv)) = connection.accept_bi().await {
-        tokio::spawn(open_channel(connection.clone(), send, recv));
+        tokio::spawn(open_channel(
+            connection.clone(),
+            send,
+            recv,
+            context.clone(),
+        ));
     }
 }
 
+#[cfg_attr(not(unix), allow(unused_variables))]
 async fn open_channel(
     connection: Connection,
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
+    context: ChannelContext,
 ) {
     let remote = connection.remote_address();
     let failure = match wire::read_message(&mut recv, DEFAULT_MESSAGE_LIMIT).await {
         Ok(Some(message)) => match control::channel_kind(&message) {
-            Ok(kind) => {
-                let why = if kind == control::TERMINAL {
-                    "terminal Channels are not implemented yet"
-                } else {
-                    "unknown channel kind"
+            #[cfg(unix)]
+            Ok(control::TERMINAL) => {
+                let channel = crate::session::Channel {
+                    send,
+                    recv,
+                    peer_limit: context.peer_limit,
+                    account: context.account,
+                    remote,
                 };
-                tracing::info!(%remote, kind, reason = why, "Channel rejected");
+                match crate::session::serve(channel, &message, context.exit_grace).await {
+                    Ok(()) => return,
+                    Err(failure) => failure,
+                }
+            }
+            Ok(kind) => {
+                tracing::info!(%remote, kind, "Channel of unknown kind rejected");
                 let code = Code::ChannelRejected.varint();
                 let _ = send.reset(code);
                 let _ = recv.stop(code);
@@ -416,6 +450,7 @@ mod tests {
         hello: Duration::from_millis(300),
         auth: Duration::from_millis(300),
         failure_delay: Duration::from_millis(50),
+        exit_grace: Duration::from_millis(300),
     };
 
     const FAST_FAILURES: Deadlines = Deadlines {
@@ -423,24 +458,30 @@ mod tests {
         ..Deadlines::DEFAULT
     };
 
-    struct Alice;
+    /// The only Account of a test Server.
+    struct Only(String);
 
-    impl Accounts for Alice {
+    impl Accounts for Only {
         fn exists(&self, name: &str) -> bool {
-            name == "alice"
+            name == self.0
         }
     }
 
     /// A Client Connection to a Server that serves exactly this Connection; the
-    /// Server authorizes `user` for the Account `alice`.
+    /// Server authorizes `user` for one Account, `alice` unless started with `start_as`.
     struct Peer {
         _endpoint: Endpoint,
         connection: Connection,
         user: UserKey,
+        account: String,
     }
 
     impl Peer {
         async fn start(deadlines: Deadlines) -> Self {
+            Self::start_as(deadlines, "alice").await
+        }
+
+        async fn start_as(deadlines: Deadlines, account: &str) -> Self {
             let key = ServerKey::generate();
             let server = quic::listen("127.0.0.1:0".parse().unwrap(), &key).unwrap();
             let addr = server.local_addr().unwrap();
@@ -452,12 +493,12 @@ mod tests {
             ));
             crate::authorized::test_support::keys_file(
                 &dir,
-                "alice",
+                account,
                 &format!("{} test\n", user.public_key().to_base64()),
             );
             let shared = Arc::new(Shared {
                 deadlines,
-                authorizer: Authorizer::new(dir, Box::new(Alice)),
+                authorizer: Authorizer::new(dir, Box::new(Only(account.to_owned()))),
             });
             tokio::spawn(async move {
                 let incoming = server.accept().await.unwrap();
@@ -475,6 +516,7 @@ mod tests {
                 _endpoint: endpoint,
                 connection,
                 user,
+                account: account.to_owned(),
             }
         }
 
@@ -491,10 +533,10 @@ mod tests {
             (send, recv)
         }
 
-        /// HELLO and successful authentication as `alice`.
+        /// HELLO and successful authentication for the Account of the Server.
         async fn authenticated(&self) -> (quinn::SendStream, quinn::RecvStream) {
             let (mut send, mut recv) = self.hello().await;
-            send.write_all(&self.request(&self.user, "alice"))
+            send.write_all(&self.request(&self.user, &self.account))
                 .await
                 .unwrap();
             assert!(auth_result(&mut recv).await);
@@ -531,13 +573,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authentication_then_channels_rejected() {
+    async fn authentication_then_unknown_channels_rejected() {
         let peer = Peer::start(Deadlines::default()).await;
         let (mut send, mut recv) = peer.authenticated().await;
 
-        // §8.2: the Client may open Channels now; no kind is implemented yet, so each
-        // is rejected with CHANNEL_REJECTED (§8.3), and the Connection stays.
-        for kind in [control::TERMINAL, 77] {
+        // §8.2: the Client may open Channels now; an unknown kind is rejected with
+        // CHANNEL_REJECTED (§8.3), and the Connection stays.
+        for kind in [77, 0] {
             let (mut channel, mut channel_recv) = peer.connection.open_bi().await.unwrap();
             channel
                 .write_all(&frame(&channel_open(kind).encode()))
@@ -792,5 +834,272 @@ mod tests {
     #[test]
     fn available_on_unix_only() {
         assert_eq!(AVAILABLE, cfg!(unix));
+    }
+
+    /// Terminal Channels (§14) against a Server that serves the Account of the test.
+    #[cfg(unix)]
+    mod terminal_channel {
+        use super::*;
+        use crate::terminal::{self, Attached, Command, Exit, Open, SessionId, Size};
+
+        const SIZE: Size = Size {
+            columns: 80,
+            rows: 24,
+            width: 0,
+            height: 0,
+        };
+
+        const FAST_EXIT: Deadlines = Deadlines {
+            exit_grace: Duration::from_millis(300),
+            ..Deadlines::DEFAULT
+        };
+
+        fn me() -> String {
+            let uid = nix::unistd::geteuid();
+            nix::unistd::User::from_uid(uid).unwrap().unwrap().name
+        }
+
+        /// An Authenticated Connection; the control stream stays open.
+        struct Authenticated {
+            peer: Peer,
+            _control: (quinn::SendStream, quinn::RecvStream),
+        }
+
+        async fn authenticated() -> Authenticated {
+            let peer = Peer::start_as(FAST_EXIT, &me()).await;
+            let control = peer.authenticated().await;
+            Authenticated {
+                peer,
+                _control: control,
+            }
+        }
+
+        impl Authenticated {
+            async fn open(&self, open: &Open) -> (quinn::SendStream, quinn::RecvStream) {
+                let (mut send, recv) = self.peer.connection.open_bi().await.unwrap();
+                write(&mut send, &open.to_message()).await;
+                (send, recv)
+            }
+        }
+
+        async fn write(send: &mut quinn::SendStream, message: &Message) {
+            send.write_all(&frame(&message.encode())).await.unwrap();
+        }
+
+        fn command(line: &str, pty: bool) -> Open {
+            Open {
+                term: pty.then(|| "xterm".to_owned()),
+                size: pty.then_some(SIZE),
+                command: Some(Command::Line(line.to_owned())),
+                ..Open::default()
+            }
+        }
+
+        async fn attached(recv: &mut quinn::RecvStream) -> Attached {
+            let message = wire::read_message(recv, DEFAULT_MESSAGE_LIMIT)
+                .await
+                .unwrap()
+                .unwrap();
+            Attached::from_message(&message).unwrap()
+        }
+
+        /// The code the Server reset the Channel with.
+        async fn reset(recv: &mut quinn::RecvStream) -> Code {
+            match wire::read_message(recv, DEFAULT_MESSAGE_LIMIT).await {
+                Err(StreamError::Reset(code)) => Code::from_value(code.into_inner()).unwrap(),
+                other => panic!("{other:?}"),
+            }
+        }
+
+        /// Output and error output until TERMINAL_EXIT, which the Server's FIN follows.
+        async fn output(recv: &mut quinn::RecvStream) -> (String, String, Exit) {
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            loop {
+                let message = wire::read_message(recv, DEFAULT_MESSAGE_LIMIT)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                match message.kind {
+                    wire::TERMINAL_DATA => out.extend(terminal::data_of(&message).unwrap()),
+                    wire::TERMINAL_STDERR => err.extend(terminal::data_of(&message).unwrap()),
+                    wire::TERMINAL_EXIT => {
+                        let exit = Exit::from_message(&message).unwrap();
+                        let end = wire::read_message(recv, DEFAULT_MESSAGE_LIMIT).await;
+                        assert!(end.unwrap().is_none(), "FIN after TERMINAL_EXIT");
+                        let text = |b| String::from_utf8(b).unwrap();
+                        return (text(out), text(err), exit);
+                    }
+                    kind => panic!("message type {kind}"),
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn command_on_pty() {
+            let a = authenticated().await;
+            let (_send, mut recv) = a.open(&command("echo hi; exit 3", true)).await;
+            let attached = attached(&mut recv).await;
+            assert_eq!((attached.attachment, attached.offset), (1, 0));
+            assert_eq!(
+                output(&mut recv).await,
+                ("hi\r\n".into(), "".into(), Exit::Code(3))
+            );
+        }
+
+        #[tokio::test]
+        async fn input_on_pty_is_echoed() {
+            let a = authenticated().await;
+            let (mut send, mut recv) = a.open(&command("read x; echo got $x", true)).await;
+            attached(&mut recv).await;
+            write(&mut send, &terminal::data(wire::TERMINAL_DATA, b"abc\n")).await;
+            let (out, _, exit) = output(&mut recv).await;
+            assert_eq!(out, "abc\r\ngot abc\r\n");
+            assert_eq!(exit, Exit::Code(0));
+        }
+
+        #[tokio::test]
+        async fn command_with_pipes() {
+            let a = authenticated().await;
+            let (mut send, mut recv) = a.open(&command("cat; echo err >&2; exit 5", false)).await;
+            attached(&mut recv).await;
+            write(&mut send, &terminal::data(wire::TERMINAL_DATA, b"abc")).await;
+            write(&mut send, &terminal::eof()).await;
+            assert_eq!(
+                output(&mut recv).await,
+                ("abc".into(), "err\n".into(), Exit::Code(5))
+            );
+        }
+
+        #[tokio::test]
+        async fn session_id_in_environment_and_signal_exit() {
+            let a = authenticated().await;
+            let (_send, mut recv) = a
+                .open(&command(
+                    "printf %s \"$STPT_SESSION\"; kill -KILL $$",
+                    false,
+                ))
+                .await;
+            let attached = attached(&mut recv).await;
+            let (out, _, exit) = output(&mut recv).await;
+            assert_eq!(out, attached.session.to_string());
+            let killed = Exit::Signal {
+                id: 5,
+                core_dumped: false,
+            };
+            assert_eq!(exit, killed);
+        }
+
+        #[tokio::test]
+        async fn rejected_channels_keep_the_connection() {
+            let a = authenticated().await;
+            let attach = Open {
+                session: Some(SessionId([1; 16])),
+                ..Open::default()
+            };
+            let (_s, mut recv) = a.open(&attach).await;
+            assert_eq!(reset(&mut recv).await, Code::SessionNotFound);
+
+            let mut bad_term = command("true", true);
+            bad_term.term = Some("x;y".into());
+            let (_s, mut recv) = a.open(&bad_term).await;
+            assert_eq!(reset(&mut recv).await, Code::ChannelRejected);
+
+            let mut many = command("true", false);
+            many.env = (0..65).map(|i| (format!("V{i}"), String::new())).collect();
+            let (_s, mut recv) = a.open(&many).await;
+            assert_eq!(reset(&mut recv).await, Code::LimitExceeded);
+
+            let (_s, mut recv) = a.open(&command("exit 1", false)).await;
+            attached(&mut recv).await;
+            assert_eq!(output(&mut recv).await.2, Exit::Code(1));
+        }
+
+        #[tokio::test]
+        async fn client_violations_close_the_connection() {
+            let violation = Some(Code::ProtocolViolation);
+            let after = async |pty: bool, messages: Vec<Message>| {
+                let a = authenticated().await;
+                let (mut send, mut recv) = a.open(&command("sleep 5", pty)).await;
+                attached(&mut recv).await;
+                for message in messages {
+                    write(&mut send, &message).await;
+                }
+                a.peer.closed_with().await
+            };
+            let data = terminal::data(wire::TERMINAL_DATA, b"x");
+            let empty = Message::new(wire::TERMINAL_DATA, vec![(0, Value::Bytes(vec![]))]);
+            let cases = [
+                (true, vec![terminal::eof()]),
+                (true, vec![empty]),
+                (true, vec![Exit::Code(0).to_message()]),
+                (
+                    true,
+                    vec![Message::new(
+                        wire::TERMINAL_SIGNAL,
+                        vec![(0, Value::Uint(8))],
+                    )],
+                ),
+                (
+                    true,
+                    vec![Message::new(
+                        wire::TERMINAL_RESIZE,
+                        vec![(1, Value::Uint(80))],
+                    )],
+                ),
+                (false, vec![SIZE.resize_message()]),
+                (false, vec![terminal::eof(), data]),
+                (false, vec![terminal::eof(), terminal::eof()]),
+                (false, vec![channel_open(control::TERMINAL)]),
+            ];
+            for (pty, messages) in cases {
+                assert_eq!(
+                    after(pty, messages.clone()).await,
+                    violation,
+                    "{messages:?}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn detach_ends_the_session_with_hangup() {
+            let marker = std::env::temp_dir().join(format!("stpt-hup-{}", std::process::id()));
+            let _ = std::fs::remove_file(&marker);
+            let line = format!(
+                "trap 'echo hup > {}; exit' HUP; echo ready; while :; do sleep 0.1; done",
+                marker.display()
+            );
+            let a = authenticated().await;
+            let (mut send, mut recv) = a.open(&command(&line, true)).await;
+            attached(&mut recv).await;
+            let mut out = Vec::new();
+            while !String::from_utf8_lossy(&out).contains("ready") {
+                let message = wire::read_message(&mut recv, DEFAULT_MESSAGE_LIMIT)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                out.extend(terminal::data_of(&message).unwrap());
+            }
+            send.finish().unwrap();
+            // The Server ends its direction without TERMINAL_EXIT (§14.10).
+            let end = wire::read_message(&mut recv, DEFAULT_MESSAGE_LIMIT).await;
+            assert!(end.unwrap().is_none());
+            let start = Instant::now();
+            while !marker.exists() {
+                assert!(start.elapsed() < Duration::from_secs(5), "no SIGHUP");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            std::fs::remove_file(&marker).unwrap();
+        }
+
+        #[tokio::test]
+        async fn background_process_does_not_hold_the_exit() {
+            let a = authenticated().await;
+            let (_send, mut recv) = a.open(&command("sleep 30 & echo bg; exit 7", true)).await;
+            attached(&mut recv).await;
+            let start = Instant::now();
+            let (out, _, exit) = output(&mut recv).await;
+            assert!(start.elapsed() < Duration::from_secs(3));
+            assert_eq!((out.as_str(), exit), ("bg\r\n", Exit::Code(7)));
+        }
     }
 }

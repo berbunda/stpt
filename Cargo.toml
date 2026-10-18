@@ -1,6 +1,6 @@
 [package]
 name = "stpt"
-version = "0.1.11-0"
+version = "0.1.12-0"
 edition = "2024"
 rust-version = "1.99"
 
@@ -12,7 +12,7 @@ quinn = { version = "0.11.9", default-features = false, features = ["runtime-tok
 rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "std"] }
 serde = { version = "1", features = ["derive"] }
 socket2 = "0.6"
-tokio = { version = "1.53", features = ["net", "process", "rt-multi-thread", "time"] }
+tokio = { version = "1.53", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 toml = { version = "1.1", default-features = false, features = ["std", "parse", "serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
@@ -20,5 +20,5 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.3", default-features = false, features = ["fs", "ioctl", "process", "term", "user"] }
 
-[dev-dependencies]
-tokio = { version = "1.53", features = ["macros"] }
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }

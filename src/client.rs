@@ -6,11 +6,13 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
 
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use crate::auth::{self, UserKey};
 use crate::cli::{ClientCommand, Common, Remote, TrustAction};
 use crate::config::{self, ClientConfig};
+use crate::console::{self, Console};
 use crate::control::{self, Sender, State};
 use crate::destination::Address;
 use crate::error::Error;
@@ -18,9 +20,13 @@ use crate::hello::{AUTH_PUBLICKEY_ED25519, ClientHello, ServerHello};
 use crate::identity::Fingerprint;
 use crate::logging::{self, Role};
 use crate::quic;
+use crate::terminal::{self, Attached, Command, Exit, Open, Size};
 use crate::tls::{Expected, ServerKeyCheck, Verdict};
 use crate::trust::{self, TrustStore};
-use crate::wire::{self, DEFAULT_MESSAGE_LIMIT, Failure, StreamError};
+use crate::wire::{
+    self, DEFAULT_MESSAGE_LIMIT, Failure, StreamError, TERMINAL_DATA, TERMINAL_EXIT,
+    TERMINAL_STDERR,
+};
 
 /// SERVER_HELLO received after CLIENT_HELLO was sent (§13.3).
 pub const SERVER_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
@@ -40,13 +46,23 @@ pub fn run(command: ClientCommand, common: &Common) -> Result<ExitCode, Error> {
     );
     config::log_source(path.as_deref());
 
-    let (name, remote) = match command {
+    // The terminal Channel to open; `None` for commands that come with Tier RD.
+    let (name, remote, open) = match command {
         ClientCommand::Trust { action } => return trust_command(action),
-        ClientCommand::Connect { remote, .. } => ("connect", remote),
-        ClientCommand::Exec { remote, .. } => ("exec", remote),
-        ClientCommand::Sessions { remote } => ("sessions", remote),
-        ClientCommand::Detach { remote, .. } => ("detach", remote),
-        ClientCommand::Terminate { remote, .. } => ("terminate", remote),
+        ClientCommand::Connect {
+            remote,
+            attach: Some(_),
+            ..
+        } => ("connect --attach", remote, None),
+        ClientCommand::Connect { remote, name, .. } => ("connect", remote, Some(interactive(name))),
+        ClientCommand::Exec {
+            remote,
+            no_shell,
+            command,
+        } => ("exec", remote, Some(exec(command, no_shell))),
+        ClientCommand::Sessions { remote } => ("sessions", remote, None),
+        ClientCommand::Detach { remote, .. } => ("detach", remote, None),
+        ClientCommand::Terminate { remote, .. } => ("terminate", remote, None),
     };
     let mut store = trust_store()?;
     let key_path = match &remote.identity {
@@ -67,8 +83,8 @@ pub fn run(command: ClientCommand, common: &Common) -> Result<ExitCode, Error> {
     );
     let account = &remote.destination.account;
     let accepted = runtime.block_on(connection.authenticate(account, &key, AUTH_RESULT_TIMEOUT))?;
-    runtime.block_on(connection.close());
     if !accepted {
+        runtime.block_on(connection.close());
         return Err(Error::AuthRejected {
             account: account.clone(),
             fingerprint: key.public_key().fingerprint(),
@@ -76,8 +92,82 @@ pub fn run(command: ClientCommand, common: &Common) -> Result<ExitCode, Error> {
         });
     }
     tracing::info!(%account, key = %key.public_key().fingerprint(), "Connection authenticated");
-    // Sessions and terminals come with Tiers RC and RD.
-    Err(Error::NotImplemented(name))
+    let Some(open) = open else {
+        runtime.block_on(connection.close());
+        return Err(Error::NotImplemented(name));
+    };
+    let exit = runtime.block_on(connection.terminal(open))?;
+    runtime.block_on(connection.close());
+    Ok(exit_code(exit))
+}
+
+/// Window size when standard output is not a terminal.
+const DEFAULT_SIZE: Size = Size {
+    columns: 80,
+    rows: 24,
+    width: 0,
+    height: 0,
+};
+
+/// Terminal type when TERM is not set or not valid (e.g. on Windows).
+const DEFAULT_TERM: &str = "xterm-256color";
+
+/// `connect`: a new Session with a PTY running the login shell.
+fn interactive(name: Option<String>) -> Open {
+    let term = std::env::var("TERM")
+        .ok()
+        .filter(|t| terminal::valid_term(t))
+        .unwrap_or_else(|| DEFAULT_TERM.to_owned());
+    Open {
+        term: Some(term),
+        size: Some(console::size().unwrap_or(DEFAULT_SIZE)),
+        env: locale(),
+        name,
+        ..Open::default()
+    }
+}
+
+/// `exec`: a new Session without a PTY running the command; as ssh, the arguments
+/// form one command line unless `no_shell`.
+fn exec(command: Vec<String>, no_shell: bool) -> Open {
+    let command = if no_shell {
+        Command::Argv(command)
+    } else {
+        Command::Line(command.join(" "))
+    };
+    Open {
+        command: Some(command),
+        env: locale(),
+        ..Open::default()
+    }
+}
+
+/// The locale variables the Client passes on: `LANG` and `LC_*`, never the whole
+/// environment (§14.6).
+fn locale() -> Vec<(String, String)> {
+    std::env::vars_os()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+        .filter(|(name, value)| {
+            (name == "LANG" || name.starts_with("LC_")) && name.len() <= 4096 && value.len() <= 4096
+        })
+        .take(64)
+        .collect()
+}
+
+/// Exit code of the Client for the remote exit status: the exit code (255 if it does
+/// not fit), or 255 after a signal, as ssh.
+fn exit_code(exit: Exit) -> ExitCode {
+    match exit {
+        Exit::Code(code) => ExitCode::from(u8::try_from(code).unwrap_or(u8::MAX)),
+        Exit::Signal { id, core_dumped } => {
+            eprintln!(
+                "stpt: the remote program was killed by signal {}{}",
+                terminal::signal_name(id).unwrap_or("(unknown)"),
+                if core_dumped { " (core dumped)" } else { "" }
+            );
+            ExitCode::from(u8::MAX)
+        }
+    }
 }
 
 fn load_user_key(path: &Path) -> Result<UserKey, Error> {
@@ -219,6 +309,135 @@ impl Connection {
         wire::write_message(send, &request.to_message(), self.peer_limit).await?;
         let message = reply(recv, deadline, "AUTH_RESULT", State::Established).await?;
         Ok(auth::result_from_message(&message)?)
+    }
+}
+
+impl Connection {
+    /// Opens a terminal Channel (§14.3) and relays local input and remote output until
+    /// the remote program exits; returns its exit status. With a PTY the local terminal
+    /// is in raw mode meanwhile.
+    async fn terminal(&mut self, open: Open) -> Result<Exit, Error> {
+        let pty = open.size.is_some();
+        let (mut send, mut recv) = self
+            .connection
+            .open_bi()
+            .await
+            .map_err(quic::Error::Connection)?;
+        if let Err(error) =
+            wire::write_message(&mut send, &open.to_message(), self.peer_limit).await
+        {
+            return Err(self.failed(error).await);
+        }
+        let attached = match wire::read_message(&mut recv, DEFAULT_MESSAGE_LIMIT).await {
+            Ok(Some(message)) => Attached::from_message(&message).map_err(StreamError::from),
+            Ok(None) => {
+                Err(Failure::violation("terminal Channel ended before TERMINAL_ATTACHED").into())
+            }
+            Err(StreamError::Reset(code)) => return Err(Error::ChannelRejected(code.into_inner())),
+            Err(error) => Err(error),
+        };
+        let attached = match attached {
+            Ok(attached) => attached,
+            Err(error) => return Err(self.failed(error).await),
+        };
+        tracing::info!(session = %attached.session, attachment = attached.attachment, "attached");
+
+        let local = Console::setup(pty).map_err(Error::Terminal)?;
+        let (input, inputs) = mpsc::channel(16);
+        let from_stdin = input.clone();
+        console::read_input(move |data| {
+            let input = data.map_or(Input::Eof, Input::Data);
+            from_stdin.blocking_send(input).is_ok()
+        });
+        let sender = tokio::spawn(send_input(send, inputs, pty, self.peer_limit));
+        let result = receive_output(&mut recv, pty).await;
+        drop(local);
+        // The Client's FIN after the exit status (§14.10); not worth waiting long for.
+        let _ = input.try_send(Input::Finish);
+        let _ = timeout(Duration::from_secs(1), sender).await;
+        match result {
+            Ok(exit) => Ok(exit),
+            Err(Received::Local(error)) => Err(error),
+            Err(Received::Stream(StreamError::Reset(code))) => {
+                Err(Error::ChannelReset(code.into_inner()))
+            }
+            Err(Received::Stream(error)) => Err(self.failed(error).await),
+        }
+    }
+}
+
+/// Local input for the terminal Channel.
+enum Input {
+    Data(Vec<u8>),
+    /// End of standard input.
+    Eof,
+    /// The Channel is over: end the Client's direction.
+    Finish,
+}
+
+/// Sends local input as TERMINAL_DATA; at the end of standard input TERMINAL_EOF
+/// without a PTY, nothing with one (Ctrl-D is in-band, §14.7).
+async fn send_input(
+    mut send: quinn::SendStream,
+    mut inputs: mpsc::Receiver<Input>,
+    pty: bool,
+    limit: u64,
+) {
+    while let Some(input) = inputs.recv().await {
+        let message = match input {
+            Input::Data(data) => terminal::data(TERMINAL_DATA, &data),
+            Input::Eof if pty => continue,
+            Input::Eof => terminal::eof(),
+            Input::Finish => break,
+        };
+        if wire::write_message(&mut send, &message, limit)
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+    let _ = send.finish();
+}
+
+/// Why receiving output ended without an exit status.
+enum Received {
+    Local(Error),
+    Stream(StreamError),
+}
+
+impl From<StreamError> for Received {
+    fn from(error: StreamError) -> Self {
+        Self::Stream(error)
+    }
+}
+
+impl From<Failure> for Received {
+    fn from(failure: Failure) -> Self {
+        Self::Stream(failure.into())
+    }
+}
+
+/// Writes remote output until TERMINAL_EXIT (§14.7, §14.10).
+async fn receive_output(recv: &mut quinn::RecvStream, pty: bool) -> Result<Exit, Received> {
+    let local = |e| Received::Local(Error::Terminal(e));
+    loop {
+        let Some(message) = wire::read_message(recv, DEFAULT_MESSAGE_LIMIT).await? else {
+            return Err(Received::Local(Error::TerminalEnded));
+        };
+        match message.kind {
+            TERMINAL_DATA => console::write_out(terminal::data_of(&message)?).map_err(local)?,
+            TERMINAL_STDERR if !pty => {
+                console::write_err(terminal::data_of(&message)?).map_err(local)?;
+            }
+            TERMINAL_EXIT => return Ok(Exit::from_message(&message)?),
+            kind => {
+                return Err(Failure::violation(format!(
+                    "message type {kind} on a terminal Channel from the Server"
+                ))
+                .into());
+            }
+        }
     }
 }
 

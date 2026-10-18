@@ -1,13 +1,11 @@
 //! Processes of a Session (Unix; PROTOCOL.md §14.6).
 //!
 //! The Server starts the login shell or the command of a Session as the Account: in a
-//! new session (`setsid`) with the PTY slave as controlling terminal and as standard
-//! input, output and error; groups, group and user of the Account; working directory
+//! new session (`setsid`), with a PTY slave as controlling terminal and as standard
+//! input, output and error, or with three pipes; groups, group and user of the
+//! Account; working directory
 //! its home (`/` if that fails); an environment built from scratch, so nothing of the
 //! Server's own environment reaches the Account.
-
-// Used by the Server from RC003 on.
-#![allow(dead_code)]
 
 use std::ffi::{CString, OsStr};
 use std::io;
@@ -72,17 +70,25 @@ pub enum Program {
     Argv(Vec<String>),
 }
 
+/// Standard input, output and error of the processes.
+pub enum Io {
+    /// The slave of a PTY with its terminal type; it becomes the controlling terminal.
+    Pty { slave: OwnedFd, term: String },
+    /// Three pipes, available on the Child.
+    Pipes,
+}
+
 nix::ioctl_write_int_bad!(set_controlling_terminal, nix::libc::TIOCSCTTY);
 
-/// Starts `program` as `account` on a PTY with terminal type `term`. `env` holds the
-/// variables taken from the Client, already checked against the allowlist.
-/// The Server must run as root, or as the Account itself.
-pub fn spawn_on_pty(
+/// Starts `program` as `account` in a new session, which is also its own process
+/// group (§14.9). `env` holds further variables: those taken from the Client, already
+/// checked against the allowlist, and `STPT_SESSION`. The Server must run as root, or
+/// as the Account itself.
+pub fn spawn(
     account: &Account,
     program: &Program,
-    term: &str,
     env: &[(String, String)],
-    slave: OwnedFd,
+    io: Io,
 ) -> io::Result<Child> {
     let switch_user = nix::unistd::geteuid().is_root();
     if !switch_user && account.uid != nix::unistd::geteuid() {
@@ -107,11 +113,19 @@ pub fn spawn_on_pty(
                 PATH_USER
             },
         )
-        .envs(env.iter().map(|(name, value)| (name, value)))
-        .env("TERM", term)
-        .stdin(Stdio::from(slave.try_clone()?))
-        .stdout(Stdio::from(slave.try_clone()?))
-        .stderr(Stdio::from(slave));
+        .envs(env.iter().map(|(name, value)| (name, value)));
+    let pty = matches!(io, Io::Pty { .. });
+    match io {
+        Io::Pty { slave, term } => command
+            .env("TERM", term)
+            .stdin(Stdio::from(slave.try_clone()?))
+            .stdout(Stdio::from(slave.try_clone()?))
+            .stderr(Stdio::from(slave)),
+        Io::Pipes => command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    };
 
     let uid = account.uid;
     let gid = account.gid;
@@ -123,8 +137,10 @@ pub fn spawn_on_pty(
     unsafe {
         command.pre_exec(move || {
             nix::unistd::setsid()?;
-            // Standard input is the slave already; it becomes the controlling terminal.
-            set_controlling_terminal(0, 0)?;
+            if pty {
+                // Standard input is the slave already; it becomes the controlling terminal.
+                set_controlling_terminal(0, 0)?;
+            }
             if switch_user {
                 nix::unistd::setgroups(&groups)?;
                 nix::unistd::setgid(gid)?;
@@ -210,7 +226,8 @@ mod tests {
         env: &[(String, String)],
     ) -> (String, std::process::ExitStatus) {
         let Pty { master, slave } = Pty::open(SIZE).unwrap();
-        let mut child = spawn_on_pty(account, &program, "xterm-256color", env, slave).unwrap();
+        let term = "xterm-256color".to_owned();
+        let mut child = spawn(account, &program, env, Io::Pty { slave, term }).unwrap();
         let out = output(&master).await;
         (out, child.wait().await.unwrap())
     }
@@ -274,6 +291,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pipes_without_terminal_in_own_process_group() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let line = "exec 3</dev/tty || echo no-ctty; \
+                    [ \"$(ps -o pgid= -p $$ | tr -d ' ')\" = $$ ] && echo own-group; \
+                    env | grep -c ^TERM=; read x; echo got $x >&2; exit 4"
+            .to_owned();
+        let mut child = spawn(&me(), &Program::Shell(line), &[], Io::Pipes).unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(b"hi\n").await.unwrap();
+        drop(stdin);
+        let (mut out, mut err) = (String::new(), String::new());
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut out)
+            .await
+            .unwrap();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut err)
+            .await
+            .unwrap();
+        assert_eq!(out, "no-ctty\nown-group\n0\n");
+        assert!(err.ends_with("got hi\n"), "{err}");
+        assert_eq!(child.wait().await.unwrap().code(), Some(4));
+    }
+
+    #[tokio::test]
     async fn signal_ends_process() {
         let line = "kill -TERM $$".to_owned();
         let (_, status) = run(&me(), Program::Shell(line), &[]).await;
@@ -284,7 +332,8 @@ mod tests {
     async fn login_shell_reads_input() {
         let me = me();
         let Pty { master, slave } = Pty::open(SIZE).unwrap();
-        let mut child = spawn_on_pty(&me, &Program::LoginShell, "dumb", &[], slave).unwrap();
+        let term = "dumb".to_owned();
+        let mut child = spawn(&me, &Program::LoginShell, &[], Io::Pty { slave, term }).unwrap();
         master.write_all(b"echo \"<$0>\"; exit 7\n").await.unwrap();
         let out = output(&master).await;
         let name = login_name(&me.shell);

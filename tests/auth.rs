@@ -32,16 +32,16 @@ mod server {
         let account = account();
         let dest = format!("{account}@127.0.0.1:{}", server.port);
         let home = dir("auth-home");
-        let connect = || stpt_in(&home, &["connect", &dest, "--fingerprint", &fingerprint]);
+        let login = || stpt_in(&home, &["sessions", &dest, "--fingerprint", &fingerprint]);
 
         // No user key: the Client says how to create one, before it connects.
-        let err = stderr(&connect());
+        let err = stderr(&login());
         assert!(err.starts_with("stpt: no user key at "), "{err}");
         assert!(err.contains("openssl genpkey -algorithm ed25519"), "{err}");
 
         // A key the Server does not know: refused, with the line to add.
         let key = user_key(&home);
-        let err = stderr(&connect());
+        let err = stderr(&login());
         assert!(
             err.starts_with("stpt: the Server did not accept the key SHA256:"),
             "{err}"
@@ -57,11 +57,11 @@ mod server {
         let file = keys.join(&account);
         std::fs::write(&file, format!("{TEST_USER_KEY_LINE} test key\n")).unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert_eq!(stderr(&connect()), "stpt: connect: not implemented yet");
+        assert_eq!(stderr(&login()), "stpt: sessions: not implemented yet");
 
         // A file others may change is ignored.
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o666)).unwrap();
-        assert!(stderr(&connect()).starts_with("stpt: the Server did not accept the key"));
+        assert!(stderr(&login()).starts_with("stpt: the Server did not accept the key"));
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
 
         // Another Account with the same key: refused like an unknown key.
@@ -71,7 +71,7 @@ mod server {
 
         // A user key readable by others is refused before connecting.
         std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let err = stderr(&connect());
+        let err = stderr(&login());
         assert!(err.contains("permissions 644 are too open"), "{err}");
 
         // --identity selects another key file.
@@ -81,7 +81,7 @@ mod server {
         let out = stpt_in(
             &home,
             &[
-                "connect",
+                "sessions",
                 &dest,
                 "--fingerprint",
                 &fingerprint,
@@ -89,6 +89,6 @@ mod server {
                 moved.to_str().unwrap(),
             ],
         );
-        assert_eq!(stderr(&out), "stpt: connect: not implemented yet");
+        assert_eq!(stderr(&out), "stpt: sessions: not implemented yet");
     }
 }

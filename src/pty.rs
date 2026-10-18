@@ -5,9 +5,6 @@
 //! processing (`IUTF8`) where the platform has it. Both descriptors are close-on-exec,
 //! so no other process inherits them by accident.
 
-// Used by the Server from RC003 on.
-#![allow(dead_code)]
-
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 
@@ -15,23 +12,14 @@ use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
 use nix::pty::{Winsize, openpty};
 use tokio::io::unix::AsyncFd;
 
-/// Window size of a terminal: columns and rows, pixel sizes 0 when unknown.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Size {
-    pub columns: u16,
-    pub rows: u16,
-    pub width: u16,
-    pub height: u16,
-}
+pub use crate::terminal::Size;
 
-impl Size {
-    fn winsize(self) -> Winsize {
-        Winsize {
-            ws_row: self.rows,
-            ws_col: self.columns,
-            ws_xpixel: self.width,
-            ws_ypixel: self.height,
-        }
+fn winsize(size: Size) -> Winsize {
+    Winsize {
+        ws_row: size.rows,
+        ws_col: size.columns,
+        ws_xpixel: size.width,
+        ws_ypixel: size.height,
     }
 }
 
@@ -44,7 +32,7 @@ pub struct Pty {
 impl Pty {
     /// Opens a PTY with the given window size. Needs a Tokio runtime.
     pub fn open(size: Size) -> io::Result<Pty> {
-        let pair = openpty(&size.winsize(), None)?;
+        let pair = openpty(&winsize(size), None)?;
         set_cloexec(&pair.master)?;
         set_cloexec(&pair.slave)?;
         set_utf8_input(&pair.slave)?;
@@ -96,9 +84,10 @@ impl Master {
     }
 
     /// Sets the window size; the kernel sends SIGWINCH to the foreground process group.
+    #[allow(dead_code, reason = "applied from RC004 on")]
     pub fn resize(&self, size: Size) -> io::Result<()> {
         // SAFETY: the descriptor is open and the pointer refers to a valid winsize.
-        unsafe { set_winsize(self.0.as_raw_fd(), &size.winsize()) }?;
+        unsafe { set_winsize(self.0.as_raw_fd(), &winsize(size)) }?;
         Ok(())
     }
 }
@@ -136,13 +125,12 @@ mod tests {
     };
 
     fn size_of(fd: &OwnedFd) -> Size {
-        let mut w = Size {
+        let mut w = winsize(Size {
             columns: 0,
             rows: 0,
             width: 0,
             height: 0,
-        }
-        .winsize();
+        });
         unsafe { get_winsize(fd.as_raw_fd(), &mut w) }.unwrap();
         Size {
             columns: w.ws_col,
