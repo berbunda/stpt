@@ -496,10 +496,11 @@ impl Connection {
             }
         };
         let result = tokio::select! {
+            biased;
+            Ok(()) = &mut detached => Ok(Outcome::Detached(session)),
             result = receive_output(&mut recv, pty, &mut modes) => result.map(Outcome::Exited),
             result = interrupted => result,
             by = terminated => Err(Received::Local(Error::Terminated(by))),
-            Ok(()) = &mut detached => Ok(Outcome::Detached(session)),
         };
         if let Some(watcher) = watcher {
             watcher.abort();
@@ -520,6 +521,10 @@ impl Connection {
         let _ = timeout(Duration::from_secs(1), sender).await;
         match result {
             Ok(outcome) => Ok(outcome),
+            // The Server's FIN answers our own detach, or it ended the Attachment.
+            Err(Received::Local(Error::TerminalEnded)) if detached.try_recv().is_ok() => {
+                Ok(Outcome::Detached(session))
+            }
             Err(Received::Local(Error::TerminalEnded)) => Ok(Outcome::DetachedByServer(session)),
             Err(Received::Local(error)) => Err(error),
             Err(Received::Stream(StreamError::Reset(code))) => {

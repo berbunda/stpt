@@ -26,6 +26,9 @@ const FOLLOWED: [u16; 14] = [
 
 const CURSOR_VISIBLE: u16 = 25;
 
+/// The modes that switch to or from an alternate screen.
+const ALTERNATE_SCREEN: [u16; 3] = [47, 1047, 1049];
+
 /// Longest parameter list followed; longer sequences are ignored.
 const MAX_PARAMETERS: usize = 32;
 
@@ -64,9 +67,11 @@ impl Modes {
     }
 
     /// Follows the mode switches in a piece of output; sequences may be split over
-    /// pieces.
-    pub fn feed(&mut self, data: &[u8]) {
-        for &byte in data {
+    /// pieces. Returns the index after the last switch of the alternate screen in
+    /// it: the output before belongs to another screen.
+    pub fn feed(&mut self, data: &[u8]) -> Option<usize> {
+        let mut screen = None;
+        for (index, &byte) in data.iter().enumerate() {
             self.parser = match (self.parser, byte) {
                 (_, 0x1b) => Parser::Escape,
                 (Parser::Ground, _) => Parser::Ground,
@@ -93,18 +98,23 @@ impl Modes {
                     Parser::PrivateCsi
                 }
                 (Parser::PrivateCsi, b'h' | b'l') => {
-                    self.switch(byte == b'h');
+                    if self.switch(byte == b'h') {
+                        screen = Some(index + 1);
+                    }
                     Parser::Ground
                 }
                 (Parser::PrivateCsi, _) => Parser::Ground,
             };
         }
+        screen
     }
 
-    fn switch(&mut self, set: bool) {
+    /// Applies `CSI ? Pm h` or `l`; true if it switched the alternate screen.
+    fn switch(&mut self, set: bool) -> bool {
         if self.parameters.len() >= MAX_PARAMETERS {
-            return;
+            return false;
         }
+        let mut screen = false;
         for mode in self
             .parameters
             .split(';')
@@ -113,6 +123,7 @@ impl Modes {
             if !FOLLOWED.contains(&mode) {
                 continue;
             }
+            screen |= ALTERNATE_SCREEN.contains(&mode);
             // Cursor visibility is on by default: hiding it is the change.
             let changed = if mode == CURSOR_VISIBLE { !set } else { set };
             if changed {
@@ -121,6 +132,7 @@ impl Modes {
                 self.changed.remove(&mode);
             }
         }
+        screen
     }
 
     /// The sequence that sets the followed modes as they are now, in a terminal in
@@ -156,7 +168,7 @@ impl Modes {
     /// Whether an alternate screen is active.
     #[cfg(test)]
     pub fn alternate_screen(&self) -> bool {
-        [47, 1047, 1049].iter().any(|m| self.changed.contains(m))
+        ALTERNATE_SCREEN.iter().any(|m| self.changed.contains(m))
     }
 }
 
@@ -172,8 +184,9 @@ mod tests {
     fn follows_switches_split_over_pieces() {
         let mut modes = Modes::new();
         // Like htop at its start: alternate screen, keypad, hidden cursor, mouse.
-        modes.feed(b"\x1b[?1049h\x1b[22;0;0t\x1b[1;24r\x1b(B\x1b[m\x1b[4l\x1b[?7h\x1b=\x1b[?");
-        modes.feed(b"25l\x1b[?1000;1006h");
+        let start = b"\x1b[?1049h\x1b[22;0;0t\x1b[1;24r\x1b(B\x1b[m\x1b[4l\x1b[?7h\x1b=\x1b[?";
+        assert_eq!(modes.feed(start), Some(8));
+        assert_eq!(modes.feed(b"25l\x1b[?1000;1006h"), None);
         assert!(modes.alternate_screen());
         assert_eq!(
             text(modes.restore()),
@@ -184,7 +197,8 @@ mod tests {
             "\x1b[?1049l\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b>"
         );
         // Leaving restores the defaults.
-        modes.feed(b"\x1b[?1000;1006l\x1b[?25h\x1b[?1049l\x1b>");
+        let end = b"\x1b[?1000;1006l\x1b[?25h\x1b[?1049l\x1b>";
+        assert_eq!(modes.feed(end), Some(end.len() - 2));
         assert!(modes.restore().is_empty());
         assert!(modes.reset().is_empty());
         assert!(!modes.alternate_screen());

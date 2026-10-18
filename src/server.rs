@@ -1498,6 +1498,24 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn fresh_replay_shows_only_the_current_screen() {
+            let a = authenticated().await;
+            let line = format!(
+                "echo before; printf '\\033[?1049hinside\\n\\033[?1049l'; echo after; {LOOP}"
+            );
+            let (mut send, mut recv) = a.open(&command(&line, true)).await;
+            let created = attached(&mut recv).await;
+            read_until(&mut recv, "ready").await;
+            detach(&mut send, &mut recv).await;
+
+            let (_send, mut recv) = a.attach(attach_to(created.session)).await;
+            let again = attached(&mut recv).await;
+            assert!(again.modes.is_empty());
+            let replay = String::from_utf8(read_until(&mut recv, "ready").await).unwrap();
+            assert!(replay.starts_with("after\r\n"), "{replay:?}");
+        }
+
+        #[tokio::test]
         async fn resume_continues_without_gap() {
             let a = authenticated().await;
             let line = "echo line1; sleep 0.3; echo line2; echo line3; read x";

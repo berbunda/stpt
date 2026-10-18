@@ -30,6 +30,9 @@ pub struct OutputBuffer {
     len: usize,
     /// Offset of the byte after the last output byte.
     end: u64,
+    /// Offset where the current screen began: after the last switch of the
+    /// alternate screen.
+    screen: u64,
 }
 
 impl OutputBuffer {
@@ -39,11 +42,11 @@ impl OutputBuffer {
             pieces: VecDeque::new(),
             len: 0,
             end: 0,
+            screen: 0,
         }
     }
 
     /// Offset after the last output byte: the number of output bytes so far.
-    #[cfg(test)]
     pub fn end(&self) -> u64 {
         self.end
     }
@@ -51,6 +54,12 @@ impl OutputBuffer {
     /// Offset of the oldest byte kept.
     fn start(&self) -> u64 {
         self.end - self.len as u64
+    }
+
+    /// The current screen begins at `offset`: a fresh replay starts no earlier, as
+    /// the output before belongs to another screen (§15.11).
+    pub fn screen_starts(&mut self, offset: u64) {
+        self.screen = offset;
     }
 
     /// Numbers a piece of output and keeps the most recent `capacity` bytes.
@@ -81,12 +90,16 @@ impl OutputBuffer {
             Replay::Resume(offset) => offset.max(self.start()),
             Replay::Fresh(limit) => {
                 let tail = self.end.saturating_sub(limit as u64).max(self.start());
-                // Start after the first line feed, so not inside an escape sequence;
-                // the output from its very start has no such risk.
-                match self.first_line_feed(tail) {
-                    _ if tail == 0 => 0,
-                    Some(offset) => offset + 1,
-                    None => self.end,
+                // Start at the beginning of the current screen if it is in the tail
+                // (offset 0 is the start of all output); else after the first line
+                // feed, so not inside an escape sequence.
+                if self.screen >= tail {
+                    self.screen
+                } else {
+                    match self.first_line_feed(tail) {
+                        Some(offset) => offset + 1,
+                        None => self.end,
+                    }
                 }
             }
         };
@@ -200,5 +213,26 @@ mod tests {
         );
         let no_line = buffer(4, &[(OUT, "abcdef")]);
         assert_eq!(text(no_line.replay(Replay::Fresh(100))), (6, vec![]));
+    }
+
+    #[test]
+    fn fresh_replay_starts_with_the_current_screen() {
+        let mut b = buffer(100, &[(OUT, "shell\nhtop screen\n")]);
+        b.screen_starts(6);
+        b.push(OUT, "prompt$ ".as_bytes().into());
+        assert_eq!(
+            text(b.replay(Replay::Fresh(100))),
+            (
+                6,
+                vec![(OUT, "htop screen\n".into()), (OUT, "prompt$ ".into())]
+            )
+        );
+        // A screen that began before the tail: the line feed rule applies.
+        assert_eq!(
+            text(b.replay(Replay::Fresh(10))),
+            (18, vec![(OUT, "prompt$ ".into())])
+        );
+        // A resume ignores it.
+        assert_eq!(text(b.replay(Replay::Resume(2))).0, 2);
     }
 }

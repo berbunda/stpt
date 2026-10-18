@@ -836,7 +836,10 @@ impl Session {
         let targets = {
             let mut inner = self.lock();
             if self.pty() {
-                inner.modes.feed(&piece.1);
+                let start = inner.buffer.end();
+                if let Some(index) = inner.modes.feed(&piece.1) {
+                    inner.buffer.screen_starts(start + index as u64);
+                }
             }
             inner.buffer.push(piece.0, piece.1.clone());
             targets(&inner)
