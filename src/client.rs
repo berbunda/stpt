@@ -350,7 +350,16 @@ impl Connection {
             from_stdin.blocking_send(input).is_ok()
         });
         let sender = tokio::spawn(send_input(send, inputs, pty, self.peer_limit));
+        let watcher = match open.size {
+            Some(size) if console::size().is_some() => {
+                Some(tokio::spawn(watch_size(input.clone(), size)))
+            }
+            _ => None,
+        };
         let result = receive_output(&mut recv, pty).await;
+        if let Some(watcher) = watcher {
+            watcher.abort();
+        }
         drop(local);
         // The Client's FIN after the exit status (§14.10); not worth waiting long for.
         let _ = input.try_send(Input::Finish);
@@ -371,12 +380,33 @@ enum Input {
     Data(Vec<u8>),
     /// End of standard input.
     Eof,
+    /// New size of the local window (with a PTY only).
+    Resize(Size),
     /// The Channel is over: end the Client's direction.
     Finish,
 }
 
-/// Sends local input as TERMINAL_DATA; at the end of standard input TERMINAL_EOF
-/// without a PTY, nothing with one (Ctrl-D is in-band, §14.7).
+/// Sends the size of the local window whenever it changes (§14.8); a burst of
+/// changes that arrives together gives one TERMINAL_RESIZE with the latest size.
+async fn watch_size(input: mpsc::Sender<Input>, mut last: Size) {
+    let Ok(mut changes) = console::SizeChanges::new() else {
+        return;
+    };
+    while changes.next().await {
+        if let Some(size) = console::size()
+            && size != last
+        {
+            last = size;
+            if input.send(Input::Resize(size)).await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+/// Sends local input as TERMINAL_DATA and size changes as TERMINAL_RESIZE; at the
+/// end of standard input TERMINAL_EOF without a PTY, nothing with one (Ctrl-D is
+/// in-band, §14.7).
 async fn send_input(
     mut send: quinn::SendStream,
     mut inputs: mpsc::Receiver<Input>,
@@ -388,6 +418,7 @@ async fn send_input(
             Input::Data(data) => terminal::data(TERMINAL_DATA, &data),
             Input::Eof if pty => continue,
             Input::Eof => terminal::eof(),
+            Input::Resize(size) => size.resize_message(),
             Input::Finish => break,
         };
         if wire::write_message(&mut send, &message, limit)

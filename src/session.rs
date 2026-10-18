@@ -320,7 +320,13 @@ async fn pty_input(master: &Master, recv: &mut RecvStream) -> Result<(), Stop> {
             TERMINAL_EOF => {
                 return Err(Failure::violation("TERMINAL_EOF on a Channel with a PTY").into());
             }
-            // Applied with RC004 (resize) and RC005 (signals).
+            // §14.8: between the input sent before and after it.
+            TERMINAL_RESIZE => {
+                if let Err(e) = master.resize(terminal::Size::from_resize(&message)?) {
+                    tracing::debug!(error = %e, "PTY resize failed");
+                }
+            }
+            // Applied with RC005.
             _ => tracing::debug!(kind = message.kind, "not applied yet"),
         }
     }

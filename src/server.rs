@@ -958,6 +958,29 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn resize_applies_between_inputs() {
+            let a = authenticated().await;
+            let (mut send, mut recv) = a.open(&command("stty size; read x; stty size", true)).await;
+            attached(&mut recv).await;
+            let message = wire::read_message(&mut recv, DEFAULT_MESSAGE_LIMIT)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(terminal::data_of(&message).unwrap(), b"24 80\r\n");
+            let size = Size {
+                columns: 132,
+                rows: 43,
+                width: 0,
+                height: 0,
+            };
+            write(&mut send, &size.resize_message()).await;
+            write(&mut send, &terminal::data(wire::TERMINAL_DATA, b"\n")).await;
+            let (out, _, exit) = output(&mut recv).await;
+            assert_eq!(out, "\r\n43 132\r\n");
+            assert_eq!(exit, Exit::Code(0));
+        }
+
+        #[tokio::test]
         async fn command_with_pipes() {
             let a = authenticated().await;
             let (mut send, mut recv) = a.open(&command("cat; echo err >&2; exit 5", false)).await;

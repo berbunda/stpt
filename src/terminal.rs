@@ -72,7 +72,6 @@ impl Size {
     }
 
     /// TERMINAL_RESIZE with this size (§14.8).
-    #[allow(dead_code, reason = "sent by the Client from RC004 on")]
     pub fn resize_message(self) -> Message {
         Message::new(TERMINAL_RESIZE, self.fields())
     }

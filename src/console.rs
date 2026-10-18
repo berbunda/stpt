@@ -28,6 +28,21 @@ pub fn size() -> Option<Size> {
     sys::size().filter(|s| s.columns > 0 && s.rows > 0)
 }
 
+/// Notices that the window size may have changed: SIGWINCH on Unix. A Windows
+/// console read with ReadConsoleW reports no size changes, so there it is a poll.
+pub struct SizeChanges(sys::SizeChanges);
+
+impl SizeChanges {
+    pub fn new() -> io::Result<Self> {
+        sys::SizeChanges::new().map(Self)
+    }
+
+    /// Waits for the next notice; false when there will be none.
+    pub async fn next(&mut self) -> bool {
+        self.0.next().await
+    }
+}
+
 /// Writes remote output to standard output, unbuffered.
 pub fn write_out(data: &[u8]) -> io::Result<()> {
     sys::write(sys::Stream::Out, data)
@@ -109,6 +124,19 @@ mod sys {
             width: w.ws_xpixel,
             height: w.ws_ypixel,
         })
+    }
+
+    pub struct SizeChanges(tokio::signal::unix::Signal);
+
+    impl SizeChanges {
+        pub fn new() -> io::Result<Self> {
+            use tokio::signal::unix::{SignalKind, signal};
+            signal(SignalKind::window_change()).map(Self)
+        }
+
+        pub async fn next(&mut self) -> bool {
+            self.0.recv().await.is_some()
+        }
     }
 
     pub enum Stream {
@@ -242,6 +270,24 @@ mod sys {
             width: 0,
             height: 0,
         })
+    }
+
+    /// Polling interval of the window size.
+    const SIZE_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+    pub struct SizeChanges(tokio::time::Interval);
+
+    impl SizeChanges {
+        pub fn new() -> io::Result<Self> {
+            let mut interval = tokio::time::interval(SIZE_POLL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            Ok(Self(interval))
+        }
+
+        pub async fn next(&mut self) -> bool {
+            self.0.tick().await;
+            true
+        }
     }
 
     pub enum Stream {

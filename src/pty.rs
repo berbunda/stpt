@@ -84,7 +84,6 @@ impl Master {
     }
 
     /// Sets the window size; the kernel sends SIGWINCH to the foreground process group.
-    #[allow(dead_code, reason = "applied from RC004 on")]
     pub fn resize(&self, size: Size) -> io::Result<()> {
         // SAFETY: the descriptor is open and the pointer refers to a valid winsize.
         unsafe { set_winsize(self.0.as_raw_fd(), &winsize(size)) }?;
