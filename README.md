@@ -24,6 +24,9 @@ Every command with `ACCOUNT@HOST` also accepts `--fingerprint SHA256:...` (see S
 # Private key, public key, fingerprint
 Three different texts appear around keys. Do not mix them up.
 
+<details>
+<summary>What each one looks like and where it is</summary>
+
 **Private key** — a file of three lines. Secret: it never leaves its machine; never copy, send or paste it anywhere (also not into `--fingerprint`). Files: `/etc/stpt/server_key` on the Server, `id_ed25519` on the Client.
 ```
 -----BEGIN PRIVATE KEY-----
@@ -40,11 +43,15 @@ MCowBQYDK2VwAyEAk9YxouLpNL+A/ZjwtDwMeKhGGVbPOnq2vhNQXSwd7Q4=
 ```
 SHA256:mskzIR8pKPbyewk8I+WgXjvBQaQbFA9RwVO8MvQ0apc
 ```
+</details>
 
 # Server key
 The Server proves its identity with a key, as an ssh host key. It creates the key at its first start, in the file `/etc/stpt/server_key` (setting `identity_key`), readable by its owner only; the Server refuses a key file that others can read.
 
 `stpt server --fingerprint` prints the fingerprint of the key (and creates the key if there is none), for example `SHA256:Ab2wRB0yBlg7vMlVGGyOb2TjVLdVNyYGUNUmY/dw6hQ`. Give it to the users of the Server by a channel you trust.
+
+<details>
+<summary>How the Client checks the Server key</summary>
 
 The Client remembers the key of every Server it trusts, in `known_servers` next to its configuration file:
 - First connection: the Client shows the fingerprint and asks; type `yes` only if it equals, in full, the fingerprint you got from the administrator. Or pass that fingerprint with `--fingerprint`: then the Client checks it and does not ask. Without a terminal and without `--fingerprint` the Client refuses to connect.
@@ -52,6 +59,7 @@ The Client remembers the key of every Server it trusts, in `known_servers` next 
 - Changed key: the Client refuses to connect and shows both fingerprints. Someone may be intercepting the connection, or the Server got a new key. Only after the administrator confirms the new key, remove the old one with `stpt trust remove HOST[:PORT]` and connect again.
 
 `stpt trust list` shows the remembered Servers and their fingerprints.
+</details>
 
 # User key
 You log in with a key, as with ssh keys; there are no passwords. Create the key once on the Client with OpenSSL (create the `stpt` directory first if it does not exist yet):
@@ -63,6 +71,9 @@ You log in with a key, as with ssh keys; there are no passwords. Create the key 
 
 `-i PATH` uses another key file. On Linux the key file must be readable by you only.
 
+<details>
+<summary>Allowing a key to log in to an Account</summary>
+
 The administrator of the Server decides which keys may log in to which Account (an operating system account on the Server). Show your public key with `openssl pkey -in ~/.config/stpt/id_ed25519 -pubout` and give its second line (it starts with `MCowBQYDK2VwAyEA`) to the administrator; the Client also prints that line when the Server refuses the key.
 
 On the Server, the keys of the Account `alice` are in `/etc/stpt/authorized_keys/alice`, one per line, optionally followed by a label:
@@ -70,6 +81,7 @@ On the Server, the keys of the Account `alice` are in `/etc/stpt/authorized_keys
 MCowBQYDK2VwAyEAk9YxouLpNL+A/ZjwtDwMeKhGGVbPOnq2vhNQXSwd7Q4= alice-laptop
 ```
 Only root may change these files: the directory and the files must belong to root and must not be writable by group or others (`chmod 755` for the directory, `644` for the files), otherwise the Server ignores them. A refused login tells the Client nothing about the reason; the Server log has it.
+</details>
 
 # Configuration
 TOML files, optional; `--config PATH` uses another file.
@@ -82,13 +94,17 @@ TOML files, optional; `--config PATH` uses another file.
 
 Command line options override the file. Unknown keys and invalid values are errors.
 
-Server settings:
+<details>
+<summary>Server settings</summary>
+
 ```toml
 listen = "[::]:843"   # address and UDP port; IPv6 addresses in brackets; [::] also accepts IPv4
 log_level = "info"    # error, warn, info, debug or trace; -v and -q override it
 identity_key = "/etc/stpt/server_key"   # Server key file, created if missing
 authorized_keys = "/etc/stpt/authorized_keys"   # directory of authorized user keys, one file per Account
 ```
+</details>
+
 The Client has no settings yet.
 
 # Build
