@@ -14,7 +14,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use nix::sys::signal::{Signal, kill};
+use nix::sys::signal::{SigHandler, Signal, kill};
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{ForkResult, Gid, Pid, Uid, User};
 use tokio::process::{Child, Command};
@@ -136,8 +136,18 @@ pub fn spawn(
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "home directory contains NUL"))?;
     // SAFETY: the closure runs in the child between fork and exec. It only makes
     // system calls and does not allocate: everything it needs is prepared here.
+    // `signal` installs no handler, it only restores default dispositions.
     unsafe {
         command.pre_exec(move || {
+            // Signals the Server ignores stay ignored across exec (a Server started in
+            // the background by a shell ignores INT and QUIT), and a shell cannot even
+            // trap them then. The Account's programs start with the default
+            // dispositions, as after a login.
+            for signal in Signal::iterator() {
+                if !matches!(signal, Signal::SIGKILL | Signal::SIGSTOP) {
+                    nix::sys::signal::signal(signal, SigHandler::SigDfl)?;
+                }
+            }
             nix::unistd::setsid()?;
             if pty {
                 // Standard input is the slave already; it becomes the controlling terminal.
@@ -384,6 +394,22 @@ mod tests {
         assert_eq!(child.wait().await.unwrap().code(), Some(3));
         let gone = signal_group(&me, group_of_exited(), Signal::SIGUSR1).await;
         assert_eq!(gone.unwrap_err().raw_os_error(), Some(nix::libc::ESRCH));
+    }
+
+    #[tokio::test]
+    async fn signals_ignored_by_the_server_are_default_for_the_account() {
+        let me = me();
+        // As for a Server started in the background by a shell.
+        // SAFETY: ignoring a signal installs no handler.
+        unsafe { nix::sys::signal::signal(Signal::SIGQUIT, SigHandler::SigIgn) }.unwrap();
+        let mut child = running(&me, "trap 'exit 3' QUIT").await;
+        unsafe { nix::sys::signal::signal(Signal::SIGQUIT, SigHandler::SigDfl) }.unwrap();
+        signal_group(&me, group_of(&child), Signal::SIGQUIT)
+            .await
+            .unwrap();
+        let waiting = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait());
+        let status = waiting.await.expect("QUIT still ignored");
+        assert_eq!(status.unwrap().code(), Some(3));
     }
 
     /// A process group that no longer exists.
