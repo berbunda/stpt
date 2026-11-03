@@ -20,10 +20,12 @@ use crate::logging;
 /// Default path of the Server configuration.
 pub const SERVER_PATH: &str = "/etc/stpt/server.toml";
 
-/// Client configuration. It has no settings yet; the first one comes with RD009.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ClientConfig {}
+pub struct ClientConfig {
+    /// Seconds a new Session may stay without an Attachment (PROTOCOL.md §15.8).
+    pub detach_timeout: Option<u64>,
+}
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -162,8 +164,23 @@ mod tests {
         assert!(parse::<ServerConfig>(r#"listen = "host""#).is_err());
         assert!(parse::<ServerConfig>("listen = 843").is_err());
         assert!(parse::<ServerConfig>(r#"lisen = "[::]:843""#).is_err());
-        assert!(parse::<ClientConfig>("detach_timeout = 60").is_err());
+        assert!(parse::<ClientConfig>("detach_timout = 60").is_err());
         assert!(parse::<ClientConfig>("").is_ok());
+    }
+
+    #[test]
+    fn detach_timeout() {
+        let timeout = |text: &str| parse::<ClientConfig>(text).map(|c| c.detach_timeout).ok();
+        assert_eq!(timeout(""), Some(None));
+        assert_eq!(timeout("detach_timeout = 3600"), Some(Some(3600)));
+        assert_eq!(timeout("detach_timeout = 0"), Some(Some(0)));
+        for bad in [
+            "detach_timeout = -1",
+            "detach_timeout = 1.5",
+            "detach_timeout = \"1h\"",
+        ] {
+            assert!(timeout(bad).is_none(), "{bad}");
+        }
     }
 
     #[test]

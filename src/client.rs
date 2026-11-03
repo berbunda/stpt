@@ -41,7 +41,7 @@ pub const AUTH_RESULT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const USER_KEY_FILE: &str = "id_ed25519";
 
 pub fn run(command: ClientCommand, common: &Common) -> Result<ExitCode, Error> {
-    let (_config, path) =
+    let (config, path) =
         config::load::<ClientConfig>(common.config.as_deref(), config::client_path())?;
     logging::init(
         Role::Client,
@@ -66,13 +66,23 @@ pub fn run(command: ClientCommand, common: &Common) -> Result<ExitCode, Error> {
             },
         ),
         ClientCommand::Connect { remote, name, .. } => {
-            (remote, Action::Terminal(interactive(name), true))
+            let open = Open {
+                detach_timeout: config.detach_timeout,
+                ..interactive(name)
+            };
+            (remote, Action::Terminal(open, true))
         }
         ClientCommand::Exec {
             remote,
             no_shell,
             command,
-        } => (remote, Action::Terminal(exec(command, no_shell), false)),
+        } => {
+            let open = Open {
+                detach_timeout: config.detach_timeout,
+                ..exec(command, no_shell)
+            };
+            (remote, Action::Terminal(open, false))
+        }
         ClientCommand::Sessions { remote } => (remote, Action::List),
         ClientCommand::Detach {
             remote,

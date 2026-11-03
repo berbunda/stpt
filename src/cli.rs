@@ -78,10 +78,19 @@ pub enum Command {
     Client(ClientCommand),
 }
 
+/// Help text of the commands that create a Session (DECISIONS.md: the user is expected
+/// to know that Sessions outlive the window).
+const DETACH_NOTE: &str = "Closing the window or losing the connection only detaches: the \
+    Session keeps running on the Server, and detached Sessions accumulate. List them with \
+    `stpt sessions`, attach with `stpt connect --attach`, end them with `stpt terminate`. \
+    The setting `detach_timeout` of the Client configuration ends a new Session after that \
+    many seconds without an Attachment.";
+
 /// Subcommands of the Client role.
 #[derive(Debug, Subcommand)]
 pub enum ClientCommand {
     /// Open an interactive terminal in a new or an existing Session
+    #[command(after_help = DETACH_NOTE)]
     Connect {
         #[command(flatten)]
         remote: Remote,
@@ -105,6 +114,7 @@ pub enum ClientCommand {
     },
 
     /// Run a command in a new Session
+    #[command(after_help = DETACH_NOTE)]
     Exec {
         #[command(flatten)]
         remote: Remote,
@@ -234,6 +244,20 @@ mod tests {
     #[test]
     fn definition_is_consistent() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn help_says_that_closing_the_window_detaches() {
+        for name in ["connect", "exec"] {
+            let mut cli = Cli::command();
+            let command = cli.find_subcommand_mut(name).unwrap();
+            for help in [command.render_help(), command.render_long_help()] {
+                let help = help.to_string();
+                let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
+                assert!(help.contains("Closing the window"), "{name}: {help}");
+                assert!(help.contains("detach_timeout"), "{name}: {help}");
+            }
+        }
     }
 
     #[test]

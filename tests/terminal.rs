@@ -218,6 +218,46 @@ mod server {
     }
 
     #[test]
+    fn client_configuration_sets_the_detach_timeout() {
+        let s = Setup::new("terminal-detach-timeout");
+        let config = s.home.join("stpt").join("config.toml");
+
+        // It applies to new Sessions only: an attach must not send it (§14.6).
+        std::fs::write(&config, "detach_timeout = 3600\n").unwrap();
+        let args = s.args("connect", &["--name", "work"]);
+        let (text, code) = in_terminal(&s, &args, b"~.");
+        assert_eq!(code, Some(0), "{text}");
+        let args = s.args("connect", &["--attach", "work"]);
+        let (text, code) = in_terminal(&s, &args, b"exit 3\n");
+        assert_eq!(code, Some(3), "{text}");
+
+        // 0: the Session ends as soon as it has no Attachment.
+        std::fs::write(&config, "detach_timeout = 0\n").unwrap();
+        let (child, _lines) = exec_until_ready(&s, "true");
+        let pid = child.id().to_string();
+        assert!(
+            Command::new("kill")
+                .args(["-HUP", &pid])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let _ = child.wait_with_output();
+        let start = std::time::Instant::now();
+        loop {
+            let table = stdout(&stpt_in(&s.home, &s.args("sessions", &[])));
+            if table.lines().count() == 1 {
+                break;
+            }
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(5),
+                "Session stays: {table}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    #[test]
     fn sessions_outlive_the_client() {
         let s = Setup::new("terminal-sessions");
 

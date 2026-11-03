@@ -1644,6 +1644,28 @@ mod tests {
             gone(&a, created.session).await;
         }
 
+        /// A timeout too large for a clock must not break the Session or the reaper.
+        #[tokio::test]
+        async fn huge_detach_timeout_is_harmless() {
+            use crate::listing;
+            let mut a = authenticated().await;
+            let open = Open {
+                detach_timeout: Some(u64::MAX),
+                ..command(LOOP, true)
+            };
+            let (mut send, mut recv) = a.open(&open).await;
+            let created = attached(&mut recv).await;
+            read_until(&mut recv, "ready").await;
+            detach(&mut send, &mut recv).await;
+            // More than a tick of the reaper.
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            let result = ask(&mut a, &listing::list_request(1, None, None)).await;
+            let (sessions, _) = listing::list_of(&result).unwrap();
+            assert!(sessions.iter().any(|s| s.id == created.session));
+            let (_send, mut recv) = a.attach(attach_to(created.session)).await;
+            attached(&mut recv).await;
+        }
+
         #[tokio::test]
         async fn names_and_limits() {
             let a = authenticated_with(Policy {

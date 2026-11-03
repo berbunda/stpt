@@ -34,6 +34,8 @@ Every command with `ACCOUNT@HOST` also accepts `--fingerprint SHA256:...` (see S
 # Sessions
 A Session keeps running when its Client goes: after `Enter ~ .` (detach, as the escape of ssh), a closed window or a lost connection. Attach to it again from any computer with a key of the same Account.
 
+**Closing the window does not end the Session, it only detaches.** Its programs keep running and detached Sessions accumulate on the Server until you end them with `exit` or `stpt terminate`, or set `detach_timeout` (see Configuration).
+
 ```
 stpt sessions alice@host                       # list the Sessions of the Account
 stpt connect alice@host --name work            # a new Session named work
@@ -133,7 +135,16 @@ exit_grace = 1   # seconds output is still sent after the program of a Session e
 ```
 </details>
 
-The Client has no settings yet.
+<details>
+<summary>Client settings</summary>
+
+```toml
+detach_timeout = 3600   # seconds a new Session may stay without an Attachment, then it is terminated
+```
+- Without this setting a detached Session stays until it is terminated or the Server stops.
+- The time starts when the last Attachment ends, including after a lost connection, and restarts with every detach. With `0` the Session ends as soon as it has no Attachment.
+- It is fixed when the Session is created (`connect` without `--attach`, `exec`): changing the file does not affect existing Sessions. The Server may apply a shorter time.
+</details>
 
 # Build
 Requires Rust 1.99 or newer, installed with rustup (distribution packages are usually older), and a C compiler: `build-essential` on Debian, the Visual Studio Build Tools (C++) on Windows. The cryptographic library (AWS-LC) is compiled from C.

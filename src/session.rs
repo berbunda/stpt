@@ -70,6 +70,10 @@ const EVENT_QUEUE: usize = 8;
 /// How often Retention Policy is applied.
 const REAPER_TICK: Duration = Duration::from_secs(1);
 
+/// Longest detach timeout applied, in seconds (100 years): the deadline computed from
+/// a value of the Client must stay within the range of the clocks (§15.8).
+const MAX_DETACH_TIMEOUT: u64 = 100 * 365 * 24 * 60 * 60;
+
 /// How long the PTY keeps the other size during a redraw, so the programs see it.
 const REDRAW_PAUSE: Duration = Duration::from_millis(100);
 
@@ -177,7 +181,9 @@ impl Store {
             leader: child.id().map(|pid| Pid::from_raw(pid as i32)),
             account,
             io,
-            detach_timeout: open.detach_timeout.map(Duration::from_secs),
+            detach_timeout: open
+                .detach_timeout
+                .map(|seconds| Duration::from_secs(seconds.min(MAX_DETACH_TIMEOUT))),
             policy: self.policy,
             inner: Mutex::new(Inner {
                 state: State::Running,
