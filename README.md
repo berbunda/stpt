@@ -53,7 +53,7 @@ stpt terminate alice@host work                 # end it: HUP, KILL after 5 s (--
 A lost connection in `connect` is repaired automatically: the Client notices it after 60 s of silence, says `connection lost`, logs in again with your key and continues where the output stopped.
 - What you type until `attached again` appears is dropped, so a command typed blindly never runs later. `Enter ~ .` gives up; `stpt connect --attach` still continues the Session.
 - If the Session produced more than the Server keeps (256 KiB) meanwhile, the Client says how many bytes were lost, and a full-screen program redraws.
-- The two messages stay on the screen of a full-screen program until it redraws (usually Ctrl+L).
+- Over a full-screen program the messages appear on the last row; after attaching, the program is made to redraw by a brief size change. With `--read-only` the size cannot change: the screen stays as it is until the program redraws by itself.
 - The Client stops trying after an hour (`reattach_timeout`, see Configuration), and at once if the Server key has changed, your key is refused or the Session is gone.
 - `exec` does not reconnect: it reports the lost connection and exits with 255. Input is not numbered like output, so reconnecting could silently lose part of what a pipe sends to the command.
 

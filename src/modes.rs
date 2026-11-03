@@ -166,7 +166,6 @@ impl Modes {
     }
 
     /// Whether an alternate screen is active.
-    #[cfg(test)]
     pub fn alternate_screen(&self) -> bool {
         ALTERNATE_SCREEN.iter().any(|m| self.changed.contains(m))
     }

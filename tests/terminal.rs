@@ -280,7 +280,12 @@ mod server {
     impl Interactive {
         fn start(s: &Setup, args: &[&str]) -> Self {
             use std::io::Read;
-            let line = format!("{} {}", env!("CARGO_BIN_EXE_stpt"), args.join(" "));
+            // script(1) with a pipe as output gives its terminal no size.
+            let line = format!(
+                "stty rows 24 cols 80; {} {}",
+                env!("CARGO_BIN_EXE_stpt"),
+                args.join(" ")
+            );
             let mut child = Command::new("script")
                 .args(["-qec", &line, "/dev/null"])
                 .env("HOME", &s.home)
@@ -368,6 +373,31 @@ mod server {
         assert!(!client.output.lock().unwrap().contains("dropped-2"));
         client.type_text("exit 5\n");
         assert_eq!(client.child.wait().unwrap().code(), Some(5));
+    }
+
+    /// A full-screen program: the messages do not scroll its screen, and it is made to
+    /// repaint after the resume, which the Server does not do without lost output.
+    #[test]
+    #[ignore = "takes more than a minute"]
+    fn reattach_leaves_a_full_screen_program_intact() {
+        let s = Setup::new("terminal-reattach-screen");
+        let relay = Relay::to(s.server.port);
+        let dest = format!("{}@127.0.0.1:{}", account(), relay.port);
+        let args = ["connect", &dest, "--fingerprint", &s.fingerprint];
+        let mut client = Interactive::start(&s, &args);
+        client.type_text(
+            "sh -c 'printf \"\\033[?1049h\"; trap \"echo winch-$((1 + 1))\" WINCH; \
+             echo ready-$((1 + 1)); while :; do sleep 0.2; done'\n",
+        );
+        client.wait_for("ready-2", 10);
+        relay.set_cut(true);
+        client.wait_for("connection lost", 80);
+        relay.set_cut(false);
+        client.wait_for("attached again", 40);
+        client.wait_for("winch-2", 10);
+        let text = client.output.lock().unwrap().clone();
+        assert!(text.contains("\x1b7\x1b[24;1H"), "{text:?}");
+        assert!(!text.contains("\r\nstpt: "), "scrolls: {text:?}");
     }
 
     /// More output during the outage than the buffer of the Server holds (256 KiB).

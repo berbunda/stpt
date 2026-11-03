@@ -663,7 +663,7 @@ impl<F: Future<Output = &'static str>> Terminal<F> {
         reason: quinn::ConnectionError,
     ) -> Result<(Connection, Channel), Error> {
         let session = self.session;
-        note(&format!(
+        self.tell(&format!(
             "connection lost: {}; reconnecting, Enter ~ . gives up",
             quic::Error::Connection(reason.clone())
         ));
@@ -715,16 +715,69 @@ impl<F: Future<Output = &'static str>> Terminal<F> {
         let lost = attached.offset.saturating_sub(self.offset);
         self.offset = attached.offset;
         if lost == 0 {
-            note("attached again");
+            self.tell("attached again");
+            // A full-screen program does not know about the messages on its screen, and
+            // the Server does not redraw on a resume without loss. A read-only
+            // Attachment may not change the size (§15.9).
+            if self.modes.alternate_screen() && !self.mode.read_only {
+                self.redraw();
+            }
             return Ok(());
         }
-        note(&format!("attached again; {lost} bytes of output were lost"));
         let mut sequence = self.modes.reset();
         self.modes = Modes::new();
         self.modes.feed(&attached.modes);
         sequence.extend_from_slice(&attached.modes);
-        console::write_out(&sequence).map_err(Error::Terminal)
+        console::write_out(&sequence).map_err(Error::Terminal)?;
+        self.tell(&format!("attached again; {lost} bytes of output were lost"));
+        Ok(())
     }
+
+    /// A message to the user while the terminal is in raw mode. On the screen of a
+    /// full-screen program it goes to the last row: a line feed would scroll the screen
+    /// behind the program's back, which repaints only what it knows has changed.
+    fn tell(&self, text: &str) {
+        let _ = match console::size() {
+            Some(size) if self.modes.alternate_screen() => {
+                console::write_out(on_last_row(text, size).as_bytes())
+            }
+            _ => console::write_err(format!("\r\nstpt: {text}\r\n").as_bytes()),
+        };
+    }
+
+    /// Makes a full-screen program repaint: curses programs do that in full only on a
+    /// real change of the size. The size is restored after a pause, as both changes
+    /// arriving together would look like none.
+    fn redraw(&self) {
+        let Some(size) = console::size().filter(|s| s.rows > 1) else {
+            return;
+        };
+        let input = self.input.clone();
+        tokio::spawn(async move {
+            let smaller = Size {
+                rows: size.rows - 1,
+                ..size
+            };
+            let _ = input.send(Input::Resize(smaller)).await;
+            tokio::time::sleep(REDRAW_PAUSE).await;
+            let size = console::size().unwrap_or(size);
+            let _ = input.send(Input::Resize(size)).await;
+        });
+    }
+}
+
+/// How long `Terminal::redraw` keeps the smaller size.
+const REDRAW_PAUSE: Duration = Duration::from_millis(200);
+
+/// `text` on the last row of the terminal, in reverse video, leaving the cursor and
+/// its attributes as they were. It is cut to fit: wrapping on the last row would scroll.
+fn on_last_row(text: &str, size: Size) -> String {
+    let width = usize::from(size.columns).saturating_sub(1);
+    let text: String = format!("stpt: {text}").chars().take(width).collect();
+    format!(
+        "\x1b7\x1b[{};1H\x1b[0;7m{text}\x1b[0m\x1b[K\x1b8",
+        size.rows
+    )
 }
 
 /// One attempt of automatic reattach.
@@ -775,11 +828,6 @@ fn retry_delay(attempt: u32) -> Duration {
         0 => Duration::ZERO,
         n => Duration::from_secs(1 << (n - 1).min(8)).min(MAX_RETRY_DELAY),
     }
-}
-
-/// A message of the Client while the terminal is in raw mode.
-fn note(text: &str) {
-    let _ = write!(io::stderr(), "\r\nstpt: {text}\r\n");
 }
 
 impl LocalInput {
@@ -1762,6 +1810,26 @@ mod tests {
         assert_eq!(classify(b"\x1b[24;80R"), Typed);
         assert_eq!(classify(b"\x1b]10;x\x07"), Report);
         assert_eq!(classify(&[0x1b, b'[', b'1'].repeat(30)), Typed);
+    }
+
+    #[test]
+    fn a_message_on_the_last_row_cannot_scroll() {
+        let size = |columns, rows| Size {
+            columns,
+            rows,
+            width: 0,
+            height: 0,
+        };
+        assert_eq!(
+            on_last_row("lost", size(80, 24)),
+            "\x1b7\x1b[24;1H\x1b[0;7mstpt: lost\x1b[0m\x1b[K\x1b8"
+        );
+        // Cut before the last column.
+        assert_eq!(
+            on_last_row("lost", size(5, 3)),
+            "\x1b7\x1b[3;1H\x1b[0;7mstpt\x1b[0m\x1b[K\x1b8"
+        );
+        assert!(!on_last_row("lost", size(0, 1)).contains("stpt"));
     }
 
     #[test]
