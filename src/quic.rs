@@ -2,7 +2,7 @@
 
 use std::fmt;
 use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -100,11 +100,31 @@ pub async fn accept(incoming: Incoming) -> Result<Connection, Error> {
 /// Client Endpoint for Connections to `server`: the unspecified address of its
 /// family, port 0. Needs the runtime.
 pub fn client(server: SocketAddr) -> Result<Endpoint, Error> {
-    let local = match server {
+    endpoint(unspecified(server), None)
+}
+
+/// The unspecified address of the family of `server`, port 0: the system picks the
+/// source address for each packet.
+fn unspecified(server: SocketAddr) -> SocketAddr {
+    match server {
         SocketAddr::V4(_) => SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0),
         SocketAddr::V6(_) => SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0),
-    };
-    endpoint(local, None)
+    }
+}
+
+/// The address this computer would send to `server` from now; an error without a
+/// route. Connecting a UDP socket only looks up the route: nothing is sent.
+pub fn route_source(server: SocketAddr) -> io::Result<IpAddr> {
+    let socket = UdpSocket::bind(unspecified(server))?;
+    socket.connect(server)?;
+    Ok(socket.local_addr()?.ip())
+}
+
+/// Moves the Connections of a Client Endpoint to a new socket: an active migration
+/// (§6.1). Each continues with a new connection ID, as RFC 9000 §9.5 requires for a
+/// new address, and sends a PING at once, which tells the Server the new address.
+pub fn rebind(endpoint: &Endpoint, server: SocketAddr) -> io::Result<()> {
+    endpoint.rebind(bind(unspecified(server))?)
 }
 
 /// Connects to the Server at `addr`; `check` decides on its key. `server_name` is
@@ -221,6 +241,15 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(200), future)
             .await
             .is_err()
+    }
+
+    #[test]
+    fn route_source_names_the_sending_address() {
+        let server = SocketAddr::from(([127, 0, 0, 1], 843));
+        assert_eq!(
+            route_source(server).unwrap(),
+            IpAddr::from(Ipv4Addr::LOCALHOST)
+        );
     }
 
     #[test]

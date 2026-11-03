@@ -50,6 +50,8 @@ stpt terminate alice@host work                 # end it: HUP, KILL after 5 s (--
 - In `connect`, `~.` is recognized only at the start of a line: right after Enter, or first thing after attaching. Mouse movement and other reports of the terminal in between do not matter; arrow keys, function keys and Esc do. Type `~~` for a `~` at the start of a line. With a non-English keyboard layout, switch to English for `~`.
 - Stopping the Server ends all Sessions.
 
+A change of network (Wi-Fi to mobile, a new address) is not even a lost connection: within about a second the Client moves its connection to the new address, and `connect` and `exec` go on without a message. An outage shorter than a minute just pauses them.
+
 A lost connection in `connect` is repaired automatically: the Client notices it after 60 s of silence, says `connection lost`, logs in again with your key and continues where the output stopped.
 - What you type until `attached again` appears is dropped, so a command typed blindly never runs later. `Enter ~ .` gives up; `stpt connect --attach` still continues the Session.
 - If the Session produced more than the Server keeps (256 KiB) meanwhile, the Client says how many bytes were lost, and a full-screen program redraws.

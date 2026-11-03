@@ -187,11 +187,15 @@ async fn connection(incoming: Incoming, shared: Arc<Shared>) {
     tracing::debug!(%remote, "TLS handshake completed");
     let Err(end) = serve_connection(&connection, &shared).await;
     match end {
-        End::Lost(reason) => tracing::info!(%remote, ?reason, "Connection closed"),
+        // The current address: the Connection may have migrated since the handshake.
+        End::Lost(reason) => {
+            let remote = connection.remote_address();
+            tracing::info!(%remote, ?reason, "Connection closed");
+        }
         End::Close(failure) => {
             connection.close(failure.code.varint(), b"");
             tracing::info!(
-                %remote,
+                remote = %connection.remote_address(),
                 code = failure.code.name(),
                 reason = %failure.reason,
                 "Connection closed by the Server"
@@ -572,7 +576,7 @@ mod tests {
     /// store and authorizes `user` for one Account, `alice` unless chosen otherwise.
     #[cfg_attr(not(unix), allow(dead_code))]
     struct Peer {
-        _endpoint: Endpoint,
+        endpoint: Endpoint,
         connection: Connection,
         user: Arc<UserKey>,
         account: String,
@@ -654,7 +658,7 @@ mod tests {
                 .await
                 .unwrap();
             Self {
-                _endpoint: endpoint,
+                endpoint,
                 connection,
                 user,
                 account: account.to_owned(),
@@ -1642,6 +1646,31 @@ mod tests {
             }
             std::fs::remove_file(&marker).unwrap();
             gone(&a, created.session).await;
+        }
+
+        /// A Client on a new socket: its Connection and Attachment continue, and the
+        /// Session list shows the current address (§15.10, §15.12).
+        #[tokio::test]
+        async fn migration_keeps_the_attachment() {
+            use crate::listing;
+            let mut a = authenticated().await;
+            let (mut send, mut recv) = a.open(&command("cat", false)).await;
+            let created = attached(&mut recv).await;
+            let before = a.peer.endpoint.local_addr().unwrap().port();
+            quic::rebind(&a.peer.endpoint, a.peer.addr).unwrap();
+            let after = a.peer.endpoint.local_addr().unwrap().port();
+            assert_ne!(before, after);
+
+            write(&mut send, &terminal::data(wire::TERMINAL_DATA, b"moved\n")).await;
+            read_until(&mut recv, "moved").await;
+
+            let result = ask(&mut a, &listing::list_request(1, None, None)).await;
+            let (sessions, _) = listing::list_of(&result).unwrap();
+            assert_eq!(sessions[0].id, created.session);
+            let attachments = &sessions[0].attachments;
+            assert_eq!(attachments.len(), 1);
+            assert_eq!(attachments[0].id, created.attachment);
+            assert_eq!(attachments[0].address.unwrap().port(), after);
         }
 
         /// A timeout too large for a clock must not break the Session or the reaper.

@@ -603,13 +603,18 @@ struct Relayed {
 impl<F: Future<Output = &'static str>> Terminal<F> {
     /// Relays local input and remote output until the remote program exits or the
     /// Attachment ends.
-    async fn relay(&mut self, channel: Channel, local: LocalInput, limit: u64) -> Relayed {
+    async fn relay(&mut self, channel: Channel, local: LocalInput, over: &Connection) -> Relayed {
         let Channel { send, mut recv, .. } = channel;
         let session = self.session;
         let (pty, read_only) = (self.mode.pty, self.mode.read_only);
         let (detach, mut detached) = tokio::sync::oneshot::channel();
         let (stop, stopped) = tokio::sync::oneshot::channel();
+        let limit = over.peer_limit;
         let sender = tokio::spawn(send_input(send, local, self.mode, limit, detach, stopped));
+        let network = tokio::spawn(follow_network(
+            over.endpoint.clone(),
+            over.connection.remote_address(),
+        ));
         // A read-only Attachment sends no input at all, not even its size (§15.9).
         let watcher = match (pty, console::size()) {
             (true, Some(size)) if !read_only => {
@@ -641,6 +646,7 @@ impl<F: Future<Output = &'static str>> Terminal<F> {
             result = interrupted => result,
             by = self.terminated.as_mut() => Err(Received::Local(Error::Terminated(by))),
         };
+        network.abort();
         if let Some(watcher) = watcher {
             watcher.abort();
         }
@@ -780,6 +786,36 @@ fn on_last_row(text: &str, size: Size) -> String {
     )
 }
 
+/// How often the Client looks whether its address towards the Server has changed.
+const NETWORK_POLL: Duration = Duration::from_secs(1);
+
+/// Migrates the Connection when the address of this computer towards the Server changes
+/// (§15.12). The system would use the new address by itself, but only with the next
+/// packet: at an idle Client that is the keep-alive up to 15 s later, and the Server
+/// keeps sending to the old address until then. Without a route it waits; the same
+/// address coming back needs nothing.
+async fn follow_network(endpoint: quinn::Endpoint, server: SocketAddr) {
+    let mut last = quic::route_source(server).ok();
+    let mut tick = tokio::time::interval(NETWORK_POLL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tick.tick().await;
+        let Ok(source) = quic::route_source(server) else {
+            continue;
+        };
+        if last == Some(source) {
+            continue;
+        }
+        match quic::rebind(&endpoint, server) {
+            Ok(()) => {
+                tracing::info!(%source, "network changed, Connection migrated");
+                last = Some(source);
+            }
+            Err(error) => tracing::debug!(%error, "migration failed"),
+        }
+    }
+}
+
 /// One attempt of automatic reattach.
 async fn attach_again(login: &mut Login<'_>, open: &Open) -> Result<(Connection, Channel), Error> {
     let address = login.remote.destination.address.clone();
@@ -885,7 +921,7 @@ async fn terminal(
     };
     let (result, finishing) = loop {
         let attachment = channel.attached.attachment;
-        let relayed = state.relay(channel, local, connection.peer_limit).await;
+        let relayed = state.relay(channel, local, connection).await;
         let reason = match &relayed.result {
             Err(Received::Stream(StreamError::Lost(reason)))
                 if pty && !login.reattach.is_zero() && lost_in_transit(reason) =>
