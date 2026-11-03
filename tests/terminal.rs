@@ -4,10 +4,15 @@ mod common;
 
 #[cfg(unix)]
 mod server {
+    use std::collections::HashMap;
     use std::io::Write;
+    use std::net::{SocketAddr, UdpSocket};
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Output, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     use super::common::{
         RunningServer, TEST_USER_KEY_LINE, dir, server_config, stderr, stdout, stpt_in, user_key,
@@ -215,6 +220,194 @@ mod server {
             String::from_utf8_lossy(&out.stdout).into_owned(),
             out.status.code(),
         )
+    }
+
+    /// A UDP relay between Clients and a Server, with a switch that cuts the path.
+    struct Relay {
+        port: u16,
+        cut: Arc<AtomicBool>,
+    }
+
+    impl Relay {
+        fn to(server: u16) -> Self {
+            let front = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let port = front.local_addr().unwrap().port();
+            let cut = Arc::new(AtomicBool::new(false));
+            let is_cut = cut.clone();
+            std::thread::spawn(move || {
+                let mut backs: HashMap<SocketAddr, UdpSocket> = HashMap::new();
+                let mut buf = [0; 65536];
+                while let Ok((n, client)) = front.recv_from(&mut buf) {
+                    if is_cut.load(Ordering::Relaxed) {
+                        continue;
+                    }
+                    let back = backs.entry(client).or_insert_with(|| {
+                        let back = UdpSocket::bind("127.0.0.1:0").unwrap();
+                        back.connect(("127.0.0.1", server)).unwrap();
+                        let (reply, front, is_cut) = (
+                            back.try_clone().unwrap(),
+                            front.try_clone().unwrap(),
+                            is_cut.clone(),
+                        );
+                        std::thread::spawn(move || {
+                            let mut buf = [0; 65536];
+                            while let Ok(n) = reply.recv(&mut buf) {
+                                if !is_cut.load(Ordering::Relaxed) {
+                                    let _ = front.send_to(&buf[..n], client);
+                                }
+                            }
+                        });
+                        back
+                    });
+                    let _ = back.send(&buf[..n]);
+                }
+            });
+            Self { port, cut }
+        }
+
+        fn set_cut(&self, cut: bool) {
+            self.cut.store(cut, Ordering::Relaxed);
+        }
+    }
+
+    /// `stpt ARGS` in script(1), with its output collected while it runs.
+    struct Interactive {
+        child: std::process::Child,
+        stdin: std::process::ChildStdin,
+        output: Arc<Mutex<String>>,
+    }
+
+    impl Interactive {
+        fn start(s: &Setup, args: &[&str]) -> Self {
+            use std::io::Read;
+            let line = format!("{} {}", env!("CARGO_BIN_EXE_stpt"), args.join(" "));
+            let mut child = Command::new("script")
+                .args(["-qec", &line, "/dev/null"])
+                .env("HOME", &s.home)
+                .env("XDG_CONFIG_HOME", &s.home)
+                .env("TERM", "xterm")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let stdin = child.stdin.take().unwrap();
+            let mut stdout = child.stdout.take().unwrap();
+            let output = Arc::new(Mutex::new(String::new()));
+            let collected = output.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0; 4096];
+                while let Ok(n) = stdout.read(&mut buf) {
+                    if n == 0 {
+                        return;
+                    }
+                    let text = String::from_utf8_lossy(&buf[..n]);
+                    collected.lock().unwrap().push_str(&text);
+                }
+            });
+            Self {
+                child,
+                stdin,
+                output,
+            }
+        }
+
+        fn wait_for(&self, text: &str, seconds: u64) {
+            let start = Instant::now();
+            while !self.output.lock().unwrap().contains(text) {
+                assert!(
+                    start.elapsed() < Duration::from_secs(seconds),
+                    "no {text:?} in {:?}",
+                    self.output.lock().unwrap()
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        fn type_text(&mut self, text: &str) {
+            self.stdin.write_all(text.as_bytes()).unwrap();
+            self.stdin.flush().unwrap();
+        }
+    }
+
+    /// Waits for the QUIC idle timeout of 60 s, as a real outage does.
+    #[test]
+    #[ignore = "takes more than a minute"]
+    fn connect_attaches_again_after_a_lost_connection() {
+        let s = Setup::new("terminal-reattach");
+        let relay = Relay::to(s.server.port);
+        let dest = format!("{}@127.0.0.1:{}", account(), relay.port);
+        let args = ["connect", &dest, "--fingerprint", &s.fingerprint];
+        let mut client = Interactive::start(&s, &args);
+        client.type_text("echo one-$((1 + 1))\n");
+        client.wait_for("one-2", 10);
+
+        // Output produced during the outage waits in the buffer of the Server.
+        client.type_text("(sleep 2; echo two-$((1 + 1))) &\n");
+        std::thread::sleep(Duration::from_millis(500));
+        relay.set_cut(true);
+        client.wait_for("connection lost", 80);
+        // Typed during the outage: dropped, not run later.
+        client.type_text("echo dropped-$((1 + 1))\n");
+        relay.set_cut(false);
+
+        client.wait_for("attached again", 40);
+        client.wait_for("two-2", 10);
+        let text = client.output.lock().unwrap().clone();
+        assert_eq!(text.matches("one-2").count(), 1, "replayed twice: {text}");
+        assert!(!text.contains("bytes of output were lost"), "{text}");
+
+        // Only the new Attachment is left: the old one was ended at once.
+        let table = stdout(&stpt_in(&s.home, &s.args("sessions", &[])));
+        let row = table.lines().nth(1).unwrap();
+        let attachments: Vec<&str> = row.split_whitespace().collect();
+        assert!(attachments.contains(&"1"), "{table}");
+
+        client.type_text("echo three-$((1 + 2))\n");
+        client.wait_for("three-3", 10);
+        assert!(!client.output.lock().unwrap().contains("dropped-2"));
+        client.type_text("exit 5\n");
+        assert_eq!(client.child.wait().unwrap().code(), Some(5));
+    }
+
+    /// More output during the outage than the buffer of the Server holds (256 KiB).
+    #[test]
+    #[ignore = "takes more than a minute"]
+    fn reattach_tells_about_lost_output() {
+        let s = Setup::new("terminal-reattach-lost");
+        let relay = Relay::to(s.server.port);
+        let dest = format!("{}@127.0.0.1:{}", account(), relay.port);
+        let args = ["connect", &dest, "--fingerprint", &s.fingerprint];
+        let mut client = Interactive::start(&s, &args);
+        client.type_text(
+            "(sleep 2; head -c 400000 /dev/zero | tr '\\0' x; echo; echo end-$((1 + 1))) &\n",
+        );
+        std::thread::sleep(Duration::from_millis(500));
+        relay.set_cut(true);
+        client.wait_for("connection lost", 80);
+        relay.set_cut(false);
+        client.wait_for("bytes of output were lost", 40);
+        client.wait_for("end-2", 10);
+        client.type_text("exit 6\n");
+        assert_eq!(client.child.wait().unwrap().code(), Some(6));
+    }
+
+    /// `Enter ~ .` gives up while the Client is trying to reattach.
+    #[test]
+    #[ignore = "takes more than a minute"]
+    fn the_escape_gives_up_reattaching() {
+        let s = Setup::new("terminal-reattach-escape");
+        let relay = Relay::to(s.server.port);
+        let dest = format!("{}@127.0.0.1:{}", account(), relay.port);
+        let args = ["connect", &dest, "--fingerprint", &s.fingerprint];
+        let mut client = Interactive::start(&s, &args);
+        client.type_text("echo ready-$((1 + 1))\n");
+        client.wait_for("ready-2", 10);
+        relay.set_cut(true);
+        client.wait_for("connection lost", 80);
+        client.type_text("\r~.");
+        client.wait_for("attach again with: stpt connect --attach", 5);
+        assert_eq!(client.child.wait().unwrap().code(), Some(255));
     }
 
     #[test]

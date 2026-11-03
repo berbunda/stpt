@@ -4,7 +4,7 @@ use std::io::{self, IsTerminal, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::Path;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -20,6 +20,7 @@ use crate::destination::Address;
 use crate::error::Error;
 use crate::hello::{AUTH_PUBLICKEY_ED25519, ClientHello, ServerHello};
 use crate::identity::Fingerprint;
+use crate::listing;
 use crate::logging::{self, Role};
 use crate::modes::Modes;
 use crate::quic;
@@ -112,16 +113,48 @@ pub fn run(command: ClientCommand, common: &Common) -> Result<ExitCode, Error> {
     let runtime = quic::runtime()?;
     let _guard = runtime.enter();
     let addr = resolve(&remote.destination.address)?;
-    let mut connection = runtime.block_on(connect(&remote, addr, &mut store, ask_user))?;
-    let hello = runtime.block_on(connection.hello(SERVER_HELLO_TIMEOUT))?;
+    let mut connection = runtime.block_on(login_to(&remote, addr, &mut store, &key, ask_user))?;
+    let mut login = Login {
+        remote: &remote,
+        store: &mut store,
+        key: &key,
+        reattach: Duration::from_secs(config.reattach_timeout.unwrap_or(REATTACH_TIMEOUT)),
+    };
+    let result = runtime.block_on(perform(&mut connection, action, &mut login));
+    runtime.block_on(connection.close());
+    result
+}
+
+/// How long automatic reattach keeps trying by default, in seconds.
+const REATTACH_TIMEOUT: u64 = 60 * 60;
+
+/// One attempt of automatic reattach: a QUIC handshake alone would wait for the idle
+/// timeout, while a new attempt may already find the network back.
+const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The longest pause between attempts of automatic reattach.
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
+
+/// A Connection with a trusted Server key, HELLO exchanged and authenticated (§10, §12).
+async fn login_to(
+    remote: &Remote,
+    addr: SocketAddr,
+    store: &mut TrustStore,
+    key: &UserKey,
+    confirm: impl Fn(&Address, &Fingerprint) -> Result<bool, Error>,
+) -> Result<Connection, Error> {
+    let mut connection = connect(remote, addr, store, confirm).await?;
+    let hello = connection.hello(SERVER_HELLO_TIMEOUT).await?;
     tracing::info!(
         version = format_args!("{:#x}", hello.version),
         "Connection established"
     );
     let account = &remote.destination.account;
-    let accepted = runtime.block_on(connection.authenticate(account, &key, AUTH_RESULT_TIMEOUT))?;
+    let accepted = connection
+        .authenticate(account, key, AUTH_RESULT_TIMEOUT)
+        .await?;
     if !accepted {
-        runtime.block_on(connection.close());
+        connection.close().await;
         return Err(Error::AuthRejected {
             account: account.clone(),
             fingerprint: key.public_key().fingerprint(),
@@ -129,9 +162,7 @@ pub fn run(command: ClientCommand, common: &Common) -> Result<ExitCode, Error> {
         });
     }
     tracing::info!(%account, key = %key.public_key().fingerprint(), "Connection authenticated");
-    let result = runtime.block_on(perform(&mut connection, action));
-    runtime.block_on(connection.close());
-    result
+    Ok(connection)
 }
 
 /// What a Client command does once the Connection is Authenticated.
@@ -154,9 +185,15 @@ enum Action {
     },
 }
 
-async fn perform(connection: &mut Connection, action: Action) -> Result<ExitCode, Error> {
+async fn perform(
+    connection: &mut Connection,
+    action: Action,
+    login: &mut Login<'_>,
+) -> Result<ExitCode, Error> {
     match action {
-        Action::Terminal(open, pty) => connection.terminal(open, pty).await.map(outcome_code),
+        Action::Terminal(open, pty) => terminal(connection, open, pty, login)
+            .await
+            .map(outcome_code),
         Action::Attach {
             session,
             takeover,
@@ -170,8 +207,7 @@ async fn perform(connection: &mut Connection, action: Action) -> Result<ExitCode
                 read_only: read_only.then_some(true),
                 ..Open::default()
             };
-            connection
-                .terminal(open, session.pty)
+            terminal(connection, open, session.pty, login)
                 .await
                 .map(outcome_code)
         }
@@ -430,11 +466,16 @@ pub enum Outcome {
     DetachedByServer(SessionId),
 }
 
+/// A terminal Channel the Server has accepted.
+struct Channel {
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
+    attached: Attached,
+}
+
 impl Connection {
-    /// Opens a terminal Channel (§14.3) and relays local input and remote output until
-    /// the remote program exits or the Attachment ends. With a PTY (`pty`) the local
-    /// terminal is in raw mode meanwhile, and `Enter ~ .` detaches.
-    async fn terminal(&mut self, open: Open, pty: bool) -> Result<Outcome, Error> {
+    /// Opens a terminal Channel (§14.3) and waits for TERMINAL_ATTACHED.
+    async fn open_terminal(&mut self, open: &Open) -> Result<Channel, Error> {
         let (mut send, mut recv) = self
             .connection
             .open_bi()
@@ -458,98 +499,20 @@ impl Connection {
             Err(error) => return Err(self.failed(error).await),
         };
         tracing::info!(session = %attached.session, attachment = attached.attachment, "attached");
-
-        let terminated = console::termination().map_err(Error::Signals)?;
-        let local = Console::setup(pty).map_err(Error::Terminal)?;
-        // The terminal modes the Session's programs set (§15.11).
-        let mut modes = Modes::new();
-        if pty && !attached.modes.is_empty() {
-            modes.feed(&attached.modes);
-            console::write_out(&attached.modes).map_err(Error::Terminal)?;
-        }
-        let read_only = open.read_only == Some(true);
-        let (input, inputs) = mpsc::channel(16);
-        let from_stdin = input.clone();
-        console::read_input(move |data| {
-            let input = data.map_or(Input::Eof, Input::Data);
-            from_stdin.blocking_send(input).is_ok()
-        });
-        let (detach, mut detached) = tokio::sync::oneshot::channel();
-        let input_mode = InputMode { pty, read_only };
-        let sender = tokio::spawn(send_input(
+        Ok(Channel {
             send,
-            inputs,
-            input_mode,
-            self.peer_limit,
-            detach,
-        ));
-        // A read-only Attachment sends no input at all, not even its size (§15.9).
-        let watcher = match open.size {
-            Some(size) if !read_only && console::size().is_some() => {
-                Some(tokio::spawn(watch_size(input.clone(), size)))
-            }
-            _ => None,
-        };
-        let session = attached.session;
-        let interrupted = async {
-            match (pty, read_only) {
-                // Ctrl+C is input for the remote PTY (dropped when read-only).
-                (true, _) => std::future::pending().await,
-                (false, true) => {
-                    let _ = tokio::signal::ctrl_c().await;
-                    Ok(Outcome::Detached(session))
-                }
-                (false, false) => {
-                    interrupts(input.clone()).await;
-                    Err(Received::Local(Error::Interrupted))
-                }
-            }
-        };
-        let result = tokio::select! {
-            biased;
-            Ok(()) = &mut detached => Ok(Outcome::Detached(session)),
-            result = receive_output(&mut recv, pty, &mut modes) => result.map(Outcome::Exited),
-            result = interrupted => result,
-            by = terminated => Err(Received::Local(Error::Terminated(by))),
-        };
-        if let Some(watcher) = watcher {
-            watcher.abort();
-        }
-        if pty {
-            // Leave the modes the remote programs set; after an early end also their
-            // colours, and continue on a new line.
-            let mut tail = modes.reset();
-            if !matches!(result, Ok(Outcome::Exited(_))) {
-                tail.extend_from_slice(b"\x1b[0m\r\n");
-            }
-            let _ = console::write_out(&tail);
-        }
-        drop(local);
-        // The Client's FIN: after the exit status, or a detach when the Client ends
-        // early (§14.10); not worth waiting long for. The caller closes the Connection.
-        let _ = input.try_send(Input::Finish);
-        let _ = timeout(Duration::from_secs(1), sender).await;
-        match result {
-            Ok(outcome) => Ok(outcome),
-            // The Server's FIN answers our own detach, or it ended the Attachment.
-            Err(Received::Local(Error::TerminalEnded)) if detached.try_recv().is_ok() => {
-                Ok(Outcome::Detached(session))
-            }
-            Err(Received::Local(Error::TerminalEnded)) => Ok(Outcome::DetachedByServer(session)),
-            Err(Received::Local(error)) => Err(error),
-            Err(Received::Stream(StreamError::Reset(code))) => {
-                Err(Error::ChannelReset(code.into_inner()))
-            }
-            // When the Server shuts down, its Sessions end too (§15.8).
-            Err(Received::Stream(StreamError::Lost(reason))) if shutting_down(&reason) => {
-                Err(quic::Error::Connection(reason).into())
-            }
-            Err(Received::Stream(StreamError::Lost(reason))) => Err(Error::SessionContinues {
-                error: Box::new(quic::Error::Connection(reason).into()),
-                session,
-            }),
-            Err(Received::Stream(error)) => Err(self.failed(error).await),
-        }
+            recv,
+            attached,
+        })
+    }
+
+    /// Ends an Attachment of a lost Connection (§15.12). The result is not awaited: it
+    /// comes only when that Attachment has ended, and nothing depends on it.
+    async fn forget_attachment(&mut self, session: SessionId, attachment: u64) {
+        self.next_request += 1;
+        let request = listing::detach_request(self.next_request, session, Some(attachment));
+        let (send, _) = self.control.as_mut().expect("authenticated");
+        let _ = wire::write_message(send, &request, self.peer_limit).await;
     }
 
     /// Sends the request `build` makes with a new request ID and returns its
@@ -599,6 +562,348 @@ impl Connection {
 fn shutting_down(reason: &quinn::ConnectionError) -> bool {
     matches!(reason, quinn::ConnectionError::ApplicationClosed(close)
         if close.error_code == wire::Code::ServerShutdown.varint())
+}
+
+/// What a new Connection to the same Server takes (§15.12).
+struct Login<'a> {
+    remote: &'a Remote,
+    store: &'a mut TrustStore,
+    key: &'a UserKey,
+    /// How long automatic reattach keeps trying; zero: it is off.
+    reattach: Duration,
+}
+
+/// Input that outlives the Attachments of a terminal Channel: it is read only once,
+/// and the escape continues.
+struct LocalInput {
+    inputs: mpsc::Receiver<Input>,
+    escape: Escape,
+}
+
+/// The local side of a terminal Channel: it outlives the Connection (§15.12).
+struct Terminal<F> {
+    session: SessionId,
+    mode: InputMode,
+    input: mpsc::Sender<Input>,
+    /// The terminal modes the Session's programs set (§15.11).
+    modes: Modes,
+    /// Offset of the first output byte not yet received (§15.11).
+    offset: u64,
+    terminated: std::pin::Pin<Box<F>>,
+}
+
+/// How one Attachment ended.
+struct Relayed {
+    result: Result<Outcome, Received>,
+    sender: tokio::task::JoinHandle<LocalInput>,
+    stop: tokio::sync::oneshot::Sender<()>,
+    detached: tokio::sync::oneshot::Receiver<()>,
+}
+
+impl<F: Future<Output = &'static str>> Terminal<F> {
+    /// Relays local input and remote output until the remote program exits or the
+    /// Attachment ends.
+    async fn relay(&mut self, channel: Channel, local: LocalInput, limit: u64) -> Relayed {
+        let Channel { send, mut recv, .. } = channel;
+        let session = self.session;
+        let (pty, read_only) = (self.mode.pty, self.mode.read_only);
+        let (detach, mut detached) = tokio::sync::oneshot::channel();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let sender = tokio::spawn(send_input(send, local, self.mode, limit, detach, stopped));
+        // A read-only Attachment sends no input at all, not even its size (§15.9).
+        let watcher = match (pty, console::size()) {
+            (true, Some(size)) if !read_only => {
+                Some(tokio::spawn(watch_size(self.input.clone(), size)))
+            }
+            _ => None,
+        };
+        let input = self.input.clone();
+        let interrupted = async {
+            match (pty, read_only) {
+                // Ctrl+C is input for the remote PTY (dropped when read-only).
+                (true, _) => std::future::pending().await,
+                (false, true) => {
+                    let _ = tokio::signal::ctrl_c().await;
+                    Ok(Outcome::Detached(session))
+                }
+                (false, false) => {
+                    interrupts(input).await;
+                    Err(Received::Local(Error::Interrupted))
+                }
+            }
+        };
+        let result = tokio::select! {
+            biased;
+            Ok(()) = &mut detached => Ok(Outcome::Detached(session)),
+            result = receive_output(&mut recv, pty, &mut self.modes, &mut self.offset) => {
+                result.map(Outcome::Exited)
+            }
+            result = interrupted => result,
+            by = self.terminated.as_mut() => Err(Received::Local(Error::Terminated(by))),
+        };
+        if let Some(watcher) = watcher {
+            watcher.abort();
+        }
+        Relayed {
+            result,
+            sender,
+            stop,
+            detached,
+        }
+    }
+
+    /// After the loss of a Connection: new Connections, each authenticated in full,
+    /// until one attaches with resume (§15.12). What is typed meanwhile is dropped,
+    /// only the escape counts: `Enter ~ .` gives up, and so does the end of the time.
+    async fn reattach(
+        &mut self,
+        login: &mut Login<'_>,
+        local: &mut LocalInput,
+        lost_attachment: u64,
+        reason: quinn::ConnectionError,
+    ) -> Result<(Connection, Channel), Error> {
+        let session = self.session;
+        note(&format!(
+            "connection lost: {}; reconnecting, Enter ~ . gives up",
+            quic::Error::Connection(reason.clone())
+        ));
+        let lost = || Error::SessionContinues {
+            error: Box::new(quic::Error::Connection(reason.clone()).into()),
+            session,
+        };
+        let deadline = Instant::now().checked_add(login.reattach);
+        let mut attempts = 0;
+        loop {
+            let delay = retry_delay(attempts);
+            attempts += 1;
+            if deadline.is_some_and(|d| Instant::now() + delay >= d) {
+                return Err(lost());
+            }
+            let open = Open {
+                session: Some(session),
+                size: Some(console::size().unwrap_or(DEFAULT_SIZE)),
+                read_only: self.mode.read_only.then_some(true),
+                resume: Some(self.offset),
+                ..Open::default()
+            };
+            let attempt = async {
+                tokio::time::sleep(delay).await;
+                timeout(ATTEMPT_TIMEOUT, attach_again(login, &open)).await
+            };
+            let result = tokio::select! {
+                biased;
+                by = self.terminated.as_mut() => return Err(Error::Terminated(by)),
+                () = local.escaped() => return Err(lost()),
+                result = attempt => result,
+            };
+            match result {
+                Ok(Ok((mut connection, channel))) => {
+                    connection.forget_attachment(session, lost_attachment).await;
+                    self.attached_again(&channel.attached)?;
+                    return Ok((connection, channel));
+                }
+                Ok(Err(error)) if !worth_retrying(&error) => return Err(error),
+                Ok(Err(error)) => tracing::debug!(%error, "reattach failed"),
+                Err(_) => tracing::debug!("reattach timed out"),
+            }
+        }
+    }
+
+    /// Continues from where the new Attachment starts (§15.11). Without lost output the
+    /// terminal stays as it was; else its modes belong to output it has not seen.
+    fn attached_again(&mut self, attached: &Attached) -> Result<(), Error> {
+        let lost = attached.offset.saturating_sub(self.offset);
+        self.offset = attached.offset;
+        if lost == 0 {
+            note("attached again");
+            return Ok(());
+        }
+        note(&format!("attached again; {lost} bytes of output were lost"));
+        let mut sequence = self.modes.reset();
+        self.modes = Modes::new();
+        self.modes.feed(&attached.modes);
+        sequence.extend_from_slice(&attached.modes);
+        console::write_out(&sequence).map_err(Error::Terminal)
+    }
+}
+
+/// One attempt of automatic reattach.
+async fn attach_again(login: &mut Login<'_>, open: &Open) -> Result<(Connection, Channel), Error> {
+    let address = login.remote.destination.address.clone();
+    let addr = tokio::task::spawn_blocking(move || resolve(&address))
+        .await
+        .expect("resolving does not panic")?;
+    // Nobody can be asked now: a key not known by now is an error.
+    let mut connection =
+        login_to(login.remote, addr, login.store, login.key, refuse_unknown).await?;
+    let channel = connection.open_terminal(open).await?;
+    Ok((connection, channel))
+}
+
+/// A first contact during reattach: the trust store has lost the key of the Server.
+fn refuse_unknown(address: &Address, fingerprint: &Fingerprint) -> Result<bool, Error> {
+    Err(Error::KeyNotKnown {
+        address: address.clone(),
+        presented: *fingerprint,
+    })
+}
+
+/// Whether the loss of a Connection is one a new Connection may help with: silence,
+/// or a Server that has forgotten it. A close by the Server is its decision.
+fn lost_in_transit(reason: &quinn::ConnectionError) -> bool {
+    matches!(
+        reason,
+        quinn::ConnectionError::TimedOut | quinn::ConnectionError::Reset
+    )
+}
+
+/// Whether a failed attempt of reattach may succeed later: not when the Server key
+/// changed, the user key is refused or the Session is gone.
+fn worth_retrying(error: &Error) -> bool {
+    match error {
+        Error::Resolve { .. } | Error::Transport(_) => true,
+        Error::Protocol(failure) => failure.code == wire::Code::Timeout,
+        // The Attachment of the lost Connection may still count against the limit.
+        Error::ChannelRejected(code) => *code == wire::Code::LimitExceeded as u64,
+        _ => false,
+    }
+}
+
+/// How long automatic reattach waits before attempt `attempt`, counted from 0.
+fn retry_delay(attempt: u32) -> Duration {
+    match attempt {
+        0 => Duration::ZERO,
+        n => Duration::from_secs(1 << (n - 1).min(8)).min(MAX_RETRY_DELAY),
+    }
+}
+
+/// A message of the Client while the terminal is in raw mode.
+fn note(text: &str) {
+    let _ = write!(io::stderr(), "\r\nstpt: {text}\r\n");
+}
+
+impl LocalInput {
+    /// Follows the input without an Attachment: completes on the escape `Enter ~ .`.
+    async fn escaped(&mut self) {
+        loop {
+            match self.inputs.recv().await {
+                Some(Input::Data(data)) if self.escape.filter(&data).1 => return,
+                Some(_) => {}
+                None => std::future::pending().await,
+            }
+        }
+    }
+}
+
+/// Runs a terminal Channel until the remote program exits or the Attachment ends and,
+/// with a PTY, attaches again after the loss of the Connection (§15.12). With a PTY the
+/// local terminal is in raw mode meanwhile, and `Enter ~ .` detaches.
+async fn terminal(
+    connection: &mut Connection,
+    open: Open,
+    pty: bool,
+    login: &mut Login<'_>,
+) -> Result<Outcome, Error> {
+    let mut channel = connection.open_terminal(&open).await?;
+    let attached = &channel.attached;
+    let session = attached.session;
+    let terminated = Box::pin(console::termination().map_err(Error::Signals)?);
+    let console = Console::setup(pty).map_err(Error::Terminal)?;
+    let mut modes = Modes::new();
+    if pty && !attached.modes.is_empty() {
+        modes.feed(&attached.modes);
+        console::write_out(&attached.modes).map_err(Error::Terminal)?;
+    }
+    let (input, inputs) = mpsc::channel(16);
+    let from_stdin = input.clone();
+    console::read_input(move |data| {
+        let input = data.map_or(Input::Eof, Input::Data);
+        from_stdin.blocking_send(input).is_ok()
+    });
+    let mut state = Terminal {
+        session,
+        mode: InputMode {
+            pty,
+            read_only: open.read_only == Some(true),
+        },
+        input: input.clone(),
+        modes,
+        offset: attached.offset,
+        terminated,
+    };
+    let mut local = LocalInput {
+        inputs,
+        escape: Escape::new(),
+    };
+    let (result, finishing) = loop {
+        let attachment = channel.attached.attachment;
+        let relayed = state.relay(channel, local, connection.peer_limit).await;
+        let reason = match &relayed.result {
+            Err(Received::Stream(StreamError::Lost(reason)))
+                if pty && !login.reattach.is_zero() && lost_in_transit(reason) =>
+            {
+                reason.clone()
+            }
+            _ => {
+                break (
+                    relayed.result,
+                    Some((relayed.sender, relayed.stop, relayed.detached)),
+                );
+            }
+        };
+        // The task returns at once: writing to a lost Connection fails.
+        let _ = relayed.stop.send(());
+        local = relayed.sender.await.expect("input task does not panic");
+        match state.reattach(login, &mut local, attachment, reason).await {
+            Ok((new, next)) => {
+                *connection = new;
+                channel = next;
+            }
+            Err(error) => break (Err(Received::Local(error)), None),
+        }
+    };
+    if pty {
+        // Leave the modes the remote programs set; after an early end also their
+        // colours, and continue on a new line.
+        let mut tail = state.modes.reset();
+        if !matches!(result, Ok(Outcome::Exited(_))) {
+            tail.extend_from_slice(b"\x1b[0m\r\n");
+        }
+        let _ = console::write_out(&tail);
+    }
+    drop(console);
+    let mut detached = None;
+    if let Some((sender, stop, receiver)) = finishing {
+        // The Client's FIN: after the exit status, or a detach when the Client ends
+        // early (§14.10); not worth waiting long for. The caller closes the Connection.
+        let _ = input.try_send(Input::Finish);
+        let _ = timeout(Duration::from_secs(1), sender).await;
+        drop(stop);
+        detached = Some(receiver);
+    }
+    match result {
+        Ok(outcome) => Ok(outcome),
+        // The Server's FIN answers our own detach, or it ended the Attachment.
+        Err(Received::Local(Error::TerminalEnded))
+            if detached.as_mut().is_some_and(|d| d.try_recv().is_ok()) =>
+        {
+            Ok(Outcome::Detached(session))
+        }
+        Err(Received::Local(Error::TerminalEnded)) => Ok(Outcome::DetachedByServer(session)),
+        Err(Received::Local(error)) => Err(error),
+        Err(Received::Stream(StreamError::Reset(code))) => {
+            Err(Error::ChannelReset(code.into_inner()))
+        }
+        // When the Server shuts down, its Sessions end too (§15.8).
+        Err(Received::Stream(StreamError::Lost(reason))) if shutting_down(&reason) => {
+            Err(quic::Error::Connection(reason).into())
+        }
+        Err(Received::Stream(StreamError::Lost(reason))) => Err(Error::SessionContinues {
+            error: Box::new(quic::Error::Connection(reason).into()),
+            session,
+        }),
+        Err(Received::Stream(error)) => Err(connection.failed(error).await),
+    }
 }
 
 /// How long the Client waits for a REQUEST_RESULT; a termination may take the
@@ -818,25 +1123,33 @@ struct InputMode {
 
 async fn send_input(
     mut send: quinn::SendStream,
-    mut inputs: mpsc::Receiver<Input>,
+    mut local: LocalInput,
     mode: InputMode,
     limit: u64,
     detach: tokio::sync::oneshot::Sender<()>,
-) {
+    mut stop: tokio::sync::oneshot::Receiver<()>,
+) -> LocalInput {
     let pty = mode.pty;
-    let mut escape = Escape::new();
-    while let Some(input) = inputs.recv().await {
+    loop {
+        let input = tokio::select! {
+            biased;
+            Ok(()) = &mut stop => return local,
+            input = local.inputs.recv() => input,
+        };
+        let Some(input) = input else {
+            break;
+        };
         let message = match input {
             Input::Data(data) if pty => {
                 tracing::trace!(input = %shape(&data), "terminal input");
-                let (data, detaching) = escape.filter(&data);
+                let (data, detaching) = local.escape.filter(&data);
                 if !data.is_empty() && !mode.read_only {
                     let message = terminal::data(TERMINAL_DATA, &data);
                     if wire::write_message(&mut send, &message, limit)
                         .await
                         .is_err()
                     {
-                        return;
+                        return local;
                     }
                 }
                 if detaching {
@@ -844,7 +1157,7 @@ async fn send_input(
                     let _ = send.finish();
                     let _ = detach.send(());
                     let _ = send.stopped().await;
-                    return;
+                    return local;
                 }
                 continue;
             }
@@ -862,13 +1175,14 @@ async fn send_input(
             .await
             .is_err()
         {
-            return;
+            return local;
         }
     }
     let _ = send.finish();
     // Closing the Connection drops stream data not yet sent: wait until the Server
     // has the FIN, which confirms the exit status (§15.7).
     let _ = send.stopped().await;
+    local
 }
 
 /// Why receiving output ended without an exit status.
@@ -890,11 +1204,12 @@ impl From<Failure> for Received {
 }
 
 /// Writes remote output until TERMINAL_EXIT (§14.7, §14.10), following the terminal
-/// modes in it.
+/// modes in it and counting the output offset (§15.11).
 async fn receive_output(
     recv: &mut quinn::RecvStream,
     pty: bool,
     modes: &mut Modes,
+    offset: &mut u64,
 ) -> Result<Exit, Received> {
     let local = |e| Received::Local(Error::Terminal(e));
     loop {
@@ -908,9 +1223,12 @@ async fn receive_output(
                     modes.feed(data);
                 }
                 console::write_out(data).map_err(local)?;
+                *offset += data.len() as u64;
             }
             TERMINAL_STDERR if !pty => {
-                console::write_err(terminal::data_of(&message)?).map_err(local)?;
+                let data = terminal::data_of(&message)?;
+                console::write_err(data).map_err(local)?;
+                *offset += data.len() as u64;
             }
             TERMINAL_EXIT => return Ok(Exit::from_message(&message)?),
             kind => {
@@ -1444,6 +1762,47 @@ mod tests {
         assert_eq!(classify(b"\x1b[24;80R"), Typed);
         assert_eq!(classify(b"\x1b]10;x\x07"), Report);
         assert_eq!(classify(&[0x1b, b'[', b'1'].repeat(30)), Typed);
+    }
+
+    #[test]
+    fn retry_delays_grow_to_a_limit() {
+        let delays: Vec<u64> = (0..8).map(|n| retry_delay(n).as_secs()).collect();
+        assert_eq!(delays, [0, 1, 2, 4, 8, 16, 30, 30]);
+        assert_eq!(retry_delay(u32::MAX), MAX_RETRY_DELAY);
+    }
+
+    #[test]
+    fn only_a_loss_in_transit_reattaches() {
+        assert!(lost_in_transit(&quinn::ConnectionError::TimedOut));
+        assert!(lost_in_transit(&quinn::ConnectionError::Reset));
+        assert!(!lost_in_transit(&quinn::ConnectionError::LocallyClosed));
+    }
+
+    #[test]
+    fn failures_that_no_retry_can_help_end_the_reattach() {
+        let code = |c: wire::Code| Error::ChannelRejected(c as u64);
+        assert!(worth_retrying(&Error::Transport(quic::Error::Connection(
+            quinn::ConnectionError::TimedOut
+        ))));
+        assert!(worth_retrying(&Error::Protocol(Failure::new(
+            wire::Code::Timeout,
+            "no SERVER_HELLO"
+        ))));
+        assert!(worth_retrying(&code(wire::Code::LimitExceeded)));
+
+        assert!(!worth_retrying(&code(wire::Code::SessionNotFound)));
+        assert!(!worth_retrying(&Error::Protocol(Failure::violation("x"))));
+        let fingerprint = ServerKey::generate().public_key().fingerprint();
+        assert!(!worth_retrying(&Error::KeyChanged {
+            address: "host".parse().unwrap(),
+            stored: fingerprint,
+            presented: fingerprint,
+        }));
+        assert!(!worth_retrying(&Error::AuthRejected {
+            account: "alice".into(),
+            fingerprint,
+            key_line: String::new(),
+        }));
     }
 
     #[test]

@@ -25,6 +25,9 @@ pub const SERVER_PATH: &str = "/etc/stpt/server.toml";
 pub struct ClientConfig {
     /// Seconds a new Session may stay without an Attachment (PROTOCOL.md §15.8).
     pub detach_timeout: Option<u64>,
+    /// Seconds automatic reattach keeps trying after the loss of a Connection (§15.12);
+    /// 0 turns it off.
+    pub reattach_timeout: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]

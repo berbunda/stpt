@@ -37,7 +37,7 @@ IDs A001–D008 were renamed to RA001–RD008 on 2026-10-11 (prefix scheme chang
 - [x] RD004  session list ← PD004 ✅ 2026-10-18
 - [x] RD005  session attach ← PD003 ✅ 2026-10-18
 - [x] RD006  session terminate ← PD002 ✅ 2026-10-18
-- [ ] RD007  automatic reattach ← PD005
+- [x] RD007  automatic reattach ← PD005 ✅ 2026-11-03
 - [ ] RD008  QUIC connection migration ← PD005
 - [x] RD009  detach timeout in Client config; help, man and README explain that closing the window detaches ← PD002 ➕ 2026-10-13 ✅ 2026-11-03
 - [x] RD010  detach from another window: all Attachments or one by ID ← PD003 ➕ 2026-10-13 ✅ 2026-10-18
