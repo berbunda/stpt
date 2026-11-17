@@ -2,8 +2,10 @@
 
 Protocol specification: https://github.com/berbunda/stpt-protocol/blob/main/specs/PROTOCOL.md
 
+Protocol work status (2026-11-08): PE001 specifies the draft file transfer Channel envelope in PROTOCOL.md §16: independent of Sessions, one bidirectional stream per Channel, sequential operations within each Channel, and parallel Channels up to a negotiated maximum. Capability 1 selects profile version 1 and the maximum (Client default 1; recommended configurable Server cap 8); Channel kind 2 is accepted with FILES_READY (0x4000). File Channels share the Connection stream budget with terminal Channels. The current program implements no file Channel, FILES_READY message, file capability or `stpt fs` command; RE001–RE004 remain open. The implementation description below describes the existing terminal and Session architecture. Operation semantics, data transfer, resume and cross-platform paths belong to PE002–PE005.
+
 # 1	Structure
-Single Cargo package `stpt` (binary crate, edition 2024). Minimum Rust version (`rust-version`): the current stable release, now 1.99; older compilers refuse to build with a clear message.
+Single Cargo package `stpt` (binary crate, edition 2024). Minimum Rust version (`rust-version`): 1.99.1; older compilers refuse to build with a clear message.
 
 | Module | Responsibility |
 |---|---|
