@@ -28,7 +28,7 @@ use crate::terminal::{self, Attached, Command, Exit, Open, SessionId, Size};
 use crate::tls::{Expected, ServerKeyCheck, Verdict};
 use crate::trust::{self, TrustStore};
 use crate::wire::{
-    self, DEFAULT_MESSAGE_LIMIT, Failure, Message, StreamError, TERMINAL_DATA, TERMINAL_EXIT,
+    self, Code, DEFAULT_MESSAGE_LIMIT, Failure, Message, StreamError, TERMINAL_DATA, TERMINAL_EXIT,
     TERMINAL_STDERR,
 };
 
@@ -363,6 +363,8 @@ fn resolve(address: &Address) -> Result<SocketAddr, Error> {
 
 /// Connection with a trusted Server key.
 pub struct Connection {
+    files: Option<crate::files::Budget>,
+    authenticated: bool,
     endpoint: quinn::Endpoint,
     connection: quinn::Connection,
     /// Control stream once opened; kept until the Connection is closed, as dropping
@@ -422,11 +424,20 @@ impl Connection {
     }
 
     async fn exchange_hello(&mut self, deadline: Duration) -> Result<ServerHello, StreamError> {
+        self.exchange_hello_offer(deadline, ClientHello::ours())
+            .await
+    }
+
+    /// RE002 may supply `ClientHello::with_files`; terminal commands do not offer it.
+    async fn exchange_hello_offer(
+        &mut self,
+        deadline: Duration,
+        offer: ClientHello,
+    ) -> Result<ServerHello, StreamError> {
         let (send, recv) = self
             .control
             .insert(self.connection.open_bi().await.map_err(StreamError::Lost)?);
         let _ = send.set_priority(control::CONTROL_PRIORITY);
-        let offer = ClientHello::ours();
         wire::write_message(send, &offer.to_message(), DEFAULT_MESSAGE_LIMIT).await?;
         let message = reply(recv, deadline, "SERVER_HELLO", State::Handshaking).await?;
         let hello = ServerHello::from_message(&message)?;
@@ -435,6 +446,8 @@ impl Connection {
             return Err(Failure::violation("the Server does not offer publickey-ed25519").into());
         }
         self.peer_limit = hello.limits.max_message;
+        self.files = crate::files::selected(&hello.capabilities)
+            .map(|max| crate::files::Budget::new(max.min(u64::from(u32::MAX)) as u32));
         Ok(hello)
     }
 
@@ -452,7 +465,31 @@ impl Connection {
         let request = key.request(&exporter, account);
         wire::write_message(send, &request.to_message(), self.peer_limit).await?;
         let message = reply(recv, deadline, "AUTH_RESULT", State::Established).await?;
-        Ok(auth::result_from_message(&message)?)
+        let accepted = auth::result_from_message(&message)?;
+        self.authenticated = accepted;
+        Ok(accepted)
+    }
+
+    /// Opens an authenticated, negotiated file Channel; `fs` CLI follows in RE002.
+    #[cfg_attr(not(test), allow(dead_code, reason = "fs CLI comes with RE002"))]
+    pub async fn open_files(&self) -> Result<crate::files::Channel, StreamError> {
+        if !self.authenticated {
+            return Err(Failure::new(
+                Code::ChannelRejected,
+                "file Channel requires authentication",
+            )
+            .into());
+        }
+        let budget = self.files.as_ref().ok_or_else(|| {
+            Failure::new(Code::ChannelRejected, "file capability was not selected")
+        })?;
+        crate::files::Channel::open(
+            &self.connection,
+            self.peer_limit,
+            budget,
+            crate::files::OPEN_TIMEOUT,
+        )
+        .await
     }
 }
 
@@ -1375,6 +1412,8 @@ async fn connect(
                 }
                 tracing::debug!(%address, "TLS handshake completed, Server key trusted");
                 return Ok(Connection {
+                    files: None,
+                    authenticated: false,
                     endpoint,
                     connection,
                     control: None,
@@ -1656,6 +1695,60 @@ mod tests {
             hello_against(|offer| answer_frame(&ServerHello::answer(offer).unwrap())).await;
         assert_eq!(result.unwrap().version, crate::hello::WIRE_VERSION);
         assert_eq!(closed, Some(wire::Code::NoError));
+    }
+
+    #[tokio::test]
+    async fn file_api_requires_authentication_and_selected_capability() {
+        for select_files in [true, false] {
+            timeout(Duration::from_secs(3), async {
+                let key = ServerKey::generate();
+                let endpoint = quic::listen("127.0.0.1:0".parse().unwrap(), &key).unwrap();
+                let addr = endpoint.local_addr().unwrap();
+                let server = tokio::spawn(async move {
+                    let connection = quic::accept(endpoint.accept().await.unwrap()).await.unwrap();
+                    let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+                    let hello = wire::read_message(&mut recv, DEFAULT_MESSAGE_LIMIT).await.unwrap().unwrap();
+                    let offer = ClientHello::from_message(&hello).unwrap();
+                    let answer = ServerHello::answer_with_files(&offer, if select_files { 8 } else { 0 }).unwrap();
+                    wire::write_message(&mut send, &answer.to_message(), DEFAULT_MESSAGE_LIMIT).await.unwrap();
+                    let auth = wire::read_message(&mut recv, DEFAULT_MESSAGE_LIMIT).await.unwrap().unwrap();
+                    assert_eq!(auth.kind, wire::AUTH_REQUEST);
+                    wire::write_message(&mut send, &auth::result_message(true), DEFAULT_MESSAGE_LIMIT).await.unwrap();
+                    connection.set_max_concurrent_bi_streams(quinn::VarInt::from_u32(11));
+                    if select_files {
+                        let (send, mut recv) = connection.accept_bi().await.unwrap();
+                        let open = wire::read_message(&mut recv, DEFAULT_MESSAGE_LIMIT).await.unwrap().unwrap();
+                        assert_eq!(control::channel_kind(&open).unwrap(), crate::files::KIND);
+                        crate::files::serve(send, recv, DEFAULT_MESSAGE_LIMIT, &crate::files::Budget::new(1)).await.unwrap();
+                    }
+                    // Retain the control stream through Connection close.
+                    connection.closed().await;
+                });
+                let path = store_path(&format!("files-{}", addr.port()));
+                let mut store = TrustStore::load(path.clone()).unwrap();
+                let remote = Remote {
+                    destination: format!("alice@{addr}").parse().unwrap(),
+                    fingerprint: Some(key.public_key().fingerprint()),
+                    identity: None,
+                };
+                let mut connection = connect(&remote, addr, &mut store, never_asked).await.unwrap();
+                assert!(matches!(connection.open_files().await, Err(StreamError::Failure(failure)) if failure.code == Code::ChannelRejected));
+                connection.exchange_hello_offer(Duration::from_secs(1), ClientHello::with_files(1)).await.unwrap();
+                assert!(matches!(connection.open_files().await, Err(StreamError::Failure(failure)) if failure.code == Code::ChannelRejected));
+                assert!(connection.authenticate("alice", &UserKey::generate(), Duration::from_secs(1)).await.unwrap());
+                if select_files {
+                    let channel = connection.open_files().await.unwrap();
+                    assert!(matches!(connection.open_files().await, Err(StreamError::Failure(failure)) if failure.code == Code::LimitExceeded));
+                    channel.close().await.unwrap();
+                } else {
+                    assert!(matches!(connection.open_files().await, Err(StreamError::Failure(failure)) if failure.code == Code::ChannelRejected));
+                }
+                assert!(connection.connection.close_reason().is_none());
+                connection.close().await;
+                server.await.unwrap();
+                std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+            }).await.unwrap();
+        }
     }
 
     fn protocol_code(result: Result<ServerHello, Error>) -> wire::Code {

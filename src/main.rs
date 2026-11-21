@@ -12,6 +12,7 @@ mod console;
 mod control;
 mod destination;
 mod error;
+mod files;
 mod hello;
 mod identity;
 mod listing;

@@ -80,6 +80,19 @@ pub struct ServerHello {
 }
 
 impl ClientHello {
+    /// Offers the file Channel envelope; operations are implemented separately.
+    /// Terminal-only commands keep using `ours()` without this capability.
+    #[cfg_attr(not(test), allow(dead_code, reason = "used by the future fs command"))]
+    pub fn with_files(max_channels: u64) -> Self {
+        assert!(max_channels > 0);
+        let mut hello = Self::ours();
+        hello.capabilities.push((
+            crate::files::CAPABILITY,
+            crate::files::parameters(max_channels),
+        ));
+        hello
+    }
+
     /// CLIENT_HELLO of this implementation: its versions, no capabilities, and one
     /// random GREASE version and capability (§11.5) to keep Servers tolerant.
     pub fn ours() -> Self {
@@ -127,9 +140,14 @@ impl ClientHello {
 }
 
 impl ServerHello {
-    /// The Server's answer: the selected version, no capabilities (none is defined
-    /// yet, so every offered one is unknown and ignored), its limits and methods.
+    /// Terminal-only answer, also used by compatibility tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn answer(hello: &ClientHello) -> Result<Self, Failure> {
+        Self::answer_with_files(hello, 0)
+    }
+
+    /// Select the file capability only for a valid offer and enabled policy.
+    pub fn answer_with_files(hello: &ClientHello, file_cap: u32) -> Result<Self, Failure> {
         let version = select_version(&hello.versions, SUPPORTED_VERSIONS).ok_or_else(|| {
             Failure::new(
                 Code::VersionNegotiationFailed,
@@ -138,7 +156,7 @@ impl ServerHello {
         })?;
         Ok(Self {
             version,
-            capabilities: Vec::new(),
+            capabilities: crate::files::select(&hello.capabilities, file_cap),
             limits: Limits::default(),
             auth_methods: vec![AUTH_PUBLICKEY_ED25519],
         })
@@ -193,6 +211,7 @@ impl ServerHello {
                 )));
             }
         }
+        crate::files::check_selection(&self.capabilities, &offered.capabilities)?;
         Ok(())
     }
 }

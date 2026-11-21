@@ -33,6 +33,8 @@ pub struct ClientConfig {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
+    /// Per-Connection file Channel cap; default 8, 0 disables negotiation.
+    pub max_file_channels: Option<u32>,
     /// Address and UDP port to listen on.
     pub listen: Option<SocketAddr>,
     /// Log level when neither `-v` nor `-q` is given.
@@ -169,6 +171,22 @@ mod tests {
         assert!(parse::<ServerConfig>(r#"lisen = "[::]:843""#).is_err());
         assert!(parse::<ClientConfig>("detach_timout = 60").is_err());
         assert!(parse::<ClientConfig>("").is_ok());
+    }
+
+    #[test]
+    fn file_channel_policy() {
+        assert_eq!(parse::<ServerConfig>("").unwrap().max_file_channels, None);
+        for cap in [0, 1, 8, u32::MAX] {
+            let text = format!("max_file_channels = {cap}");
+            assert_eq!(
+                parse::<ServerConfig>(&text).unwrap().max_file_channels,
+                Some(cap)
+            );
+        }
+        for value in ["-1", "4294967296", "1.5", "\"8\""] {
+            assert!(parse::<ServerConfig>(&format!("max_file_channels = {value}")).is_err());
+        }
+        assert!(parse::<ClientConfig>("max_file_channels = 2").is_err());
     }
 
     #[test]

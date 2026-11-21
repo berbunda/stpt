@@ -68,6 +68,7 @@ impl Default for Deadlines {
 
 /// What the Connections of a Server share.
 pub struct Shared {
+    pub max_file_channels: u32,
     pub deadlines: Deadlines,
     pub authorizer: Authorizer,
     #[cfg(unix)]
@@ -113,6 +114,9 @@ pub fn run(
     let listen = listen_address(listen, &config);
     quic::runtime()?.block_on(async {
         let shared = Arc::new(Shared {
+            max_file_channels: config
+                .max_file_channels
+                .unwrap_or(crate::files::DEFAULT_SERVER_CAP),
             deadlines: Deadlines::DEFAULT,
             authorizer: Authorizer::new(keys_dir, Box::new(SystemAccounts)),
             #[cfg(unix)]
@@ -248,7 +252,7 @@ async fn serve_connection(
         )
     })??;
     let hello = ClientHello::from_message(&message)?;
-    let answer = ServerHello::answer(&hello)?;
+    let answer = ServerHello::answer_with_files(&hello, shared.max_file_channels)?;
     let peer_limit = hello.limits.max_message;
     wire::write_message(&mut send, &answer.to_message(), peer_limit).await?;
     let established = Instant::now();
@@ -275,6 +279,8 @@ async fn serve_connection(
     // §8.2, §14.5: Channels become available.
     connection.set_max_concurrent_bi_streams(VarInt::from_u32(1 + MAX_CHANNELS));
     let context = ChannelContext {
+        files: crate::files::selected(&answer.capabilities)
+            .map(|max| crate::files::Budget::new(max as u32)),
         account: accepted.account.clone(),
         key: KeyInfo {
             key: accepted.key,
@@ -425,6 +431,7 @@ async fn authenticate(
 #[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Clone)]
 struct ChannelContext {
+    files: Option<crate::files::Budget>,
     account: String,
     key: KeyInfo,
     peer_limit: u64,
@@ -435,8 +442,8 @@ struct ChannelContext {
 }
 
 /// Streams the Client opens on an Authenticated Connection: each must start with
-/// CHANNEL_OPEN (§8.3). Terminal Channels are served; another kind is rejected with
-/// CHANNEL_REJECTED, and the Connection stays open.
+/// CHANNEL_OPEN (§8.3). Terminal and negotiated file Channels are dispatched;
+/// unknown kinds are rejected without closing the Connection.
 async fn accept_channels(connection: Connection, context: ChannelContext) {
     while let Ok((send, recv)) = connection.accept_bi().await {
         tokio::spawn(open_channel(
@@ -458,6 +465,15 @@ async fn open_channel(
     let remote = connection.remote_address();
     let failure = match wire::read_message(&mut recv, DEFAULT_MESSAGE_LIMIT).await {
         Ok(Some(message)) => match control::channel_kind(&message) {
+            Ok(crate::files::KIND) => match &context.files {
+                None => Failure::violation("file Channel without negotiated capability"),
+                Some(budget) => {
+                    match crate::files::serve(send, recv, context.peer_limit, budget).await {
+                        Ok(()) => return,
+                        Err(failure) => failure,
+                    }
+                }
+            },
             #[cfg(unix)]
             Ok(control::TERMINAL) => {
                 let channel = crate::attachment::Channel {
@@ -593,6 +609,7 @@ mod tests {
             #[cfg(unix)]
             let store = Store::start(Policy::DEFAULT);
             Self::serve(deadlines, account, |authorizer| Shared {
+                max_file_channels: crate::files::DEFAULT_SERVER_CAP,
                 deadlines,
                 authorizer,
                 #[cfg(unix)]
@@ -605,6 +622,7 @@ mod tests {
         async fn start_with(policy: Policy, account: &str) -> Self {
             let store = Store::start(policy);
             Self::serve(Deadlines::DEFAULT, account, |authorizer| Shared {
+                max_file_channels: crate::files::DEFAULT_SERVER_CAP,
                 deadlines: Deadlines::DEFAULT,
                 authorizer,
                 store,
@@ -702,6 +720,27 @@ mod tests {
             (send, recv)
         }
 
+        async fn authenticated_files(&self, max: u64) -> (quinn::SendStream, quinn::RecvStream) {
+            let (mut send, mut recv) = self.connection.open_bi().await.unwrap();
+            let offer = ClientHello::with_files(max);
+            send.write_all(&hello_frame(&offer)).await.unwrap();
+            let message = wire::read_message(&mut recv, DEFAULT_MESSAGE_LIMIT)
+                .await
+                .unwrap()
+                .unwrap();
+            let answer = ServerHello::from_message(&message).unwrap();
+            answer.check(&offer).unwrap();
+            assert_eq!(
+                crate::files::selected(&answer.capabilities),
+                Some(max.min(u64::from(crate::files::DEFAULT_SERVER_CAP)))
+            );
+            send.write_all(&self.request(&self.user, &self.account))
+                .await
+                .unwrap();
+            assert!(auth_result(&mut recv).await);
+            (send, recv)
+        }
+
         /// AUTH_REQUEST of `key` for `account`, signed for this Connection.
         fn request(&self, key: &UserKey, account: &str) -> Vec<u8> {
             let exporter = auth::exporter(&self.connection).unwrap();
@@ -792,6 +831,98 @@ mod tests {
         for id in [7, 8, u64::MAX] {
             assert_eq!(request(&mut send, &mut recv, id).await, LIST_RESULT);
         }
+    }
+
+    /// File Channels use the real authenticated Connection dispatcher on both OSes.
+    #[tokio::test]
+    async fn file_channels_limit_close_and_control_independence() {
+        timeout(Duration::from_secs(5), async {
+            let peer = Peer::start(Deadlines::default()).await;
+            let (mut control_send, mut control_recv) = peer.authenticated_files(2).await;
+            let budget = crate::files::Budget::new(3); // Bypass local cap to exercise Server enforcement.
+            let open = || crate::files::Channel::open(&peer.connection, DEFAULT_MESSAGE_LIMIT, &budget, Duration::from_secs(1));
+            let first = open().await.unwrap();
+            let second = open().await.unwrap();
+            assert!(matches!(open().await, Err(StreamError::Reset(code)) if code == Code::LimitExceeded.varint()));
+            assert_eq!(request(&mut control_send, &mut control_recv, 1).await, LIST_RESULT);
+            first.close().await.unwrap();
+            // The Server may still be processing the FIN ACK when a new stream arrives.
+            let next = loop {
+                match open().await {
+                    Ok(channel) => break channel,
+                    Err(StreamError::Reset(code)) if code == Code::LimitExceeded.varint() => tokio::task::yield_now().await,
+                    Err(error) => panic!("{error:?}"),
+                }
+            };
+            drop(second); // Explicit stream cancellation; the Connection remains live.
+            next.close().await.unwrap();
+            assert_eq!(request(&mut control_send, &mut control_recv, 2).await, LIST_RESULT);
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn file_channel_without_capability_is_a_connection_violation() {
+        timeout(Duration::from_secs(3), async {
+            let peer = Peer::start(Deadlines::default()).await;
+            let (_send, _recv) = peer.authenticated().await;
+            let (mut send, _recv) = peer.connection.open_bi().await.unwrap();
+            send.write_all(&frame(&channel_open(crate::files::KIND).encode()))
+                .await
+                .unwrap();
+            assert_eq!(peer.closed_with().await, Some(Code::ProtocolViolation));
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_messages_on_ready_file_channel_close_connection() {
+        for kind in [
+            wire::CHANNEL_OPEN,
+            wire::FILES_READY,
+            wire::TERMINAL_DATA,
+            0x4008,
+        ] {
+            timeout(Duration::from_secs(3), async {
+                let peer = Peer::start(Deadlines::default()).await;
+                let (_send, _recv) = peer.authenticated_files(1).await;
+                let (mut send, mut recv) = peer.connection.open_bi().await.unwrap();
+                send.write_all(&frame(&channel_open(crate::files::KIND).encode()))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    wire::read_message(&mut recv, DEFAULT_MESSAGE_LIMIT)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .kind,
+                    wire::FILES_READY
+                );
+                send.write_all(&frame(&Message::new(kind, vec![]).encode()))
+                    .await
+                    .unwrap();
+                assert_eq!(peer.closed_with().await, Some(Code::ProtocolViolation));
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn unimplemented_file_operation_aborts_only_its_channel() {
+        timeout(Duration::from_secs(3), async {
+            let peer = Peer::start(Deadlines::default()).await;
+            let (mut control_send, mut control_recv) = peer.authenticated_files(1).await;
+            let (mut send, mut recv) = peer.connection.open_bi().await.unwrap();
+            send.write_all(&frame(&channel_open(crate::files::KIND).encode())).await.unwrap();
+            assert_eq!(wire::read_message(&mut recv, DEFAULT_MESSAGE_LIMIT).await.unwrap().unwrap().kind, wire::FILES_READY);
+            // A stat request has no filesystem effect in the envelope-only implementation.
+            let path = Value::Array(vec![Value::Uint(0), Value::Array(vec![])]);
+            let operation = Message::new(wire::FILE_REQUEST, vec![(0, Value::Uint(0)), (1, Value::Uint(3)), (2, path)]);
+            send.write_all(&frame(&operation.encode())).await.unwrap();
+            assert!(matches!(wire::read_message(&mut recv, DEFAULT_MESSAGE_LIMIT).await, Err(StreamError::Reset(code)) if code == Code::InternalError.varint()));
+            assert_eq!(request(&mut control_send, &mut control_recv, 3).await, LIST_RESULT);
+        }).await.unwrap();
     }
 
     #[tokio::test]
@@ -1217,6 +1348,39 @@ mod tests {
                 output(&mut recv).await,
                 ("abc".into(), "err\n".into(), Exit::Code(5))
             );
+        }
+
+        #[tokio::test]
+        async fn file_channel_close_does_not_end_terminal_session() {
+            timeout(Duration::from_secs(5), async {
+                let peer = Peer::start_with(FAST, &me()).await;
+                let control = peer.authenticated_files(1).await;
+                let a = Authenticated { peer, control };
+                let budget = crate::files::Budget::new(1);
+                let files = crate::files::Channel::open(
+                    &a.peer.connection,
+                    DEFAULT_MESSAGE_LIMIT,
+                    &budget,
+                    Duration::from_secs(1),
+                )
+                .await
+                .unwrap();
+                let (mut send, mut recv) = a.open(&command("cat", false)).await;
+                attached(&mut recv).await;
+                files.close().await.unwrap();
+                write(
+                    &mut send,
+                    &terminal::data(wire::TERMINAL_DATA, b"still running"),
+                )
+                .await;
+                write(&mut send, &terminal::eof()).await;
+                assert_eq!(
+                    output(&mut recv).await,
+                    ("still running".into(), "".into(), Exit::Code(0))
+                );
+            })
+            .await
+            .unwrap();
         }
 
         #[tokio::test]

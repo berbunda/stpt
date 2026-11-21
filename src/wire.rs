@@ -29,6 +29,10 @@ pub const REQUEST_RESULT: u64 = 29;
 pub const SESSION_DETACH: u64 = 30;
 pub const SESSION_LIST: u64 = 31;
 
+/// File capability envelope (§16.2) and operation-dispatch boundary (§16.5).
+pub const FILES_READY: u64 = 0x4000;
+pub const FILE_REQUEST: u64 = 0x4001;
+
 /// Error codes (§13.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Code {

@@ -43,7 +43,7 @@ IDs A001–D008 were renamed to RA001–RD008 on 2026-10-11 (prefix scheme chang
 - [x] RD010  detach from another window: all Attachments or one by ID ← PD003 ➕ 2026-10-13 ✅ 2026-10-18
 
 # 5	Tier RE — File Transfer
-- [ ] RE001  file transfer Channel ← PE001 ➕ 2026-10-13
+- [x] RE001  file transfer Channel ← PE001 ➕ 2026-10-13 ✅ 2026-11-21
 - [ ] RE002  `stpt fs`: transfer and file management ← PE002, PE003 ➕ 2026-10-13
 - [ ] RE003  resume of transfers ← PE004 ➕ 2026-10-13
 - [ ] RE004  metadata and Windows paths ← PE005 ➕ 2026-10-13

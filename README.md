@@ -59,6 +59,9 @@ A lost connection in `connect` is repaired automatically: the Client notices it 
 - The Client stops trying after an hour (`reattach_timeout`, see Configuration), and at once if the Server key has changed, your key is refused or the Session is gone.
 - `exec` does not reconnect: it reports the lost connection and exits with 255. Input is not numbered like output, so reconnecting could silently lose part of what a pipe sends to the command.
 
+# File service
+The file Channel envelope is implemented (RE001): negotiation, opening, limits and closing. File operations and `stpt fs` are not available yet (RE002–RE004). Terminal commands do not offer the file capability. An external Client can negotiate and open the envelope, but an operation request currently aborts only that Channel with INTERNAL_ERROR.
+
 # Private key, public key, fingerprint
 Three different texts appear around keys. Do not mix them up.
 
@@ -140,6 +143,7 @@ listen = "[::]:843"   # address and UDP port; IPv6 addresses in brackets; [::] a
 log_level = "info"    # error, warn, info, debug or trace; -v and -q override it
 identity_key = "/etc/stpt/server_key"   # Server key file, created if missing
 authorized_keys = "/etc/stpt/authorized_keys"   # directory of authorized user keys, one file per Account
+max_file_channels = 8   # per Connection; 0 disables file capability negotiation
 exit_grace = 1   # seconds output is still sent after the program of a Session exited (0–60)
 ```
 </details>
