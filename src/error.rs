@@ -17,6 +17,7 @@ pub const EXIT_STPT_ERROR: u8 = 255;
 
 #[derive(Debug)]
 pub enum Error {
+    Files(crate::file_client::Error),
     Config(config::Error),
     Transport(quic::Error),
     /// Server mode on a platform without it (gate G2).
@@ -98,6 +99,7 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Files(e) => write!(f, "fs: {e}"),
             Self::Config(e) => write!(f, "config: {e}"),
             Self::Transport(e) => write!(f, "transport: {e}"),
             Self::ServerUnavailable => {

@@ -51,6 +51,19 @@ pub fn run(command: ClientCommand, common: &Common) -> Result<ExitCode, Error> {
     config::log_source(path.as_deref());
 
     let (remote, action) = match command {
+        ClientCommand::Fs { action } => {
+            let (remote, mut operation) = crate::file_client::split(action);
+            operation.max_size = config
+                .max_file_size
+                .unwrap_or(crate::file_protocol::DEFAULT_MAX_SIZE);
+            (
+                remote,
+                Action::Files(
+                    operation,
+                    Duration::from_secs(config.file_timeout.unwrap_or(60)),
+                ),
+            )
+        }
         ClientCommand::Trust { action } => return trust_command(action),
         ClientCommand::Connect {
             remote,
@@ -113,7 +126,14 @@ pub fn run(command: ClientCommand, common: &Common) -> Result<ExitCode, Error> {
     let runtime = quic::runtime()?;
     let _guard = runtime.enter();
     let addr = resolve(&remote.destination.address)?;
-    let mut connection = runtime.block_on(login_to(&remote, addr, &mut store, &key, ask_user))?;
+    let mut connection = runtime.block_on(login_to_offer(
+        &remote,
+        addr,
+        &mut store,
+        &key,
+        ask_user,
+        matches!(&action, Action::Files(..)),
+    ))?;
     let mut login = Login {
         remote: &remote,
         store: &mut store,
@@ -143,8 +163,29 @@ async fn login_to(
     key: &UserKey,
     confirm: impl Fn(&Address, &Fingerprint) -> Result<bool, Error>,
 ) -> Result<Connection, Error> {
+    login_to_offer(remote, addr, store, key, confirm, false).await
+}
+
+async fn login_to_offer(
+    remote: &Remote,
+    addr: SocketAddr,
+    store: &mut TrustStore,
+    key: &UserKey,
+    confirm: impl Fn(&Address, &Fingerprint) -> Result<bool, Error>,
+    files: bool,
+) -> Result<Connection, Error> {
     let mut connection = connect(remote, addr, store, confirm).await?;
-    let hello = connection.hello(SERVER_HELLO_TIMEOUT).await?;
+    let hello = if files {
+        match connection
+            .exchange_hello_offer(SERVER_HELLO_TIMEOUT, ClientHello::with_files(1))
+            .await
+        {
+            Ok(hello) => hello,
+            Err(error) => return Err(connection.failed(error).await),
+        }
+    } else {
+        connection.hello(SERVER_HELLO_TIMEOUT).await?
+    };
     tracing::info!(
         version = format_args!("{:#x}", hello.version),
         "Connection established"
@@ -167,6 +208,7 @@ async fn login_to(
 
 /// What a Client command does once the Connection is Authenticated.
 enum Action {
+    Files(crate::file_client::Operation, Duration),
     /// A new Session: its terminal Channel, and whether it has a PTY.
     Terminal(Open, bool),
     Attach {
@@ -191,6 +233,32 @@ async fn perform(
     login: &mut Login<'_>,
 ) -> Result<ExitCode, Error> {
     match action {
+        Action::Files(operation, deadline) => {
+            let mut channel = connection
+                .open_files()
+                .await
+                .map_err(|e| Error::Files(e.into()))?;
+            let result = tokio::select! {
+                result=crate::file_client::run(&mut channel,operation,connection.peer_limit,deadline)=>result.map_err(Error::Files),
+                _=tokio::signal::ctrl_c()=>Err(Error::Interrupted),
+                reason=connection.connection.closed()=>Err(Error::Files(crate::file_client::Error::Stream(StreamError::Lost(reason)))),
+                ()=follow_network(connection.endpoint.clone(),connection.connection.remote_address())=>unreachable!(),
+            };
+            if result.is_ok()
+                && let Err(error) = channel.close().await
+            {
+                match error {
+                    StreamError::Failure(f) => {
+                        return Err(Error::Files(crate::file_client::Error::Protocol(f)));
+                    }
+                    _ => tracing::debug!(
+                        ?error,
+                        "file operation completed before Channel teardown failed"
+                    ),
+                }
+            }
+            result.map(|()| ExitCode::SUCCESS)
+        }
         Action::Terminal(open, pty) => terminal(connection, open, pty, login)
             .await
             .map(outcome_code),
@@ -428,7 +496,7 @@ impl Connection {
             .await
     }
 
-    /// RE002 may supply `ClientHello::with_files`; terminal commands do not offer it.
+    /// File commands supply `ClientHello::with_files`; terminal commands do not offer it.
     async fn exchange_hello_offer(
         &mut self,
         deadline: Duration,
@@ -470,8 +538,7 @@ impl Connection {
         Ok(accepted)
     }
 
-    /// Opens an authenticated, negotiated file Channel; `fs` CLI follows in RE002.
-    #[cfg_attr(not(test), allow(dead_code, reason = "fs CLI comes with RE002"))]
+    /// Opens an authenticated, negotiated file Channel for `fs`.
     pub async fn open_files(&self) -> Result<crate::files::Channel, StreamError> {
         if !self.authenticated {
             return Err(Failure::new(

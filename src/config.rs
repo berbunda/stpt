@@ -23,6 +23,12 @@ pub const SERVER_PATH: &str = "/etc/stpt/server.toml";
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
+    /// Maximum logical file size (default 8 GiB).
+    #[serde(default, deserialize_with = "file_size_limit")]
+    pub max_file_size: Option<u64>,
+    /// No-progress file operation deadline in seconds (default 60).
+    #[serde(default, deserialize_with = "file_deadline")]
+    pub file_timeout: Option<u64>,
     /// Seconds a new Session may stay without an Attachment (PROTOCOL.md §15.8).
     pub detach_timeout: Option<u64>,
     /// Seconds automatic reattach keeps trying after the loss of a Connection (§15.12);
@@ -33,6 +39,12 @@ pub struct ClientConfig {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
+    /// Maximum logical size of one file transfer (default 8 GiB).
+    #[serde(default, deserialize_with = "file_size_limit")]
+    pub max_file_size: Option<u64>,
+    /// No-progress deadline for file operations in seconds (default 60).
+    #[serde(default, deserialize_with = "file_deadline")]
+    pub file_timeout: Option<u64>,
     /// Per-Connection file Channel cap; default 8, 0 disables negotiation.
     pub max_file_channels: Option<u32>,
     /// Address and UDP port to listen on.
@@ -49,6 +61,21 @@ pub struct ServerConfig {
     #[cfg_attr(not(unix), allow(dead_code))]
     #[serde(default, deserialize_with = "exit_grace")]
     pub exit_grace: Option<Duration>,
+}
+
+fn file_size_limit<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    let value = u64::deserialize(d)?;
+    if value > crate::file_protocol::MAX_SIZE {
+        return Err(D::Error::custom("max_file_size exceeds wire size bound"));
+    }
+    Ok(Some(value))
+}
+fn file_deadline<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    let value = u64::deserialize(d)?;
+    if !(1..=86400).contains(&value) {
+        return Err(D::Error::custom("file_timeout must be 1 to 86400 seconds"));
+    }
+    Ok(Some(value))
 }
 
 /// Longest exit grace period accepted, in seconds.
@@ -187,6 +214,28 @@ mod tests {
             assert!(parse::<ServerConfig>(&format!("max_file_channels = {value}")).is_err());
         }
         assert!(parse::<ClientConfig>("max_file_channels = 2").is_err());
+    }
+
+    #[test]
+    fn file_limits_and_deadlines_are_validated() {
+        assert_eq!(
+            parse::<ServerConfig>("max_file_size = 8589934592\nfile_timeout = 120")
+                .unwrap()
+                .file_timeout,
+            Some(120)
+        );
+        assert!(parse::<ServerConfig>("max_file_size = 2305843009213693952").is_err());
+        for bad in ["0", "86401", "-1", "1.5", "\"60\""] {
+            let t = format!("file_timeout = {bad}");
+            assert!(parse::<ClientConfig>(&t).is_err());
+            assert!(parse::<ServerConfig>(&t).is_err());
+        }
+        assert_eq!(
+            parse::<ClientConfig>("file_timeout = 30")
+                .unwrap()
+                .file_timeout,
+            Some(30)
+        );
     }
 
     #[test]

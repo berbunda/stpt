@@ -1,24 +1,26 @@
 [package]
 name = "stpt"
-version = "0.3.3-0"
+version = "0.3.4-0"
 edition = "2024"
-rust-version = "1.99.1"
+rust-version = "1.100.0"
 
 [dependencies]
 aws-lc-rs = { version = "1.19", default-features = false, features = ["aws-lc-sys"] }
 base64 = { version = "0.23.1", default-features = false, features = ["std"] }
+# PE003 requires BLAKE3; use its maintained reference implementation.
+blake3 = { version = "1", default-features = false, features = ["std"] }
 clap = { version = "4.6", features = ["derive"] }
 quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
 rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "std"] }
 serde = { version = "1", features = ["derive"] }
 socket2 = "0.6"
-tokio = { version = "1.54", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.54", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 toml = { version = "1.2", default-features = false, features = ["std", "parse", "serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.32.0", default-features = false, features = ["fs", "ioctl", "process", "signal", "term", "user"] }
+nix = { version = "0.32.0", default-features = false, features = ["dir", "fs", "ioctl", "process", "signal", "term", "user"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }

@@ -1,4 +1,4 @@
-//! Processes of a Session (Unix; PROTOCOL.md §14.6).
+//! Processes of a Session and the credential-isolated file worker (Unix).
 //!
 //! The Server starts the login shell or the command of a Session as the Account: in a
 //! new session (`setsid`), with a PTY slave as controlling terminal and as standard
@@ -104,6 +104,53 @@ pub struct Account {
 }
 
 impl Account {
+    /// Executes the same binary directly as the Account, without its login shell.
+    /// Credentials change only in the fork/exec child, never on a Tokio thread.
+    pub fn file_worker(&self, peer_limit: u64, max_size: u64) -> io::Result<Child> {
+        let root = nix::unistd::geteuid().is_root();
+        if !root
+            && (self.uid != nix::unistd::geteuid()
+                || !self.groups.contains(&nix::unistd::getegid())
+                || nix::unistd::getgroups()?
+                    .iter()
+                    .any(|g| !self.groups.contains(g)))
+        {
+            return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        }
+        // On Linux exec the image already running, including after unlink or a
+        // package update. Resolving its original pathname after dropping UID can
+        // fail when a parent directory is private to the Server administrator.
+        #[cfg(target_os = "linux")]
+        let executable = PathBuf::from("/proc/self/exe");
+        #[cfg(not(target_os = "linux"))]
+        let executable = std::env::current_exe()?;
+        let mut c = Command::new(executable);
+        c.arg("__stpt-file-worker")
+            .arg(peer_limit.to_string())
+            .arg(max_size.to_string())
+            .env_clear()
+            .current_dir("/")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true);
+        let (uid, gid, groups) = (self.uid, self.gid, self.groups.clone());
+        // SAFETY: only async-signal-safe credential/session syscalls before exec;
+        // the vector is prepared in the parent and never mutated by this closure.
+        unsafe {
+            c.pre_exec(move || {
+                nix::unistd::setsid()?;
+                if root {
+                    nix::unistd::setgroups(&groups)?;
+                    nix::unistd::setgid(gid)?;
+                    nix::unistd::setuid(uid)?;
+                }
+                Ok(())
+            });
+        }
+        c.spawn()
+    }
+
     /// Looks the Account up (`getpwnam`, `getgrouplist`); blocks.
     pub fn lookup(name: &str) -> io::Result<Option<Account>> {
         let Some(user) = User::from_name(name)? else {

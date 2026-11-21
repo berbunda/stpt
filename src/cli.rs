@@ -89,6 +89,11 @@ const DETACH_NOTE: &str = "Closing the window or losing the connection only deta
 /// Subcommands of the Client role.
 #[derive(Debug, Subcommand)]
 pub enum ClientCommand {
+    /// Transfer files and manage Server files (no terminal Session)
+    Fs {
+        #[command(subcommand)]
+        action: FsAction,
+    },
     /// Open an interactive terminal in a new or an existing Session
     #[command(after_help = DETACH_NOTE)]
     Connect {
@@ -168,6 +173,68 @@ pub enum ClientCommand {
     },
 }
 
+#[derive(Debug, Args)]
+pub struct FsPath {
+    #[command(flatten)]
+    pub remote: Remote,
+    /// Absolute POSIX path on the Server (no shell expansion)
+    pub path: String,
+}
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum FileHash {
+    Blake3,
+    Sha256,
+}
+impl FileHash {
+    pub fn id(self) -> u64 {
+        match self {
+            Self::Blake3 => 1,
+            Self::Sha256 => 2,
+        }
+    }
+}
+#[derive(Debug, Subcommand)]
+pub enum FsAction {
+    /// Download one regular file; destination must be a file path
+    Pull {
+        #[command(flatten)]
+        target: FsPath,
+        local: PathBuf,
+        #[arg(long)]
+        replace: bool,
+        #[arg(long, value_enum, default_value = "blake3")]
+        hash: FileHash,
+    },
+    /// Upload one regular file to an absolute Server path
+    Push {
+        #[command(flatten)]
+        remote: Remote,
+        local: PathBuf,
+        path: String,
+        #[arg(long)]
+        replace: bool,
+        #[arg(long, value_enum, default_value = "blake3")]
+        hash: FileHash,
+    },
+    /// Inspect a directory entry without following its final symlink
+    Stat(FsPath),
+    /// List one directory (not recursive)
+    List(FsPath),
+    /// Create one directory; parents must already exist
+    Mkdir(FsPath),
+    /// Remove one entry or empty directory (not recursive)
+    Remove(FsPath),
+    /// Atomically rename an entry; no cross-filesystem fallback
+    Rename {
+        #[command(flatten)]
+        target: FsPath,
+        #[arg(id = "new_path", value_name = "DESTINATION")]
+        destination: String,
+        #[arg(long)]
+        replace: bool,
+    },
+}
+
 /// Server of a Client command and how its key is verified at first contact.
 #[derive(Debug, Args)]
 pub struct Remote {
@@ -244,6 +311,38 @@ mod tests {
     #[test]
     fn definition_is_consistent() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn fs_commands_are_explicit_and_have_remote_options() {
+        for command in ["stat", "list", "mkdir", "remove"] {
+            assert!(
+                parse(&[
+                    "fs",
+                    command,
+                    "alice@host",
+                    "/tmp/file",
+                    "--fingerprint",
+                    "SHA256:mskzIR8pKPbyewk8I+WgXjvBQaQbFA9RwVO8MvQ0apc"
+                ])
+                .is_ok()
+            );
+        }
+        assert!(
+            parse(&[
+                "fs",
+                "push",
+                "alice@host",
+                "local",
+                "/remote",
+                "--hash",
+                "sha256"
+            ])
+            .is_ok()
+        );
+        assert!(parse(&["fs", "pull", "alice@host", "/remote", "local", "--replace"]).is_ok());
+        assert!(parse(&["fs", "rename", "alice@host", "/old", "/new", "--replace"]).is_ok());
+        assert!(parse(&["fs", "remove", "alice@host", "/remote", "--recursive"]).is_err());
     }
 
     #[test]

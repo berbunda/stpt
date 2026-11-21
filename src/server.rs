@@ -68,6 +68,10 @@ impl Default for Deadlines {
 
 /// What the Connections of a Server share.
 pub struct Shared {
+    #[cfg(unix)]
+    pub file_workers: Arc<tokio::sync::Semaphore>,
+    pub max_file_size: u64,
+    pub file_timeout: Duration,
     pub max_file_channels: u32,
     pub deadlines: Deadlines,
     pub authorizer: Authorizer,
@@ -114,6 +118,12 @@ pub fn run(
     let listen = listen_address(listen, &config);
     quic::runtime()?.block_on(async {
         let shared = Arc::new(Shared {
+            #[cfg(unix)]
+            file_workers: Arc::new(tokio::sync::Semaphore::new(32)),
+            max_file_size: config
+                .max_file_size
+                .unwrap_or(crate::file_protocol::DEFAULT_MAX_SIZE),
+            file_timeout: Duration::from_secs(config.file_timeout.unwrap_or(60)),
             max_file_channels: config
                 .max_file_channels
                 .unwrap_or(crate::files::DEFAULT_SERVER_CAP),
@@ -130,8 +140,20 @@ pub fn run(
         let stop = stop_signal().map_err(Error::Signals)?;
         tracing::info!(listen = %local, "listening");
         tokio::select! {
-            () = serve(endpoint.clone(), shared) => {}
+            () = serve(endpoint.clone(), shared.clone()) => {}
             signal = stop => shut_down(&endpoint, signal).await,
+        }
+        #[cfg(unix)]
+        if timeout(
+            Duration::from_secs(3),
+            shared.file_workers.clone().acquire_many_owned(32),
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!(
+                "file workers did not finish shutdown cleanup; private staging may remain"
+            );
         }
         Ok(ExitCode::SUCCESS)
     })
@@ -279,6 +301,10 @@ async fn serve_connection(
     // §8.2, §14.5: Channels become available.
     connection.set_max_concurrent_bi_streams(VarInt::from_u32(1 + MAX_CHANNELS));
     let context = ChannelContext {
+        #[cfg(unix)]
+        file_workers: shared.file_workers.clone(),
+        max_file_size: shared.max_file_size,
+        file_timeout: shared.file_timeout,
         files: crate::files::selected(&answer.capabilities)
             .map(|max| crate::files::Budget::new(max as u32)),
         account: accepted.account.clone(),
@@ -431,6 +457,10 @@ async fn authenticate(
 #[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Clone)]
 struct ChannelContext {
+    #[cfg(unix)]
+    file_workers: Arc<tokio::sync::Semaphore>,
+    max_file_size: u64,
+    file_timeout: Duration,
     files: Option<crate::files::Budget>,
     account: String,
     key: KeyInfo,
@@ -468,7 +498,23 @@ async fn open_channel(
             Ok(crate::files::KIND) => match &context.files {
                 None => Failure::violation("file Channel without negotiated capability"),
                 Some(budget) => {
-                    match crate::files::serve(send, recv, context.peer_limit, budget).await {
+                    #[cfg(unix)]
+                    let result = crate::files::serve_account(
+                        send,
+                        recv,
+                        context.peer_limit,
+                        budget,
+                        crate::files::Service {
+                            account: &context.account,
+                            max_size: context.max_file_size,
+                            timeout: context.file_timeout,
+                            workers: context.file_workers.clone(),
+                        },
+                    )
+                    .await;
+                    #[cfg(not(unix))]
+                    let result = crate::files::serve(send, recv, context.peer_limit, budget).await;
+                    match result {
                         Ok(()) => return,
                         Err(failure) => failure,
                     }
@@ -609,6 +655,10 @@ mod tests {
             #[cfg(unix)]
             let store = Store::start(Policy::DEFAULT);
             Self::serve(deadlines, account, |authorizer| Shared {
+                #[cfg(unix)]
+                file_workers: Arc::new(tokio::sync::Semaphore::new(32)),
+                max_file_size: crate::file_protocol::DEFAULT_MAX_SIZE,
+                file_timeout: Duration::from_secs(60),
                 max_file_channels: crate::files::DEFAULT_SERVER_CAP,
                 deadlines,
                 authorizer,
@@ -622,6 +672,9 @@ mod tests {
         async fn start_with(policy: Policy, account: &str) -> Self {
             let store = Store::start(policy);
             Self::serve(Deadlines::DEFAULT, account, |authorizer| Shared {
+                file_workers: Arc::new(tokio::sync::Semaphore::new(32)),
+                max_file_size: crate::file_protocol::DEFAULT_MAX_SIZE,
+                file_timeout: Duration::from_secs(60),
                 max_file_channels: crate::files::DEFAULT_SERVER_CAP,
                 deadlines: Deadlines::DEFAULT,
                 authorizer,
@@ -909,18 +962,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unimplemented_file_operation_aborts_only_its_channel() {
+    async fn unavailable_file_worker_aborts_only_its_channel() {
         timeout(Duration::from_secs(3), async {
-            let peer = Peer::start(Deadlines::default()).await;
+            let peer = Peer::start_as(Deadlines::default(),"stpt-missing-worker-account").await;
             let (mut control_send, mut control_recv) = peer.authenticated_files(1).await;
             let (mut send, mut recv) = peer.connection.open_bi().await.unwrap();
             send.write_all(&frame(&channel_open(crate::files::KIND).encode())).await.unwrap();
             assert_eq!(wire::read_message(&mut recv, DEFAULT_MESSAGE_LIMIT).await.unwrap().unwrap().kind, wire::FILES_READY);
-            // A stat request has no filesystem effect in the envelope-only implementation.
+            // Account disappearance after authentication must not affect control traffic.
             let path = Value::Array(vec![Value::Uint(0), Value::Array(vec![])]);
             let operation = Message::new(wire::FILE_REQUEST, vec![(0, Value::Uint(0)), (1, Value::Uint(3)), (2, path)]);
             send.write_all(&frame(&operation.encode())).await.unwrap();
-            assert!(matches!(wire::read_message(&mut recv, DEFAULT_MESSAGE_LIMIT).await, Err(StreamError::Reset(code)) if code == Code::InternalError.varint()));
+            assert!(matches!(wire::read_message(&mut recv, DEFAULT_MESSAGE_LIMIT).await, Err(StreamError::Reset(code)) if code == if cfg!(unix) {Code::ChannelRejected.varint()} else {Code::InternalError.varint()}));
             assert_eq!(request(&mut control_send, &mut control_recv, 3).await, LIST_RESULT);
         }).await.unwrap();
     }

@@ -12,6 +12,10 @@ mod console;
 mod control;
 mod destination;
 mod error;
+mod file_client;
+mod file_protocol;
+#[cfg(unix)]
+mod file_worker;
 mod files;
 mod hello;
 mod identity;
@@ -37,6 +41,10 @@ use std::io::Write;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    #[cfg(unix)]
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__stpt-file-worker")) {
+        return crate::file_worker::main();
+    }
     match cli::run(cli::Cli::parse_args()) {
         Ok(code) => code,
         Err(e) => {

@@ -59,8 +59,26 @@ A lost connection in `connect` is repaired automatically: the Client notices it 
 - The Client stops trying after an hour (`reattach_timeout`, see Configuration), and at once if the Server key has changed, your key is refused or the Session is gone.
 - `exec` does not reconnect: it reports the lost connection and exits with 255. Input is not numbered like output, so reconnecting could silently lose part of what a pipe sends to the command.
 
-# File service
-The file Channel envelope is implemented (RE001): negotiation, opening, limits and closing. File operations and `stpt fs` are not available yet (RE002–RE004). Terminal commands do not offer the file capability. An external Client can negotiate and open the envelope, but an operation request currently aborts only that Channel with INTERNAL_ERROR.
+# Files
+`stpt fs` transfers regular files and manages files on the Linux Server under the Account's filesystem permissions. It needs no terminal or Session. Paths on the Server are absolute POSIX paths; local paths use the Client's native syntax.
+
+```
+stpt fs push alice@host ./local.bin /home/alice/remote.bin
+stpt fs pull alice@host /home/alice/remote.bin ./copy.bin
+stpt fs stat alice@host /home/alice/remote.bin
+stpt fs list alice@host /home/alice
+stpt fs mkdir alice@host /home/alice/new-directory
+stpt fs rename alice@host /home/alice/old-name /home/alice/new-name
+stpt fs remove alice@host /home/alice/empty-directory
+```
+
+- Every operation accepts `--fingerprint` and `-i` as the terminal commands do. `stpt fs help COMMAND` describes its arguments. Success exits with 0; file or Connection errors with 255.
+- Push and pull transfer one regular file. No recursive copying, wildcard expansion, implicit parent creation or automatic destination-name selection is performed. Uploads use private staging and are published atomically only after verification. An interrupted or failed upload does not expose a partial destination.
+- BLAKE3 verifies transfers by default. `--hash sha256` on push or pull explicitly requests SHA-256; the Server confirms that exact algorithm. Data stays inside QUIC/TLS in both cases. Files use bounded blocks, including files larger than 4 GiB; both roles default to an 8 GiB per-file limit.
+- Existing destinations are protected by default, including a destination created concurrently with the transfer. Pull `--replace` explicitly permits local replacement; rename `--replace` permits an atomic native replacement. **Push cannot replace an existing destination yet:** even with `--replace` it returns UNSUPPORTED. This preserves the protocol's regular-file-only replacement requirement without a check/rename race. There is no delete-and-retry fallback.
+- `list` prints kind, logical size (or `-`) and a byte-escaped entry name, separated by tabs; `stat` prints kind and size. A failed listing may already have printed incomplete batches. Neither transfers nor listings are filesystem snapshots. Minimal kind/size metadata is available; timestamps, permissions and source ACLs are not copied.
+- Final symlinks are inspected, removed or renamed as entries. This implementation refuses downloads through final symlinks; directory listing may follow one. Devices, FIFOs and sockets are not transferred. The service is not confined to the home directory: normal Account permissions apply.
+- Ctrl+C cancels the operation. A Connection loss or missing final result is an error; a modifying operation may already have committed. STPT does not automatically retry it. Resume remains RE003; Windows Server paths and extended metadata remain RE004. Windows Clients can transfer to Linux Servers now.
 
 # Private key, public key, fingerprint
 Three different texts appear around keys. Do not mix them up.
@@ -144,6 +162,8 @@ log_level = "info"    # error, warn, info, debug or trace; -v and -q override it
 identity_key = "/etc/stpt/server_key"   # Server key file, created if missing
 authorized_keys = "/etc/stpt/authorized_keys"   # directory of authorized user keys, one file per Account
 max_file_channels = 8   # per Connection; 0 disables file capability negotiation
+max_file_size = 8589934592   # bytes per transfer, default 8 GiB
+file_timeout = 60   # seconds without file-operation progress (1–86400)
 exit_grace = 1   # seconds output is still sent after the program of a Session exited (0–60)
 ```
 </details>
@@ -153,6 +173,8 @@ exit_grace = 1   # seconds output is still sent after the program of a Session e
 
 ```toml
 detach_timeout = 3600   # seconds a new Session may stay without an Attachment, then it is terminated
+max_file_size = 8589934592   # bytes per transfer, default 8 GiB
+file_timeout = 60   # seconds without file-operation progress (1–86400)
 reattach_timeout = 3600   # seconds `connect` keeps trying to attach again after a lost connection; 0: not at all
 ```
 - Without `detach_timeout` a detached Session stays until it is terminated or the Server stops.
@@ -161,7 +183,7 @@ reattach_timeout = 3600   # seconds `connect` keeps trying to attach again after
 </details>
 
 # Build
-Requires Rust 1.99 or newer, installed with rustup (distribution packages are usually older), and a C compiler: `build-essential` on Debian, the Visual Studio Build Tools (C++) on Windows. The cryptographic library (AWS-LC) is compiled from C.
+Requires Rust 1.100 or newer, installed with rustup (distribution packages are usually older), and a C compiler: `build-essential` on Debian, the Visual Studio Build Tools (C++) on Windows. The cryptographic library (AWS-LC) is compiled from C.
 
 ```
 cargo build --release

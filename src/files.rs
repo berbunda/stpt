@@ -1,5 +1,5 @@
-//! File Channel envelope (PROTOCOL.md §16.2–§16.4, RE001).
-//! No filesystem access or file operations are implemented here (RE002–RE004).
+//! File Channel lifecycle and bounded relay to an Account-owned filesystem worker.
+//! Payload grammar: file_protocol; operations: file_worker; CLI: file_client.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -88,11 +88,52 @@ impl Budget {
 }
 
 /// Server side, called only after authentication and capability checks.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "test-only envelope without a filesystem service")
+)]
 pub async fn serve(
+    send: SendStream,
+    recv: RecvStream,
+    peer_limit: u64,
+    budget: &Budget,
+) -> Result<(), Failure> {
+    serve_inner(
+        send,
+        recv,
+        peer_limit,
+        budget,
+        #[cfg(unix)]
+        None,
+    )
+    .await
+}
+
+#[cfg(unix)]
+pub struct Service<'a> {
+    pub account: &'a str,
+    pub max_size: u64,
+    pub timeout: Duration,
+    pub workers: Arc<Semaphore>,
+}
+
+#[cfg(unix)]
+pub async fn serve_account(
+    send: SendStream,
+    recv: RecvStream,
+    peer_limit: u64,
+    budget: &Budget,
+    service: Service<'_>,
+) -> Result<(), Failure> {
+    serve_inner(send, recv, peer_limit, budget, Some(service)).await
+}
+
+async fn serve_inner(
     mut send: SendStream,
     mut recv: RecvStream,
     peer_limit: u64,
     budget: &Budget,
+    #[cfg(unix)] service: Option<Service<'_>>,
 ) -> Result<(), Failure> {
     let _permit = match budget.acquire() {
         Ok(permit) => permit,
@@ -121,8 +162,11 @@ pub async fn serve(
             Ok(())
         }
         Ok(Some(message)) if message.kind == wire::FILE_REQUEST => {
-            // RE002's operation dispatcher is not present yet. Refuse local work
-            // without inspecting paths, touching files, or claiming a result.
+            #[cfg(unix)]
+            if let Some(service) = service {
+                return worker_relay(send, recv, peer_limit, message, service).await;
+            }
+            // An envelope-only test peer or unsupported platform has no worker.
             abort(&mut send, &mut recv, Code::InternalError);
             Ok(())
         }
@@ -148,24 +192,217 @@ fn server_error(
     }
 }
 
-/// Client side envelope API, used by RE002's future `fs` command.
+/// Client side file Channel, shared by the explicit `fs` commands.
 #[cfg_attr(
     not(test),
-    allow(dead_code, reason = "file operation CLI comes with RE002")
+    allow(
+        dead_code,
+        reason = "idle lifecycle API is also used by protocol tests"
+    )
 )]
 pub struct Channel {
-    connection: Connection,
-    send: SendStream,
-    recv: RecvStream,
+    pub(super) connection: Connection,
+    pub(super) send: SendStream,
+    pub(super) recv: RecvStream,
     _permit: OwnedSemaphorePermit,
     closed: bool,
 }
 
+#[cfg(unix)]
+async fn worker_relay(
+    mut send: SendStream,
+    mut recv: RecvStream,
+    peer_limit: u64,
+    initial: Message,
+    service: Service<'_>,
+) -> Result<(), Failure> {
+    use crate::file_protocol as p;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let request = p::Request::parse(&initial)?;
+    let exchange = std::sync::Mutex::new(p::Exchange::new(&request)?);
+    let _worker_slot = match service.workers.try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            abort(&mut send, &mut recv, Code::LimitExceeded);
+            return Ok(());
+        }
+    };
+    let account = service.account.to_owned();
+    // Keep admission charged even if an NSS lookup outlives cancellation.
+    let lookup = tokio::task::spawn_blocking(move || {
+        (crate::process::Account::lookup(&account), _worker_slot)
+    });
+    let joined = tokio::select! {
+        result=timeout(service.timeout,lookup)=>match result {Ok(r)=>r,Err(_)=>{abort(&mut send,&mut recv,Code::Timeout);return Ok(());}},
+        _=send.stopped()=>{abort(&mut send,&mut recv,Code::NoError);return Ok(());},
+    };
+    let (account, _worker_slot) = match joined {
+        Ok(result) => result,
+        Err(_) => {
+            abort(&mut send, &mut recv, Code::InternalError);
+            return Ok(());
+        }
+    };
+    let mut child = match account {
+        Ok(Some(account)) => match account.file_worker(peer_limit, service.max_size) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(?e, "file worker start failed");
+                abort(&mut send, &mut recv, Code::ChannelRejected);
+                return Ok(());
+            }
+        },
+        _ => {
+            abort(&mut send, &mut recv, Code::ChannelRejected);
+            return Ok(());
+        }
+    };
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let progress = std::sync::Mutex::new((true, tokio::time::Instant::now()));
+    let stopped = send.stopped();
+    let result = {
+        let input = async {
+            let first = initial.encode();
+            stdin
+                .write_all(&(first.len() as u32).to_be_bytes())
+                .await
+                .map_err(|_| StreamError::Reset(Code::InternalError.varint()))?;
+            stdin
+                .write_all(&first)
+                .await
+                .map_err(|_| StreamError::Reset(Code::InternalError.varint()))?;
+            loop {
+                let Some(message) = wire::read_message(&mut recv, DEFAULT_MESSAGE_LIMIT).await?
+                else {
+                    drop(stdin);
+                    return Ok::<_, StreamError>(());
+                };
+                exchange.lock().unwrap().incoming(&message)?;
+                progress.lock().unwrap().0 = true;
+                let b = message.encode();
+                stdin
+                    .write_all(&(b.len() as u32).to_be_bytes())
+                    .await
+                    .map_err(|_| StreamError::Reset(Code::InternalError.varint()))?;
+                stdin
+                    .write_all(&b)
+                    .await
+                    .map_err(|_| StreamError::Reset(Code::InternalError.varint()))?;
+                progress.lock().unwrap().1 = tokio::time::Instant::now();
+            }
+        };
+        let output = async {
+            loop {
+                let mut prefix = [0; 4];
+                match stdout.read_exact(&mut prefix).await {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        return Ok::<_, StreamError>(());
+                    }
+                    Err(_) => return Err(StreamError::Reset(Code::InternalError.varint())),
+                }
+                let n = u32::from_be_bytes(prefix) as usize;
+                if n == 0 || n > 65535 {
+                    return Err(StreamError::Reset(Code::InternalError.varint()));
+                }
+                let mut b = vec![0; n];
+                stdout
+                    .read_exact(&mut b)
+                    .await
+                    .map_err(|_| StreamError::Reset(Code::InternalError.varint()))?;
+                let m = Message::decode(&b)
+                    .map_err(|_| StreamError::Reset(Code::InternalError.varint()))?;
+                if m.kind == 0 {
+                    let code = m
+                        .field(0)
+                        .and_then(crate::cbor::Value::as_uint)
+                        .and_then(Code::from_value)
+                        .unwrap_or(Code::InternalError);
+                    return if code == Code::ProtocolViolation {
+                        Err(
+                            Failure::violation("file worker rejected invalid operation exchange")
+                                .into(),
+                        )
+                    } else {
+                        Err(StreamError::Reset(code.varint()))
+                    };
+                }
+                exchange.lock().unwrap().outgoing(&m)?;
+                wire::write_message(&mut send, &m, peer_limit).await?;
+                let mut state = progress.lock().unwrap();
+                state.1 = tokio::time::Instant::now();
+                state.0 = exchange.lock().unwrap().active();
+            }
+        };
+        let deadline = async {
+            let mut tick = tokio::time::interval(service.timeout.min(Duration::from_secs(1)));
+            loop {
+                tick.tick().await;
+                let (active, last) = *progress.lock().unwrap();
+                if active && last.elapsed() >= service.timeout {
+                    return;
+                }
+            }
+        };
+        tokio::pin!(input, output, deadline);
+        tokio::select! {
+            r=&mut input=>match r {Ok(())=>output.await,Err(e)=>Err(e)},
+            r=&mut output=>r.and_then(|()|Err(StreamError::Reset(Code::InternalError.varint()))),
+            _=stopped=>Err(StreamError::Reset(Code::NoError.varint())),
+            ()=&mut deadline=>Err(StreamError::Reset(Code::Timeout.varint())),
+        }
+    };
+    // Dropping the pipe futures sends EOF/BrokenPipe so normal cancellation runs
+    // Account-owned staging cleanup. Only a stuck worker is forcibly killed.
+    drop(stdout);
+    match timeout(Duration::from_secs(2), child.wait()).await {
+        Ok(Ok(status)) if status.success() && result.is_ok() => {
+            if send.finish().is_ok() {
+                let _ = timeout(OPEN_TIMEOUT, send.stopped()).await;
+            }
+            Ok(())
+        }
+        other => {
+            if other.is_err() {
+                tracing::warn!("file worker stalled; private staging cleanup may be incomplete");
+                let _ = child.start_kill();
+                // Reap asynchronously and retain admission until the OS actually
+                // releases a stuck child; a D-state process cannot be waited on
+                // synchronously without defeating the Channel timeout.
+                tokio::spawn(async move {
+                    let _permit = _worker_slot;
+                    let _ = child.wait().await;
+                });
+            }
+            match result {
+                Err(StreamError::Failure(f)) => Err(f),
+                Err(StreamError::Reset(code)) => {
+                    let _ = send.reset(code);
+                    let _ = recv.stop(code);
+                    Ok(())
+                }
+                _ => {
+                    abort(&mut send, &mut recv, Code::InternalError);
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
 #[cfg_attr(
     not(test),
-    allow(dead_code, reason = "file operation CLI comes with RE002")
+    allow(
+        dead_code,
+        reason = "idle lifecycle API is also used by protocol tests"
+    )
 )]
 impl Channel {
+    pub(super) fn abort(&mut self, code: Code) {
+        abort(&mut self.send, &mut self.recv, code);
+        self.closed = true;
+    }
     /// Caller holds an authenticated Connection and its selected file budget.
     pub async fn open(
         connection: &Connection,
@@ -289,7 +526,7 @@ impl Drop for Channel {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::hello::{ClientHello, ServerHello};
 
@@ -380,15 +617,15 @@ mod tests {
         assert_eq!(selected(&vec![(CAPABILITY, extended)]), Some(2));
     }
 
-    struct Pair {
+    pub(crate) struct Pair {
         _server: quinn::Endpoint,
         _client: quinn::Endpoint,
-        server: Connection,
-        client: Connection,
+        pub(crate) server: Connection,
+        pub(crate) client: Connection,
     }
 
     impl Pair {
-        async fn start() -> Self {
+        pub(crate) async fn start() -> Self {
             let key = crate::identity::ServerKey::generate();
             let server = crate::quic::listen("127.0.0.1:0".parse().unwrap(), &key).unwrap();
             let addr = server.local_addr().unwrap();

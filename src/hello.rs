@@ -80,9 +80,8 @@ pub struct ServerHello {
 }
 
 impl ClientHello {
-    /// Offers the file Channel envelope; operations are implemented separately.
+    /// Offers the file service for explicit `fs` commands.
     /// Terminal-only commands keep using `ours()` without this capability.
-    #[cfg_attr(not(test), allow(dead_code, reason = "used by the future fs command"))]
     pub fn with_files(max_channels: u64) -> Self {
         assert!(max_channels > 0);
         let mut hello = Self::ours();

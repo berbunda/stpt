@@ -130,10 +130,15 @@ pub struct RunningServer {
 impl RunningServer {
     /// Starts `stpt server` with `args` and waits until it listens.
     pub fn start(args: &[&str]) -> Self {
+        Self::start_binary(Path::new(env!("CARGO_BIN_EXE_stpt")), args)
+    }
+
+    /// Starts an isolated executable copy for lifecycle tests.
+    pub fn start_binary(binary: &Path, args: &[&str]) -> Self {
         use std::io::{BufRead, BufReader};
         use std::process::Stdio;
 
-        let mut child = Command::new(env!("CARGO_BIN_EXE_stpt"))
+        let mut child = Command::new(binary)
             .arg("server")
             .args(args)
             .stderr(Stdio::piped())
