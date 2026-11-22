@@ -638,12 +638,19 @@ async fn upload(
     }
     Ok(())
 }
+fn local_storage(error: crate::file_worker::Error) -> Error {
+    let message = match error {
+        crate::file_worker::Error::Status(s) => s.name().to_owned(),
+        crate::file_worker::Error::Failure(f) => f.reason,
+    };
+    Error::Local(std::io::Error::other(message))
+}
 struct Destination {
-    path: PathBuf,
+    #[cfg_attr(not(test), allow(dead_code))]
     temp: PathBuf,
     file: Option<tokio::fs::File>,
     replace: bool,
-    persistent: bool,
+    publication: crate::file_storage::LocalPublication,
 }
 impl Destination {
     async fn retained(path: &Path, replace: bool, state: &Checkpoint) -> Result<Self, Error> {
@@ -651,63 +658,32 @@ impl Destination {
             return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists).into());
         }
         let temp = state.dir.join("data");
-        let mut options = tokio::fs::OpenOptions::new();
-        options.read(true).write(true);
-        if !state.existing {
-            options.create_new(true);
-        }
-        #[cfg(unix)]
-        {
-            options.mode(0o600).custom_flags(nix::libc::O_NOFOLLOW);
-        }
-        let file = options.open(&temp).await?;
-        if !file.metadata().await?.is_file() {
-            return Err(Error::Usage("resume partial is not a regular file"));
-        }
+        let (publication, file) =
+            crate::file_storage::LocalPublication::retained(path, &temp, state.existing)
+                .map_err(local_storage)?;
         Ok(Self {
-            path: path.to_owned(),
             temp,
-            file: Some(file),
+            file: Some(tokio::fs::File::from_std(file)),
             replace,
-            persistent: true,
+            publication,
         })
     }
-
     async fn new(path: &Path, replace: bool) -> Result<Self, Error> {
-        use aws_lc_rs::rand::{SecureRandom, SystemRandom};
         if path.file_name().is_none() {
             return Err(Error::Usage("local destination must name a file"));
         }
         if !replace && tokio::fs::symlink_metadata(path).await.is_ok() {
             return Err(Error::Local(std::io::ErrorKind::AlreadyExists.into()));
         }
-        let mut random = [0; 16];
-        SystemRandom::new()
-            .fill(&mut random)
-            .map_err(|_| Error::Usage("system randomness failed"))?;
-        let temp = path.parent().unwrap_or(Path::new(".")).join(format!(
-            ".stpt-download-{}",
-            random
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>()
-        ));
         let path = path.to_owned();
         tokio::task::spawn_blocking(move || {
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let file = options.open(&temp)?;
+            let (publication, file, temp) =
+                crate::file_storage::LocalPublication::new(&path).map_err(local_storage)?;
             Ok::<_, Error>(Self {
-                path,
                 temp,
                 file: Some(tokio::fs::File::from_std(file)),
                 replace,
-                persistent: false,
+                publication,
             })
         })
         .await
@@ -730,25 +706,10 @@ impl Destination {
         }
         Ok(())
     }
-    async fn publish(&self) -> Result<(), Error> {
-        if self.replace {
-            tokio::fs::rename(&self.temp, &self.path).await?;
-        } else {
-            tokio::fs::hard_link(&self.temp, &self.path).await?;
-            tokio::fs::remove_file(&self.temp).await?;
-        }
-        Ok(())
-    }
-}
-impl Drop for Destination {
-    fn drop(&mut self) {
-        drop(self.file.take());
-        if !self.persistent
-            && let Err(e) = std::fs::remove_file(&self.temp)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(?e, "local download staging cleanup failed");
-        }
+    async fn publish(&mut self) -> Result<(), Error> {
+        self.publication
+            .publish(self.replace)
+            .map_err(local_storage)
     }
 }
 #[allow(clippy::too_many_arguments)]
@@ -905,6 +866,164 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+    #[tokio::test]
+    async fn listing_batches_followed_by_failure_are_incomplete() {
+        let dir = directory("partial-list");
+        let pair = Pair::start().await;
+        let server = pair.server.clone();
+        let task = tokio::spawn(async move {
+            let (mut send, mut recv, _) = mock_open(&server).await;
+            let entry = Value::Array(vec![
+                Value::Bytes(b"entry".to_vec()),
+                Value::Map(vec![
+                    (Value::Uint(0), Value::Uint(1)),
+                    (Value::Uint(1), Value::Uint(3)),
+                ]),
+            ]);
+            wire::write_message(
+                &mut send,
+                &Message::new(
+                    p::ENTRIES,
+                    vec![(0, Value::Uint(0)), (1, Value::Array(vec![entry]))],
+                ),
+                65535,
+            )
+            .await
+            .unwrap();
+            wire::write_message(&mut send, &p::result(0, Status::NoSpace, None), 65535)
+                .await
+                .unwrap();
+            let _ = wire::read_message(&mut recv, 65535).await;
+        });
+        let budget = Budget::new(1);
+        let mut channel = Channel::open(&pair.client, 65535, &budget, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let mut op = resume_operation(4, dir.join("unused"), dir.join("state"));
+        op.resume_state = None;
+        assert!(matches!(
+            run(&mut channel, op, 65535, Duration::from_secs(1)).await,
+            Err(Error::Remote(Status::NoSpace))
+        ));
+        assert!(pair.client.close_reason().is_none());
+        drop(channel);
+        task.await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn verified_download_without_final_result_never_publishes() {
+        let dir = directory("lost-final");
+        let target = dir.join("target");
+        let pair = Pair::start().await;
+        let server = pair.server.clone();
+        let task = tokio::spawn(async move {
+            let (mut send, mut recv, _) = mock_open(&server).await;
+            let mut hash = p::Hash::new(1).unwrap();
+            hash.update(b"abc");
+            for message in [
+                p::accepted(0, 3, 1),
+                p::data(0, 0, b"abc".to_vec()),
+                p::end(0, Status::Ok, 3, Some(hash.finish())),
+            ] {
+                wire::write_message(&mut send, &message, 65535)
+                    .await
+                    .unwrap();
+            }
+            let receipt = wire::read_message(&mut recv, 65535).await.unwrap().unwrap();
+            assert_eq!(p::status(&receipt).unwrap(), Status::Ok);
+            send.reset(Code::NoError.varint()).unwrap();
+        });
+        let budget = Budget::new(1);
+        let mut channel = Channel::open(&pair.client, 65535, &budget, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let mut op = resume_operation(1, target.clone(), dir.join("unused"));
+        op.resume_state = None;
+        assert!(matches!(
+            run(&mut channel, op, 65535, Duration::from_secs(1)).await,
+            Err(Error::Stream(_))
+        ));
+        assert!(!target.exists());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        drop(channel);
+        task.await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn local_setup_failure_aborts_download_without_ok_receipt() {
+        let dir = directory("local-failure");
+        let pair = Pair::start().await;
+        let server = pair.server.clone();
+        let task = tokio::spawn(async move {
+            let (mut send, mut recv, _) = mock_open(&server).await;
+            wire::write_message(&mut send, &p::accepted(0, 1, 1), 65535)
+                .await
+                .unwrap();
+            assert!(matches!(
+                wire::read_message(&mut recv, 65535).await,
+                Err(StreamError::Reset(_))
+            ));
+        });
+        let budget = Budget::new(1);
+        let mut channel = Channel::open(&pair.client, 65535, &budget, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let mut op = resume_operation(1, dir.join("missing/target"), dir.join("unused"));
+        op.resume_state = None;
+        assert!(matches!(
+            run(&mut channel, op, 65535, Duration::from_secs(1)).await,
+            Err(Error::Local(_))
+        ));
+        drop(channel);
+        task.await.unwrap();
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn local_publication_cannot_substitute_verified_staging() {
+        for replace in [false, true] {
+            let dir = directory("stage-swap");
+            let path = dir.join("target");
+            if replace {
+                std::fs::write(&path, b"old").unwrap();
+            }
+            let mut staging = Destination::new(&path, replace).await.unwrap();
+            staging
+                .file
+                .as_mut()
+                .unwrap()
+                .write_all(b"verified")
+                .await
+                .unwrap();
+            staging.finish_writes().await.unwrap();
+            let entry = if staging.temp.file_name() == Some(OsStr::new("data")) {
+                staging.temp.parent().unwrap().to_owned()
+            } else {
+                staging.temp.clone()
+            };
+            let moved = dir.join("moved");
+            match std::fs::rename(&entry, &moved) {
+                Ok(()) => {
+                    if moved.is_dir() {
+                        std::fs::create_dir(&entry).unwrap();
+                        std::fs::write(entry.join("data"), b"substituted").unwrap();
+                    } else {
+                        std::fs::write(&entry, b"substituted").unwrap();
+                    }
+                }
+                Err(e) => {
+                    #[cfg(not(windows))]
+                    panic!("{e}");
+                    #[cfg(windows)]
+                    assert_eq!(e.raw_os_error(), Some(32));
+                }
+            }
+            staging.publish().await.unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), b"verified");
+            drop(staging);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
     #[tokio::test]
     async fn local_publication_does_not_overwrite_a_racing_destination() {

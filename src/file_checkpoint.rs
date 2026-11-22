@@ -28,14 +28,27 @@ fn private_open(path: &Path) -> std::io::Result<File> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        if path.try_exists()? {
-            protect(path)?;
-        }
+        // Protect the actual newly opened object before writing any token or
+        // record; inherited permissions and a preceding pathname check are insufficient.
+        o.access_mode(0xc0060080);
         o.custom_flags(0x00200000);
     }
     let file = o.open(path)?;
+    #[cfg(windows)]
+    protect_handle(&file)?;
     if !file.metadata()?.is_file() {
         return Err(std::io::Error::other("resume record is not a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = file.metadata()?;
+        if meta.uid() != nix::unistd::geteuid().as_raw() || meta.mode() & 0o077 != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "resume files must be owned by this user and private",
+            ));
+        }
     }
     Ok(file)
 }
@@ -43,10 +56,16 @@ fn private_open(path: &Path) -> std::io::Result<File> {
 /// Apply via an opened non-reparse handle, not a check followed by a path update.
 #[cfg(windows)]
 fn protect(path: &Path) -> std::io::Result<()> {
-    use std::os::windows::{
-        fs::{MetadataExt, OpenOptionsExt},
-        io::AsRawHandle,
-    };
+    use std::os::windows::fs::OpenOptionsExt;
+    let file = OpenOptions::new()
+        .access_mode(0x00060080)
+        .custom_flags(0x02200000)
+        .open(path)?;
+    protect_handle(&file)
+}
+#[cfg(windows)]
+fn protect_handle(file: &File) -> std::io::Result<()> {
+    use std::os::windows::{fs::MetadataExt, io::AsRawHandle};
     use windows_sys::Win32::{
         Foundation::LocalFree,
         Security::{
@@ -55,10 +74,7 @@ fn protect(path: &Path) -> std::io::Result<()> {
             SetKernelObjectSecurity,
         },
     };
-    let file = OpenOptions::new()
-        .access_mode(0x00060080)
-        .custom_flags(0x02200000)
-        .open(path)?;
+    crate::windows_security::check_current_owner(file)?;
     if file.metadata()?.file_attributes() & 0x400 != 0 {
         return Err(std::io::Error::other(
             "resume state cannot use reparse points",
@@ -228,6 +244,23 @@ impl Drop for Checkpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn existing_world_readable_state_file_is_refused_before_writing() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "stpt-checkpoint-permissions-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let record = dir.join("record.new");
+        std::fs::write(&record, b"unrelated").unwrap();
+        std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(private_open(&record).is_err());
+        assert_eq!(std::fs::read(&record).unwrap(), b"unrelated");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn binding_lock_and_unknown_data_are_preserved() {
         let dir = std::env::temp_dir().join(format!("stpt-checkpoint-{}", std::process::id()));

@@ -1,8 +1,4 @@
 //! File profile messages shared by the CLI and the unprivileged worker (§16).
-#![cfg_attr(
-    not(unix),
-    allow(dead_code, reason = "Server codec is exercised on Unix")
-)]
 use crate::cbor::Value;
 use crate::wire::{Failure, Message};
 
@@ -619,6 +615,28 @@ mod tests {
         ));
         assert!(Request::parse(&m).is_err());
         assert!(Request::parse(&request(99)).is_ok());
+    }
+    #[test]
+    fn maximum_frame_and_all_data_boundary_refusals() {
+        let m = data(u64::MAX, MAX_SIZE - MAX_CHUNK as u64, vec![7; MAX_CHUNK]);
+        assert_eq!(m.encode().len(), 61469);
+        assert!(m.encode().len() <= 65535);
+        assert_eq!(
+            bytes(&m, u64::MAX, MAX_SIZE - MAX_CHUNK as u64, MAX_SIZE)
+                .unwrap()
+                .len(),
+            MAX_CHUNK
+        );
+        for m in [
+            data(0, 0, vec![]),
+            data(0, 0, vec![0; MAX_CHUNK + 1]),
+            data(0, 1, vec![1]),
+            data(1, 0, vec![1]),
+            data(0, 0, vec![0; 4]),
+        ] {
+            assert!(bytes(&m, 0, 0, 3).is_err());
+        }
+        assert!(bytes(&data(0, MAX_SIZE, vec![1]), 0, MAX_SIZE, MAX_SIZE).is_err());
     }
     #[test]
     fn counts_above_four_gib_and_failed_end_precedence() {

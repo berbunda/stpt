@@ -329,3 +329,100 @@ impl Upload {
         )
     }
 }
+
+/// Client publication pins both directories; temporary source names are private.
+/// Retained state directories are already private and remain owned by Checkpoint.
+pub struct LocalPublication {
+    _staging: Option<Staging>,
+    source: File,
+    target: File,
+    name: OsString,
+}
+impl LocalPublication {
+    pub fn new(path: &std::path::Path) -> Result<(Self, File, PathBuf), Error> {
+        let absolute = std::path::absolute(path)?;
+        let (target, name) = parent(&absolute)?;
+        let (stage, file) = Staging::new(target)?;
+        let temp = absolute.parent().unwrap().join(&stage.name).join("data");
+        let state = Self {
+            source: stage.dir.try_clone()?,
+            target: stage.parent.try_clone()?,
+            name,
+            _staging: Some(stage),
+        };
+        Ok((state, file, temp))
+    }
+    pub fn retained(
+        path: &std::path::Path,
+        temp: &std::path::Path,
+        existing: bool,
+    ) -> Result<(Self, File), Error> {
+        let absolute = std::path::absolute(path)?;
+        let (target, name) = parent(&absolute)?;
+        let (source, source_name) = parent(temp)?;
+        let mut flags = OFlag::O_RDWR | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+        if !existing {
+            flags |= OFlag::O_CREAT | OFlag::O_EXCL;
+        }
+        let file: File = openat(
+            &source,
+            source_name.as_os_str(),
+            flags,
+            Mode::from_bits_truncate(0o600),
+        )?
+        .into();
+        let meta = file.metadata()?;
+        if !meta.is_file()
+            || meta.uid() != nix::unistd::geteuid().as_raw()
+            || meta.mode() & 0o077 != 0
+        {
+            return Err(Error::Status(Status::Access));
+        }
+        Ok((
+            Self {
+                source,
+                target,
+                name,
+                _staging: None,
+            },
+            file,
+        ))
+    }
+    pub fn publish(&mut self, replace: bool) -> Result<(), Error> {
+        if replace {
+            renameat(&self.source, "data", &self.target, self.name.as_os_str())?;
+        } else {
+            nix::unistd::linkat(
+                &self.source,
+                "data",
+                &self.target,
+                self.name.as_os_str(),
+                AtFlags::empty(),
+            )?;
+            unlinkat(&self.source, "data", UnlinkatFlags::NoRemoveDir)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+    #[test]
+    fn exhaustion_and_permission_errors_have_portable_statuses() {
+        for code in [nix::libc::ENOSPC, nix::libc::EDQUOT] {
+            assert_eq!(
+                io_status(&std::io::Error::from_raw_os_error(code)),
+                Status::NoSpace
+            );
+        }
+        assert_eq!(
+            io_status(&std::io::Error::from_raw_os_error(nix::libc::EROFS)),
+            Status::ReadOnly
+        );
+        assert_eq!(
+            io_status(&std::io::Error::from_raw_os_error(nix::libc::EACCES)),
+            Status::Access
+        );
+    }
+}

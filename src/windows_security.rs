@@ -63,6 +63,36 @@ fn known(kind: WELL_KNOWN_SID_TYPE) -> io::Result<Vec<u8>> {
     bytes.truncate(size as usize);
     Ok(bytes)
 }
+/// Client state must be owned by this user before tightening its DACL; granting
+/// OWNER RIGHTS to an unrelated owner would leave that owner access to tokens.
+pub(crate) fn check_current_owner(file: &std::fs::File) -> io::Result<()> {
+    let own = current_sid()?;
+    unsafe {
+        let mut owner = std::ptr::null_mut();
+        let mut descriptor = std::ptr::null_mut();
+        let result = GetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        );
+        if result != 0 {
+            return Err(io::Error::from_raw_os_error(result as i32));
+        }
+        let _descriptor = Local(descriptor);
+        if owner.is_null() || EqualSid(owner, own.as_ptr() as _) == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "resume state must be owned by this user",
+            ));
+        }
+    }
+    Ok(())
+}
 pub fn check(path: &Path) -> io::Result<()> {
     check_access(path, false)
 }

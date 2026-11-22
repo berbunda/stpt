@@ -256,5 +256,26 @@ mod tests {
             Err(Status::Limit)
         ));
         assert!(store.0.lock().unwrap().is_empty());
+        let mut total = Vec::new();
+        for group in 0..4 {
+            let mut owner = account.clone();
+            owner.name = format!("{}-quota-{group}", account.name);
+            for _ in 0..4 {
+                total.push(store.acquire(&owner, &q).unwrap().0);
+            }
+        }
+        let mut other = account.clone();
+        other.name.push_str("-quota-overflow");
+        assert!(matches!(store.acquire(&other, &q), Err(Status::Limit)));
+        drop(total);
+        let large = request(8 * 1024 * 1024 * 1024, Value::Array(vec![Value::Uint(0)]));
+        let first = store.acquire(&account, &large).unwrap().0;
+        assert!(matches!(store.acquire(&account, &q), Err(Status::Limit)));
+        let second = store.acquire(&other, &large).unwrap().0;
+        let mut third = account.clone();
+        third.name.push_str("-third");
+        assert!(matches!(store.acquire(&third, &q), Err(Status::Limit)));
+        drop((first, second));
+        assert!(store.0.lock().unwrap().is_empty());
     }
 }

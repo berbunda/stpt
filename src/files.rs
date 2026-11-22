@@ -300,6 +300,12 @@ async fn worker_relay(
                 let Some(mut message) =
                     wire::read_message(&mut recv, DEFAULT_MESSAGE_LIMIT).await?
                 else {
+                    // FIN between frames interrupts an outstanding operation.
+                    // Do not inject a private close command into DATA/receipt
+                    // parsing, which would turn cancellation into a Connection error.
+                    if exchange.lock().unwrap().active() {
+                        return Err(StreamError::Reset(Code::NoError.varint()));
+                    }
                     let b = Message::new(2, vec![]).encode();
                     stdin
                         .write_all(&(b.len() as u32).to_be_bytes())
@@ -398,16 +404,24 @@ async fn worker_relay(
                 }
             }
         };
-        tokio::pin!(input, output, deadline);
-        tokio::select! {
-            r=&mut input=>match r {Ok(())=>output.await,Err(e)=>Err(e)},
-            r=&mut output=>r.and_then(|()|Err(StreamError::Reset(Code::InternalError.varint()))),
-            stopped=stopped=>match stopped {
-                Ok(Some(code))=>Err(StreamError::Reset(code)),
-                Err(error)=>Err(quinn::WriteError::from(error).into()),
-                _=>Err(StreamError::Reset(Code::NoError.varint())),
-            },
-            ()=&mut deadline=>Err(StreamError::Reset(Code::Timeout.varint())),
+        tokio::pin!(input, output, deadline, stopped);
+        let mut input_finished = false;
+        loop {
+            tokio::select! {
+                r=&mut input, if !input_finished=>match r {
+                    Ok(())=>input_finished=true,
+                    Err(e)=>break Err(e),
+                },
+                r=&mut output=>break if input_finished { r } else {
+                    r.and_then(|()|Err(StreamError::Reset(Code::InternalError.varint())))
+                },
+                stopped=&mut stopped=>break match stopped {
+                    Ok(Some(code))=>Err(StreamError::Reset(code)),
+                    Err(error)=>Err(quinn::WriteError::from(error).into()),
+                    _=>Err(StreamError::Reset(Code::NoError.varint())),
+                },
+                ()=&mut deadline=>break Err(StreamError::Reset(Code::Timeout.varint())),
+            }
         }
     };
     let eligible = matches!(&result,Err(StreamError::Reset(c)) if *c==Code::Timeout.varint())

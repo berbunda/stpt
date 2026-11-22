@@ -456,9 +456,23 @@ pub fn remove(path: &Target) -> Result<(), Error> {
 pub fn rename(path: &Target, dest: &Target, replace: bool) -> Result<(), Error> {
     let (_a, file) = path.entry(DELETE | FILE_READ_ATTRIBUTES)?;
     let b = dest.pin(false)?;
+    rename_entry(
+        &file,
+        b.handles.last().unwrap(),
+        std::ffi::OsStr::new(dest.names.last().unwrap()),
+        replace,
+    )?;
+    checked_close(file)
+}
+fn rename_entry(
+    file: &File,
+    parent: &File,
+    name: &std::ffi::OsStr,
+    replace: bool,
+) -> Result<(), Error> {
     use windows_sys::Wdk::Storage::FileSystem::{FileRenameInformation, NtSetInformationFile};
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
-    let name: Vec<u16> = dest.names.last().unwrap().encode_utf16().collect();
+    let name: Vec<u16> = name.encode_wide().collect();
     let bytes = (std::mem::offset_of!(FILE_RENAME_INFO, FileName) + name.len() * 2)
         .max(std::mem::size_of::<FILE_RENAME_INFO>());
     let mut buffer = vec![0u64; bytes.div_ceil(8)];
@@ -467,7 +481,7 @@ pub fn rename(path: &Target, dest: &Target, replace: bool) -> Result<(), Error> 
     // SAFETY: aligned variable-length buffer, synchronous native call, live handles.
     let result = unsafe {
         (*info).Anonymous.ReplaceIfExists = replace;
-        (*info).RootDirectory = b.handles.last().unwrap().as_raw_handle();
+        (*info).RootDirectory = parent.as_raw_handle();
         (*info).FileNameLength = (name.len() * 2) as u32;
         std::ptr::copy_nonoverlapping(
             name.as_ptr(),
@@ -483,7 +497,7 @@ pub fn rename(path: &Target, dest: &Target, replace: bool) -> Result<(), Error> 
         )
     };
     nt_result(result)?;
-    checked_close(file)
+    Ok(())
 }
 fn identity(file: &File) -> Result<(u64, [u8; 16]), Error> {
     let mut id = FILE_ID_INFO::default();
@@ -568,19 +582,19 @@ impl Upload {
         link(
             self.file.as_ref().unwrap(),
             self.pin.handles.last().unwrap(),
-            path.names.last().unwrap(),
+            std::ffi::OsStr::new(path.names.last().unwrap()),
         )?;
         checked_close(self.file.take().unwrap())
     }
 }
-fn link(file: &File, parent: &File, name: &str) -> Result<(), Error> {
+fn link(file: &File, parent: &File, name: &std::ffi::OsStr) -> Result<(), Error> {
     use windows_sys::{
         Wdk::Storage::FileSystem::{
             FILE_LINK_INFORMATION, FileLinkInformation, NtSetInformationFile,
         },
         Win32::System::IO::IO_STATUS_BLOCK,
     };
-    let name: Vec<u16> = name.encode_utf16().collect();
+    let name: Vec<u16> = name.encode_wide().collect();
     let bytes = (std::mem::offset_of!(FILE_LINK_INFORMATION, FileName) + name.len() * 2)
         .max(std::mem::size_of::<FILE_LINK_INFORMATION>());
     let mut buffer = vec![0u64; bytes.div_ceil(8)];
@@ -606,9 +620,163 @@ fn link(file: &File, parent: &File, name: &str) -> Result<(), Error> {
     };
     nt_result(result)
 }
+/// Client-side native names are local policy, not remote profile components.
+pub struct LocalPublication {
+    file: File,
+    parent: File,
+    name: std::ffi::OsString,
+    cleanup: bool,
+    published: bool,
+}
+impl LocalPublication {
+    fn parent(path: &Path) -> Result<(File, std::ffi::OsString, PathBuf), Error> {
+        let absolute = std::path::absolute(path)?;
+        let name = absolute
+            .file_name()
+            .ok_or(Error::Status(Status::InvalidPath))?
+            .to_owned();
+        let parent = absolute
+            .parent()
+            .ok_or(Error::Status(Status::InvalidPath))?;
+        // Local directory symlinks are an explicit Client choice. Pin their
+        // resolved target; none of these native names comes from a peer listing.
+        let file = OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES | FILE_TRAVERSE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(parent)?;
+        Ok((file, name, parent.to_owned()))
+    }
+    pub fn new(path: &Path) -> Result<(Self, File, PathBuf), Error> {
+        use aws_lc_rs::rand::{SecureRandom, SystemRandom};
+        let (parent, name, directory) = Self::parent(path)?;
+        let mut random = [0u8; 16];
+        SystemRandom::new()
+            .fill(&mut random)
+            .map_err(|_| abort("local staging randomness"))?;
+        let stage = format!(
+            ".stpt-download-{}",
+            random
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        );
+        let file = native_open(
+            &parent,
+            &stage,
+            GENERIC_READ | GENERIC_WRITE | DELETE,
+            nt::FILE_CREATE,
+            nt::FILE_NON_DIRECTORY_FILE,
+            true,
+        )?;
+        let state = Self {
+            file,
+            parent,
+            name,
+            cleanup: true,
+            published: false,
+        };
+        crate::windows_security::check_handle(&state.file, true)
+            .map_err(|_| Error::Status(Status::Unsupported))?;
+        let primary = state.file.try_clone()?;
+        Ok((state, primary, directory.join(stage)))
+    }
+    pub fn retained(path: &Path, temp: &Path, existing: bool) -> Result<(Self, File), Error> {
+        let (parent, name, _) = Self::parent(path)?;
+        let (source, source_name, _) = Self::parent(temp)?;
+        let source_name = source_name
+            .to_str()
+            .ok_or(Error::Status(Status::InvalidPath))?;
+        let file = native_open(
+            &source,
+            source_name,
+            GENERIC_READ | GENERIC_WRITE | DELETE,
+            if existing {
+                nt::FILE_OPEN
+            } else {
+                nt::FILE_CREATE
+            },
+            nt::FILE_NON_DIRECTORY_FILE,
+            true,
+        )?;
+        if attrs(&file)?.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(Error::Status(Status::Unsupported));
+        }
+        crate::windows_security::check_handle(&file, true)
+            .map_err(|_| Error::Status(Status::Access))?;
+        let primary = file.try_clone()?;
+        Ok((
+            Self {
+                file,
+                parent,
+                name,
+                cleanup: false,
+                published: false,
+            },
+            primary,
+        ))
+    }
+    fn remove_stage(&self) -> Result<(), Error> {
+        let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+        if unsafe {
+            SetFileInformationByHandle(
+                self.file.as_raw_handle(),
+                FileDispositionInfo,
+                (&info as *const FILE_DISPOSITION_INFO).cast(),
+                std::mem::size_of_val(&info) as u32,
+            )
+        } == 0
+        {
+            return Err(os_error());
+        }
+        Ok(())
+    }
+    pub fn publish(&mut self, replace: bool) -> Result<(), Error> {
+        if replace {
+            rename_entry(&self.file, &self.parent, &self.name, true)?;
+        } else {
+            link(&self.file, &self.parent, &self.name)?;
+            self.remove_stage()?;
+        }
+        self.published = true;
+        Ok(())
+    }
+}
+impl Drop for LocalPublication {
+    fn drop(&mut self) {
+        if self.cleanup
+            && !self.published
+            && let Err(e) = self.remove_stage()
+        {
+            eprintln!("stpt: local staging cleanup failed: {e:?}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn exhaustion_and_permission_errors_have_portable_statuses() {
+        for code in [
+            ERROR_DISK_FULL,
+            ERROR_HANDLE_DISK_FULL,
+            ERROR_DISK_QUOTA_EXCEEDED,
+        ] {
+            assert_eq!(
+                io_status(&io::Error::from_raw_os_error(code as i32)),
+                Status::NoSpace
+            );
+        }
+        assert_eq!(
+            io_status(&io::Error::from_raw_os_error(ERROR_WRITE_PROTECT as i32)),
+            Status::ReadOnly
+        );
+        assert_eq!(
+            io_status(&io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32)),
+            Status::Access
+        );
+    }
     #[test]
     fn dos_mapping_validation_refuses_substituted_paths_and_aliases() {
         for mapping in [r"\Device\HarddiskVolume3", r"\Device\CdRom0"] {

@@ -146,6 +146,7 @@ mod server {
         s.ok("rename", &[text(&moved), text(&copy), "--replace"]);
         let folder = s.data.join("folder");
         s.ok("mkdir", &[text(&folder)]);
+        assert_eq!(s.ok("list", &[text(&folder)]), "");
         std::fs::write(folder.join("child"), b"x").unwrap();
         assert!(stderr(&s.fs("remove", &[text(&folder)])).contains("NOT_EMPTY"));
         s.ok("remove", &[text(&folder.join("child"))]);
@@ -293,6 +294,56 @@ mod server {
         }
     }
     #[test]
+    fn worker_write_failure_aborts_and_cleans_instead_of_sending_result() {
+        use std::os::unix::process::CommandExt;
+        let data = dir("re-review-write-failure");
+        let target = data.join("target");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_stpt"));
+        command
+            .args(["__stpt-file-worker", "65535", "1048576"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped());
+        // SAFETY: only async-signal-safe setrlimit/signal calls in the fork child.
+        unsafe {
+            command.pre_exec(|| {
+                let limit = nix::libc::rlimit {
+                    rlim_cur: 128,
+                    rlim_max: 128,
+                };
+                if nix::libc::setrlimit(nix::libc::RLIMIT_FSIZE, &limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                nix::libc::signal(nix::libc::SIGXFSZ, nix::libc::SIG_IGN);
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let mut output = child.stdout.take().unwrap();
+        p::write_ipc(
+            &mut input,
+            &Message::new(
+                wire::FILE_REQUEST,
+                vec![
+                    (0, Value::Uint(0)),
+                    (1, Value::Uint(2)),
+                    (2, path(&target)),
+                    (5, Value::Uint(256)),
+                ],
+            ),
+        )
+        .unwrap();
+        assert_eq!(p::read_ipc(&mut output).unwrap().unwrap().kind, p::ACCEPTED);
+        p::write_ipc(&mut input, &p::data(0, 0, vec![1; 256])).unwrap();
+        let failure = p::read_ipc(&mut output).unwrap().unwrap();
+        assert_eq!(failure.kind, 0);
+        assert_ne!(failure.kind, p::RESULT);
+        drop(input);
+        assert!(!child.wait().unwrap().success());
+        assert!(!target.exists());
+        assert_eq!(std::fs::read_dir(&data).unwrap().count(), 0);
+    }
+    #[test]
     fn worker_integrity_failure_and_interrupt_never_publish() {
         let dir = dir("fs-worker-integrity");
         let target = dir.join("target");
@@ -382,6 +433,42 @@ mod server {
             wire::FILE_REQUEST,
             vec![(0, Value::Uint(1)), (1, Value::Uint(3)), (2, path(&source))],
         ));
+        assert_eq!(p::status(&worker.recv()).unwrap(), p::Status::Ok);
+        std::fs::File::create(&source)
+            .unwrap()
+            .set_len(65536)
+            .unwrap();
+        worker.send(&Message::new(
+            wire::FILE_REQUEST,
+            vec![(0, Value::Uint(2)), (1, Value::Uint(1)), (2, path(&source))],
+        ));
+        assert_eq!(worker.recv().kind, p::ACCEPTED);
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(b"appended after acceptance")
+            .unwrap();
+        let mut count = 0;
+        let mut hash = p::Hash::new(1).unwrap();
+        loop {
+            let m = worker.recv();
+            if m.kind == p::DATA {
+                let bytes = p::bytes(&m, 2, count, 65536).unwrap();
+                assert!(bytes.iter().all(|b| *b == 0));
+                hash.update(bytes);
+                count += bytes.len() as u64;
+            } else {
+                assert_eq!(count, 65536);
+                assert_eq!(
+                    p::verify_end(&m, 2, count, 65536, hash.finish()).unwrap(),
+                    p::Status::Ok
+                );
+                break;
+            }
+        }
+        worker.send(&p::receipt(2, p::Status::Ok));
         assert_eq!(p::status(&worker.recv()).unwrap(), p::Status::Ok);
     }
     fn request(
@@ -637,6 +724,77 @@ mod server {
             self.connection.close(wire::Code::NoError.varint(), b"");
             self.endpoint.wait_idle().await;
         }
+    }
+    #[test]
+    #[ignore = "manual Tier RE >4GiB scenario; sparse source and bounded hash sink"]
+    fn review_download_above_four_gib() {
+        let s = Setup::new("re-review-large", None, "");
+
+        let length = (1u64 << 32) + 65536;
+        let source = s.data.join("large-sparse");
+        let file = std::fs::File::create(&source).unwrap();
+        file.set_len(length).unwrap();
+        drop(file);
+        super::quic::runtime().unwrap().block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(600), async {
+                let client = Raw::login(&s).await;
+                let request = Message::new(
+                    wire::FILE_REQUEST,
+                    vec![(0, Value::Uint(0)), (1, Value::Uint(1)), (2, path(&source))],
+                );
+                let (mut send, mut recv, a) = client.open(&request).await;
+                assert_eq!(a.kind, p::ACCEPTED);
+                assert_eq!(p::size(&a, 1).unwrap(), length);
+                let mut count = 0u64;
+                let mut hash = p::Hash::new(1).unwrap();
+                loop {
+                    let m = wire::read_message(&mut recv, 65535).await.unwrap().unwrap();
+                    if m.kind == p::DATA {
+                        let bytes = p::bytes(&m, 0, count, length).unwrap();
+                        assert!(bytes.iter().all(|b| *b == 0));
+                        hash.update(bytes);
+                        count += bytes.len() as u64;
+                    } else {
+                        assert_eq!(count, length);
+                        assert_eq!(
+                            p::verify_end(&m, 0, count, length, hash.finish()).unwrap(),
+                            p::Status::Ok
+                        );
+                        break;
+                    }
+                }
+                wire::write_message(&mut send, &p::receipt(0, p::Status::Ok), 65535)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    p::status(&wire::read_message(&mut recv, 65535).await.unwrap().unwrap())
+                        .unwrap(),
+                    p::Status::Ok
+                );
+                send.finish().unwrap();
+                let _ = wire::read_message(&mut recv, 65535).await;
+                client.close().await;
+            })
+            .await
+            .unwrap();
+        });
+        std::fs::remove_file(&source).unwrap();
+    }
+    #[test]
+    fn file_fin_during_upload_keeps_connection_usable() {
+        let s = Setup::new("re-review-upload-fin", None, "");
+        let target = s.data.join("target");
+        super::quic::runtime().unwrap().block_on(async{tokio::time::timeout(std::time::Duration::from_secs(8),async{let client=Raw::login(&s).await;let fresh=request(2,&target,Value::Array(vec![Value::Uint(0)]),Some(6),1);let(mut send,mut recv,a)=client.open(&fresh).await;assert_eq!(a.kind,p::ACCEPTED);send.finish().unwrap();assert!(matches!(wire::read_message(&mut recv,65535).await,Err(wire::StreamError::Reset(code)) if code==wire::Code::NoError.varint()),"interrupted upload must be Channel-local");assert!(client.connection.close_reason().is_none());let q=Message::new(wire::FILE_REQUEST,vec![(0,Value::Uint(0)),(1,Value::Uint(3)),(2,path(&target))]);let(_,_,m)=client.open(&q).await;assert_eq!(p::status(&m).unwrap(),p::Status::NotFound);client.close().await;}).await.unwrap();});
+    }
+    #[test]
+    fn file_fin_cancels_only_channel_under_download_backpressure() {
+        super::quic::runtime().unwrap().block_on(async{tokio::time::timeout(std::time::Duration::from_secs(8),async{
+            let s=Setup::new("re-review-fin",None,"file_timeout=1\n");let source=s.data.join("source");std::fs::File::create(&source).unwrap().set_len(32*1024*1024).unwrap();let client=Raw::login(&s).await;
+            let request=Message::new(wire::FILE_REQUEST,vec![(0,Value::Uint(0)),(1,Value::Uint(1)),(2,path(&source))]);let(mut send,mut recv,a)=client.open(&request).await;assert_eq!(a.kind,p::ACCEPTED);send.finish().unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+            assert!(matches!(wire::read_message(&mut recv,65535).await,Err(wire::StreamError::Reset(code)) if code==wire::Code::NoError.varint()),"FIN must cancel the active operation without a Connection error");
+            assert!(client.connection.close_reason().is_none());let stat=Message::new(wire::FILE_REQUEST,vec![(0,Value::Uint(0)),(1,Value::Uint(3)),(2,path(&source))]);let(_,_,m)=client.open(&stat).await;assert_eq!(p::status(&m).unwrap(),p::Status::Ok);client.close().await;
+        }).await.unwrap();});
     }
     #[test]
     fn server_retention_timeout_busy_cancel_and_consumed_token() {

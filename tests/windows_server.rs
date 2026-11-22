@@ -551,6 +551,7 @@ fn windows_files_cli_roundtrip_management_and_private_publication() {
     let moved = data.join("moved");
     let folder = data.join("folder");
     s.ok("mkdir", &[folder.to_str().unwrap()]);
+    assert_eq!(s.ok("list", &[folder.to_str().unwrap()]), "");
     s.ok(
         "rename",
         &[source.to_str().unwrap(), moved.to_str().unwrap()],
@@ -991,6 +992,91 @@ fn windows_download_resume_verifies_prefix_and_full_hash_both_algorithms() {
                     let _ = wire::read_message(&mut recv, 65535).await;
                 }
             }
+            let q = Message::new(
+                wire::FILE_REQUEST,
+                vec![
+                    (0, Value::Uint(0)),
+                    (1, Value::Uint(1)),
+                    (2, path_value(&source)),
+                ],
+            );
+            let (mut send, mut recv, a) = client.file(&q).await;
+            assert_eq!(p::size(&a, 1).unwrap(), 6);
+            use std::io::Write;
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&source)
+                .unwrap()
+                .write_all(b"appended after acceptance")
+                .unwrap();
+            let mut count = 0;
+            let mut hash = p::Hash::new(1).unwrap();
+            loop {
+                let m = wire::read_message(&mut recv, 65535).await.unwrap().unwrap();
+                if m.kind == p::DATA {
+                    let bytes = p::bytes(&m, 0, count, 6).unwrap();
+                    hash.update(bytes);
+                    count += bytes.len() as u64;
+                } else {
+                    assert_eq!(count, 6);
+                    assert_eq!(
+                        p::verify_end(&m, 0, count, 6, hash.finish()).unwrap(),
+                        p::Status::Ok
+                    );
+                    break;
+                }
+            }
+            wire::write_message(&mut send, &p::receipt(0, p::Status::Ok), 65535)
+                .await
+                .unwrap();
+            assert_eq!(
+                p::status(&wire::read_message(&mut recv, 65535).await.unwrap().unwrap()).unwrap(),
+                p::Status::Ok
+            );
+            send.finish().unwrap();
+            let _ = wire::read_message(&mut recv, 65535).await;
+            std::fs::File::create(&source)
+                .unwrap()
+                .set_len(32 * 1024 * 1024)
+                .unwrap();
+            let q = Message::new(
+                wire::FILE_REQUEST,
+                vec![
+                    (0, Value::Uint(0)),
+                    (1, Value::Uint(1)),
+                    (2, path_value(&source)),
+                ],
+            );
+            let (mut send, mut recv, a) = client.file(&q).await;
+            let length = p::size(&a, 1).unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&source)
+                .unwrap()
+                .set_len(0)
+                .unwrap();
+            let mut count = 0;
+            loop {
+                let m = wire::read_message(&mut recv, 65535).await.unwrap().unwrap();
+                if m.kind == p::DATA {
+                    count += p::bytes(&m, 0, count, length).unwrap().len() as u64;
+                } else {
+                    assert_eq!(m.kind, p::END);
+                    assert!(count < length);
+                    assert_eq!(p::status(&m).unwrap(), p::Status::Io);
+                    assert_eq!(p::size(&m, 2).unwrap(), count);
+                    break;
+                }
+            }
+            wire::write_message(&mut send, &p::receipt(0, p::Status::Io), 65535)
+                .await
+                .unwrap();
+            assert_eq!(
+                p::status(&wire::read_message(&mut recv, 65535).await.unwrap().unwrap()).unwrap(),
+                p::Status::Io
+            );
+            send.finish().unwrap();
+            let _ = wire::read_message(&mut recv, 65535).await;
             client.close().await;
         })
         .await
@@ -1086,4 +1172,92 @@ fn windows_upload_keeps_private_acl_and_checks_destination_authority_at_publicat
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(p::status(&result).unwrap(), p::Status::Access, "{result:?}");
     assert!(!dest.exists());
+}
+
+#[test]
+fn file_fin_cancels_only_channel_under_download_backpressure() {
+    use file_protocol as p;
+    let s = Setup::with_config("re-review-fin", "file_timeout=1\n");
+    let data = dir("re-review-fin-data");
+    let source = data.join("source");
+    std::fs::File::create(&source)
+        .unwrap()
+        .set_len(32 * 1024 * 1024)
+        .unwrap();
+    quic::runtime().unwrap().block_on(async{tokio::time::timeout(Duration::from_secs(8),async{
+ let client=Raw::login(&s).await;let request=Message::new(wire::FILE_REQUEST,vec![(0,Value::Uint(0)),(1,Value::Uint(1)),(2,path_value(&source))]);let(mut send,mut recv,a)=client.file(&request).await;assert_eq!(a.kind,p::ACCEPTED);send.finish().unwrap();
+ tokio::time::sleep(Duration::from_millis(2500)).await;
+ assert!(matches!(wire::read_message(&mut recv,65535).await,Err(wire::StreamError::Reset(code)) if code==wire::Code::NoError.varint()),"FIN must cancel the active operation without a Connection error");
+ assert!(client.connection.close_reason().is_none());let stat=Message::new(wire::FILE_REQUEST,vec![(0,Value::Uint(0)),(1,Value::Uint(3)),(2,path_value(&source))]);let(_,_,m)=client.file(&stat).await;assert_eq!(p::status(&m).unwrap(),p::Status::Ok);client.close().await;
+ }).await.unwrap();});
+}
+
+#[test]
+#[ignore = "manual Tier RE >4GiB scenario; sparse source and bounded hash sink"]
+fn review_download_above_four_gib() {
+    use file_protocol as p;
+    let s = Setup::new("re-review-large");
+    let data = dir("re-review-large-data");
+
+    let length = (1u64 << 32) + 65536;
+    let source = data.join("large-sparse");
+    let file = std::fs::File::create(&source).unwrap();
+    file.set_len(length).unwrap();
+    drop(file);
+    quic::runtime().unwrap().block_on(async {
+        tokio::time::timeout(std::time::Duration::from_secs(600), async {
+            let client = Raw::login(&s).await;
+            let request = Message::new(
+                wire::FILE_REQUEST,
+                vec![
+                    (0, Value::Uint(0)),
+                    (1, Value::Uint(1)),
+                    (2, path_value(&source)),
+                ],
+            );
+            let (mut send, mut recv, a) = client.file(&request).await;
+            assert_eq!(a.kind, p::ACCEPTED);
+            assert_eq!(p::size(&a, 1).unwrap(), length);
+            let mut count = 0u64;
+            let mut hash = p::Hash::new(1).unwrap();
+            loop {
+                let m = wire::read_message(&mut recv, 65535).await.unwrap().unwrap();
+                if m.kind == p::DATA {
+                    let bytes = p::bytes(&m, 0, count, length).unwrap();
+                    assert!(bytes.iter().all(|b| *b == 0));
+                    hash.update(bytes);
+                    count += bytes.len() as u64;
+                } else {
+                    assert_eq!(count, length);
+                    assert_eq!(
+                        p::verify_end(&m, 0, count, length, hash.finish()).unwrap(),
+                        p::Status::Ok
+                    );
+                    break;
+                }
+            }
+            wire::write_message(&mut send, &p::receipt(0, p::Status::Ok), 65535)
+                .await
+                .unwrap();
+            assert_eq!(
+                p::status(&wire::read_message(&mut recv, 65535).await.unwrap().unwrap()).unwrap(),
+                p::Status::Ok
+            );
+            send.finish().unwrap();
+            let _ = wire::read_message(&mut recv, 65535).await;
+            client.close().await;
+        })
+        .await
+        .unwrap();
+    });
+    std::fs::remove_file(&source).unwrap();
+}
+
+#[test]
+fn file_fin_during_upload_keeps_connection_usable() {
+    use file_protocol as p;
+    let s = Setup::new("re-review-upload-fin");
+    let data = dir("re-review-upload-fin-data");
+    let target = data.join("target");
+    quic::runtime().unwrap().block_on(async{tokio::time::timeout(Duration::from_secs(8),async{let client=Raw::login(&s).await;let(mut send,mut recv,a)=client.file(&upload_request(&target,Value::Array(vec![Value::Uint(0)]))).await;assert_eq!(a.kind,p::ACCEPTED);send.finish().unwrap();assert!(matches!(wire::read_message(&mut recv,65535).await,Err(wire::StreamError::Reset(code)) if code==wire::Code::NoError.varint()),"interrupted upload must be Channel-local");assert!(client.connection.close_reason().is_none());let q=Message::new(wire::FILE_REQUEST,vec![(0,Value::Uint(0)),(1,Value::Uint(3)),(2,path_value(&target))]);let(_,_,m)=client.file(&q).await;assert_eq!(p::status(&m).unwrap(),p::Status::NotFound);client.close().await;}).await.unwrap();});
 }
