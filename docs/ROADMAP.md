@@ -28,7 +28,7 @@ IDs A001–D008 were renamed to RA001–RD008 on 2026-10-11 (prefix scheme chang
 - [x] RC005  signals / Ctrl+C ← PC005 ✅ 2026-10-18
 - [x] RC006  interactive applications ← PC002 ✅ 2026-10-18
 - [x] RC007  graceful disconnect ← PC006 ✅ 2026-10-18
-- [ ] RC008  Windows PTY (ConPTY), Server mode on Windows ➕ 2026-10-17
+- [x] RC008  Windows PTY (ConPTY), Server mode on Windows ➕ 2026-10-17 ✅ 2026-11-22
 
 # 4	Tier RD — Session Model
 - [x] RD001  Session ID ← PD001 ✅ 2026-10-18
@@ -46,7 +46,7 @@ IDs A001–D008 were renamed to RA001–RD008 on 2026-10-11 (prefix scheme chang
 - [x] RE001  file transfer Channel ← PE001 ➕ 2026-10-13 ✅ 2026-11-21
 - [x] RE002  `stpt fs`: transfer and file management ← PE002, PE003 ➕ 2026-10-13 ✅ 2026-11-21
 - [x] RE003  resume of transfers ← PE004 ➕ 2026-10-13 ✅ 2026-11-22
-- [x] RE004  metadata and Windows paths ← PE005 ➕ 2026-10-13 ✅ 2026-11-22 (Windows Server execution remains G2/RC008)
+- [x] RE004  metadata and Windows paths ← PE005 ➕ 2026-10-13 ✅ 2026-11-22 (Windows native file service remains G3)
 
 # 6	Tier RF — Client-side File Access
 - [ ] RF001  permission grants on the Client ← PF001 ➕ 2026-10-13

@@ -9,15 +9,14 @@
 //! by group or others.
 
 use std::fmt;
-use std::fs::{self, File};
+use std::fs;
+#[cfg(unix)]
+use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use crate::auth::{AuthRequest, ed25519_raw, ed25519_spki};
 use crate::identity::{Fingerprint, PublicKey};
-
-/// Default authorized keys directory.
-pub const AUTHORIZED_KEYS_DIR: &str = "/etc/stpt/authorized_keys";
 
 /// Maximum length of a key label in bytes (§15.10).
 const MAX_LABEL_LEN: usize = 64;
@@ -36,10 +35,10 @@ impl Accounts for SystemAccounts {
         matches!(nix::unistd::User::from_name(name), Ok(Some(_)))
     }
 
-    /// Server mode is Unix only for now (gate G2).
-    #[cfg(not(unix))]
-    fn exists(&self, _name: &str) -> bool {
-        false
+    /// Windows deliberately serves only its exact current process Account.
+    #[cfg(windows)]
+    fn exists(&self, name: &str) -> bool {
+        matches!(crate::process::Account::lookup(name), Ok(Some(_)))
     }
 }
 
@@ -109,7 +108,11 @@ impl Authorizer {
         let dir_meta = fs::metadata(&self.dir).map_err(|e| KeysError::io(&self.dir, e))?;
         check_owner_and_mode(&dir_meta, &self.dir)?;
         let path = self.dir.join(account);
+        #[cfg(unix)]
         let mut file = File::open(&path).map_err(|e| KeysError::io(&path, e))?;
+        #[cfg(windows)]
+        let mut file =
+            crate::windows_security::open_read(&path).map_err(|e| KeysError::io(&path, e))?;
         let meta = file.metadata().map_err(|e| KeysError::io(&path, e))?;
         if !meta.is_file() {
             return Err(KeysError::Unsafe {
@@ -117,7 +120,10 @@ impl Authorizer {
                 what: "not a regular file",
             });
         }
+        #[cfg(unix)]
         check_owner_and_mode(&meta, &path)?;
+        #[cfg(windows)]
+        crate::windows_security::check_handle(&file, false).map_err(|e| KeysError::io(&path, e))?;
         let mut text = String::new();
         file.read_to_string(&mut text)
             .map_err(|e| KeysError::io(&path, e))?;
@@ -172,7 +178,8 @@ impl fmt::Display for KeysError {
 
 /// An Account name that names a file inside the directory and nothing else.
 fn valid_file_name(name: &str) -> bool {
-    !name.is_empty()
+    (!cfg!(windows) || crate::file_protocol::valid_windows_component(name))
+        && !name.is_empty()
         && name != "."
         && name != ".."
         && !name.contains(['/', '\\'])
@@ -200,9 +207,9 @@ fn check_owner_and_mode(meta: &fs::Metadata, path: &Path) -> Result<(), KeysErro
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn check_owner_and_mode(_meta: &fs::Metadata, _path: &Path) -> Result<(), KeysError> {
-    Ok(())
+#[cfg(windows)]
+fn check_owner_and_mode(_meta: &fs::Metadata, path: &Path) -> Result<(), KeysError> {
+    crate::windows_security::check(path).map_err(|e| KeysError::io(path, e))
 }
 
 /// Parses an authorized keys file; an invalid line invalidates the whole file.

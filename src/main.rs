@@ -1,4 +1,3 @@
-#[cfg(unix)]
 mod attachment;
 mod auth;
 mod authorized;
@@ -27,23 +26,33 @@ mod logging;
 mod modes;
 #[cfg(unix)]
 mod process;
+#[cfg(windows)]
+#[path = "process_windows.rs"]
+mod process;
 #[cfg(unix)]
 mod pty;
+#[cfg(windows)]
+#[path = "pty_windows.rs"]
+mod pty;
 mod quic;
-#[cfg(unix)]
 mod requests;
 mod server;
-#[cfg(unix)]
 mod session;
 mod terminal;
 mod tls;
 mod trust;
+#[cfg(windows)]
+mod windows_security;
 mod wire;
 
 use std::io::Write;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    #[cfg(windows)]
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__stpt-native-exec")) {
+        return process::native_exec();
+    }
     #[cfg(unix)]
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__stpt-file-worker")) {
         return crate::file_worker::main();

@@ -2,7 +2,6 @@
 
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
-use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,23 +11,22 @@ use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep_until, timeout, timeout_at};
 
 use crate::auth::{self, AuthRequest};
-use crate::authorized::{self, Accepted, Authorizer, KeyInfo, SystemAccounts};
+use crate::authorized::{Accepted, Authorizer, KeyInfo, SystemAccounts};
 use crate::cli::Common;
 use crate::config::{self, ServerConfig};
 use crate::control::{self, Sender, State};
 use crate::destination::DEFAULT_PORT;
 use crate::error::Error;
 use crate::hello::{AUTH_PUBLICKEY_ED25519, ClientHello, ServerHello};
-use crate::identity::{self, ServerKey};
+use crate::identity::ServerKey;
 use crate::logging::{self, Role};
 use crate::quic;
-#[cfg(unix)]
 use crate::session::{Policy, Store};
 
 use crate::wire::{self, Code, DEFAULT_MESSAGE_LIMIT, Failure, StreamError};
 
-/// Server mode needs a Unix PTY; Windows Server mode (ConPTY) comes with RC008 (gate G2).
-pub const AVAILABLE: bool = cfg!(unix);
+/// Native Unix PTY and Windows ConPTY backends provide Server mode.
+pub const AVAILABLE: bool = cfg!(any(unix, windows));
 
 /// Listen address without `--listen` and configuration: all addresses, port 843.
 pub const DEFAULT_LISTEN: SocketAddr =
@@ -77,7 +75,6 @@ pub struct Shared {
     pub max_file_channels: u32,
     pub deadlines: Deadlines,
     pub authorizer: Authorizer,
-    #[cfg(unix)]
     pub store: Arc<Store>,
 }
 
@@ -90,10 +87,7 @@ pub fn run(
     if !AVAILABLE {
         return Err(Error::ServerUnavailable);
     }
-    let (config, path) = config::load::<ServerConfig>(
-        common.config.as_deref(),
-        Some(PathBuf::from(config::SERVER_PATH)),
-    )?;
+    let (config, path) = config::load_server(common.config.as_deref())?;
     logging::init(
         Role::Server,
         logging::level(Role::Server, common.verbose, common.quiet, config.log_level),
@@ -109,9 +103,8 @@ pub fn run(
     let keys_dir = config
         .authorized_keys
         .clone()
-        .unwrap_or_else(|| PathBuf::from(authorized::AUTHORIZED_KEYS_DIR));
+        .unwrap_or_else(|| config::server_directory().join("authorized_keys"));
     tracing::info!(path = %keys_dir.display(), "authorized keys directory");
-    #[cfg(unix)]
     let policy = Policy {
         exit_grace: config.exit_grace.unwrap_or(Policy::DEFAULT.exit_grace),
         ..Policy::DEFAULT
@@ -128,12 +121,15 @@ pub fn run(
                 .max_file_size
                 .unwrap_or(crate::file_protocol::DEFAULT_MAX_SIZE),
             file_timeout: Duration::from_secs(config.file_timeout.unwrap_or(60)),
-            max_file_channels: config
-                .max_file_channels
-                .unwrap_or(crate::files::DEFAULT_SERVER_CAP),
+            max_file_channels: if cfg!(windows) {
+                0
+            } else {
+                config
+                    .max_file_channels
+                    .unwrap_or(crate::files::DEFAULT_SERVER_CAP)
+            },
             deadlines: Deadlines::DEFAULT,
             authorizer: Authorizer::new(keys_dir, Box::new(SystemAccounts)),
-            #[cfg(unix)]
             store: Store::start(policy),
         });
         #[cfg(unix)]
@@ -196,15 +192,19 @@ fn stop_signal() -> std::io::Result<impl Future<Output = &'static str>> {
     })
 }
 
-/// Server mode is Unix only for now (gate G2).
-#[cfg(not(unix))]
+/// Console termination events are handled within the OS shutdown deadline.
+#[cfg(windows)]
 fn stop_signal() -> std::io::Result<impl Future<Output = &'static str>> {
-    Ok(std::future::pending())
+    let terminating = crate::console::termination()?;
+    let mut interrupt = tokio::signal::windows::ctrl_c()?;
+    Ok(async move {
+        tokio::select! {signal=terminating=>signal,_=interrupt.recv()=>"INT"}
+    })
 }
 
 /// Closes every Connection with SERVER_SHUTDOWN (§13.2) and waits briefly until the
 /// Clients are told. The Sessions end with the process: their PTYs are closed, so
-/// their processes get SIGHUP.
+/// Unix processes receive SIGHUP; Windows Jobs terminate their process trees.
 async fn shut_down(endpoint: &Endpoint, signal: &str) {
     tracing::info!(signal, "shutting down");
     endpoint.close(Code::ServerShutdown.varint(), b"");
@@ -334,7 +334,6 @@ async fn serve_connection(
             label: accepted.label.clone(),
         },
         peer_limit,
-        #[cfg(unix)]
         store: shared.store.clone(),
         attached: Default::default(),
     };
@@ -355,7 +354,6 @@ async fn serve_connection(
         // Kept until the Connection ends: dropping it would end the control stream.
         std::future::pending::<()>().await;
     });
-    #[cfg(unix)]
     let context = Arc::new(crate::requests::Context {
         store: shared.store.clone(),
         account: accepted.account.clone(),
@@ -366,7 +364,6 @@ async fn serve_connection(
         let message = control_message(&mut recv, State::Authenticated).await?;
         debug_assert!(control::is_request(message.kind));
         let id = control::request_id(&message)?;
-        #[cfg(unix)]
         let request = crate::requests::parse(&message)?;
         let admitted = {
             let mut outstanding = outstanding.lock().unwrap();
@@ -383,14 +380,10 @@ async fn serve_connection(
         }
         tracing::debug!(remote = %connection.remote_address(), kind = message.kind, id, "request");
         let (results, outstanding) = (results.clone(), outstanding.clone());
-        #[cfg(unix)]
         let context = context.clone();
         tokio::spawn(async move {
-            #[cfg(unix)]
             let result = crate::requests::handle(id, request, &context).await;
-            // Server mode is Unix only for now (gate G2).
-            #[cfg(not(unix))]
-            let result = control::request_result(id, Code::InternalError);
+
             outstanding.lock().unwrap().remove(&id);
             let _ = results.send(result).await;
         });
@@ -474,7 +467,6 @@ async fn authenticate(
 }
 
 /// What the Channels of an Authenticated Connection need to know.
-// Unused where Server mode is not available (gate G2).
 #[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Clone)]
 struct ChannelContext {
@@ -488,7 +480,6 @@ struct ChannelContext {
     account: String,
     key: KeyInfo,
     peer_limit: u64,
-    #[cfg(unix)]
     store: Arc<Store>,
     /// Sessions the Connection is attached to (§14.3).
     attached: Arc<std::sync::Mutex<std::collections::HashSet<crate::terminal::SessionId>>>,
@@ -544,7 +535,6 @@ async fn open_channel(
                     }
                 }
             },
-            #[cfg(unix)]
             Ok(control::TERMINAL) => {
                 let channel = crate::attachment::Channel {
                     send,
@@ -612,7 +602,7 @@ fn server_key(config: &ServerConfig) -> Result<ServerKey, Error> {
     let path = config
         .identity_key
         .clone()
-        .unwrap_or_else(|| PathBuf::from(identity::SERVER_KEY_PATH));
+        .unwrap_or_else(|| config::server_directory().join("server_key"));
     let (key, created) = ServerKey::load_or_create(&path)?;
     let fingerprint = key.public_key().fingerprint();
     if created {
@@ -676,7 +666,6 @@ mod tests {
         }
 
         async fn start_as(deadlines: Deadlines, account: &str) -> Self {
-            #[cfg(unix)]
             let store = Store::start(Policy::DEFAULT);
             Self::serve(deadlines, account, |authorizer| Shared {
                 #[cfg(unix)]
@@ -688,7 +677,6 @@ mod tests {
                 max_file_channels: crate::files::DEFAULT_SERVER_CAP,
                 deadlines,
                 authorizer,
-                #[cfg(unix)]
                 store,
             })
             .await
@@ -885,12 +873,8 @@ mod tests {
         Message::new(wire::CHANNEL_OPEN, vec![(0, Value::Uint(kind))])
     }
 
-    /// Result code of a Session list: Sessions exist where Server mode does (gate G2).
-    const LIST_RESULT: Code = if cfg!(unix) {
-        Code::NoError
-    } else {
-        Code::InternalError
-    };
+    /// Session requests are available on both Server platforms.
+    const LIST_RESULT: Code = Code::NoError;
 
     /// Sends SESSION_LIST with request ID `id`; returns the error code of its result.
     async fn request(send: &mut quinn::SendStream, recv: &mut quinn::RecvStream, id: u64) -> Code {
@@ -1210,8 +1194,8 @@ mod tests {
     }
 
     #[test]
-    fn available_on_unix_only() {
-        assert_eq!(AVAILABLE, cfg!(unix));
+    fn available_on_primary_platforms() {
+        const { assert!(AVAILABLE) };
     }
 
     /// Terminal Channels (§14) against a Server that serves the Account of the test.

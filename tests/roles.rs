@@ -16,13 +16,9 @@ fn server_role() {
 #[cfg(windows)]
 #[test]
 fn server_role() {
-    let config = common::config_file("roles-server", "");
-    let out = stpt(&["server", "--listen", "127.0.0.1:0", "--config", &config]);
-    assert_eq!(out.status.code(), Some(255));
-    assert_eq!(
-        stderr(&out),
-        "stpt: server: Server mode is not available on this platform"
-    );
+    let config = common::server_config("roles-server", "");
+    let server = common::RunningServer::start(&["--listen", "127.0.0.1:0", "--config", &config]);
+    assert!(server.port > 0);
 }
 
 #[test]

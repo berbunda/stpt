@@ -1,7 +1,9 @@
 //! Server Identity (PROTOCOL.md §9): key pair, public key, fingerprint, key file.
 
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+#[cfg(not(windows))]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -81,9 +83,6 @@ impl FromStr for Fingerprint {
         Ok(Self(hash.try_into().map_err(|_| FingerprintError)?))
     }
 }
-
-/// Default path of the Server key file.
-pub const SERVER_KEY_PATH: &str = "/etc/stpt/server_key";
 
 /// Key pair of a Server Identity (§9.1): Ed25519.
 pub struct ServerKey {
@@ -197,7 +196,10 @@ pub fn read_private_key(path: &Path) -> Result<PrivatePkcs8KeyDer<'static>, KeyF
         path: path.to_owned(),
         source,
     };
+    #[cfg(unix)]
     let mut file = File::open(path).map_err(io_error)?;
+    #[cfg(windows)]
+    let mut file = crate::windows_security::open_read(path).map_err(io_error)?;
     check_permissions(&file, path)?;
     let mut pem = Vec::new();
     file.read_to_end(&mut pem).map_err(io_error)?;
@@ -228,9 +230,12 @@ fn check_permissions(file: &File, path: &Path) -> Result<(), KeyFileError> {
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn check_permissions(_file: &File, _path: &Path) -> Result<(), KeyFileError> {
-    Ok(())
+#[cfg(windows)]
+fn check_permissions(file: &File, path: &Path) -> Result<(), KeyFileError> {
+    crate::windows_security::check_handle(file, true).map_err(|source| KeyFileError::Io {
+        path: path.to_owned(),
+        source,
+    })
 }
 
 /// Creates the key file with a new key, readable by its owner only; never replaces
@@ -245,11 +250,18 @@ fn create(path: &Path) -> Result<ServerKey, KeyFileError> {
     }
     let der = generate_pkcs8();
     let pem = to_pem(der.secret_pkcs8_der());
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
+    #[cfg(not(windows))]
+    let mut options = {
+        let mut o = OpenOptions::new();
+        o.write(true).create_new(true);
+        o
+    };
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    #[cfg(not(windows))]
     let mut file = options.open(path).map_err(io_error)?;
+    #[cfg(windows)]
+    let mut file = crate::windows_security::create_private(path).map_err(io_error)?;
     file.write_all(pem.as_bytes()).map_err(io_error)?;
     file.sync_all().map_err(io_error)?;
     Ok(ServerKey::from_pkcs8(der).expect("generated Ed25519 key is valid"))

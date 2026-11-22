@@ -1,4 +1,4 @@
-//! Session requests on the Server (Unix; PROTOCOL.md §8.4, §15.6, §15.9, §15.10).
+//! Session requests on the Server (Unix and Windows; PROTOCOL.md §8.4, §15.6, §15.9, §15.10).
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};

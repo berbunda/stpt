@@ -1,4 +1,4 @@
-//! Sessions of the Server (Unix; PROTOCOL.md §3.2, §15).
+//! Sessions of the Server (Unix and Windows; PROTOCOL.md §3.2, §15).
 //!
 //! The store holds every Session of the Server. A Session owns its processes and
 //! their output: one task reads the output, numbers it into the output buffer and
@@ -12,9 +12,14 @@ use std::future::pending;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
 
+#[cfg(windows)]
+use crate::process::{Child, ChildStderr, ChildStdin, ChildStdout, Pid, Signal};
+#[cfg(unix)]
 use nix::sys::signal::Signal;
+#[cfg(unix)]
 use nix::unistd::Pid;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(unix)]
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, sleep_until, timeout};
@@ -617,6 +622,17 @@ impl Session {
 
     /// Sends a signal with the permissions of the Account: with a PTY to its
     /// foreground process group, else to the group of the command (§14.9).
+    #[cfg(windows)]
+    pub async fn signal(&self, signal: Signal) {
+        if signal == Signal::SIGINT {
+            if let SessionIo::Pty(master) = &self.io {
+                let _ = master.write_all(&[3]).await;
+            }
+        } else if let Some(leader) = self.leader {
+            self.deliver_signal(leader, signal).await;
+        }
+    }
+    #[cfg(unix)]
     pub async fn signal(&self, signal: Signal) {
         let group = match &self.io {
             SessionIo::Pty(master) => match master.foreground_group() {
@@ -828,6 +844,10 @@ impl Session {
             Some(status) => status,
             None => child.wait().await,
         };
+        #[cfg(windows)]
+        if let SessionIo::Pty(master) = &self.io {
+            master.close();
+        }
         match status {
             Ok(status) => Exit::from_status(status),
             Err(e) => {

@@ -20,7 +20,7 @@ pub enum Error {
     Files(crate::file_client::Error),
     Config(config::Error),
     Transport(quic::Error),
-    /// Server mode on a platform without it (gate G2).
+    /// Server mode on an unsupported platform.
     ServerUnavailable,
     /// Key file of the Server Identity.
     ServerKey(identity::KeyFileError),

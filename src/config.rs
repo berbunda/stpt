@@ -17,8 +17,21 @@ use serde::{Deserialize, Deserializer};
 
 use crate::logging;
 
-/// Default path of the Server configuration.
-pub const SERVER_PATH: &str = "/etc/stpt/server.toml";
+/// Platform directory for Server configuration, identity and authorization.
+#[cfg(unix)]
+pub fn server_directory() -> PathBuf {
+    PathBuf::from("/etc/stpt")
+}
+#[cfg(windows)]
+pub fn server_directory() -> PathBuf {
+    std::env::var_os("PROGRAMDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+        .join("stpt")
+}
+pub fn server_path() -> PathBuf {
+    server_directory().join("server.toml")
+}
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -121,12 +134,35 @@ pub fn load<T: DeserializeOwned + Default>(
     explicit: Option<&Path>,
     default: Option<PathBuf>,
 ) -> Result<(T, Option<PathBuf>), Error> {
+    load_inner(explicit, default, false)
+}
+pub fn load_server(explicit: Option<&Path>) -> Result<(ServerConfig, Option<PathBuf>), Error> {
+    load_inner(explicit, Some(server_path()), true)
+}
+fn load_inner<T: DeserializeOwned + Default>(
+    explicit: Option<&Path>,
+    default: Option<PathBuf>,
+    secure: bool,
+) -> Result<(T, Option<PathBuf>), Error> {
     let (path, required) = match (explicit, default) {
         (Some(path), _) => (path.to_owned(), true),
         (None, Some(path)) => (path, false),
         (None, None) => return Ok((T::default(), None)),
     };
-    let text = match fs::read_to_string(&path) {
+    let read = || -> io::Result<String> {
+        #[cfg(windows)]
+        if secure {
+            use std::io::Read;
+            let mut file = crate::windows_security::open_read(&path)?;
+            crate::windows_security::check_handle(&file, false)?;
+            let mut text = String::new();
+            file.read_to_string(&mut text)?;
+            return Ok(text);
+        }
+        let _ = secure;
+        fs::read_to_string(&path)
+    };
+    let text = match read() {
         Ok(text) => text,
         Err(e) if !required && e.kind() == io::ErrorKind::NotFound => {
             return Ok((T::default(), None));

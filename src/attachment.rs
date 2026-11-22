@@ -1,4 +1,4 @@
-//! Server side of a terminal Channel (Unix; PROTOCOL.md §14, §15.9): it creates a
+//! Server side of a terminal Channel (Unix and Windows; PROTOCOL.md §14, §15.9): it creates a
 //! Session or attaches to one, then relays between the Channel and the Session as
 //! one of its Attachments. The Session outlives the Channel: the Client's FIN is a
 //! detach (§14.10).
@@ -7,6 +7,9 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
+#[cfg(windows)]
+use crate::process::Signal;
+#[cfg(unix)]
 use nix::sys::signal::Signal;
 use quinn::{RecvStream, SendStream};
 use tokio::sync::{mpsc, watch};

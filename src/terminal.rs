@@ -455,6 +455,11 @@ pub fn platform_signal(id: u64) -> Option<i32> {
     PLATFORM_SIGNALS.get(index).copied()
 }
 
+/// Windows backend dispatches the portable IDs directly; no POSIX numbers.
+#[cfg(windows)]
+pub fn platform_signal(id: u64) -> Option<i32> {
+    (1..=MAX_SENDABLE_SIGNAL).contains(&id).then_some(id as i32)
+}
 /// TERMINAL_SIGNAL with signal id `id` (§14.9).
 pub fn signal(id: u64) -> Message {
     Message::new(TERMINAL_SIGNAL, vec![(0, Value::Uint(id))])
@@ -502,6 +507,10 @@ impl Exit {
         }
     }
 
+    #[cfg(windows)]
+    pub fn from_status(status: std::process::ExitStatus) -> Self {
+        Self::Code(status.code().map_or(u32::MAX, |n| n as u32))
+    }
     #[cfg(unix)]
     pub fn from_status(status: std::process::ExitStatus) -> Self {
         use std::os::unix::process::ExitStatusExt;

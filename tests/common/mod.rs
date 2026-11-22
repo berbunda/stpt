@@ -1,5 +1,9 @@
 #![allow(dead_code, reason = "every test crate uses a part of the helpers")]
 
+#[cfg(windows)]
+#[allow(dead_code)]
+#[path = "../../src/windows_security.rs"]
+pub mod windows_security;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -45,6 +49,8 @@ pub fn user_key(home: &Path) -> PathBuf {
     let path = home.join("stpt").join("id_ed25519");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, TEST_USER_KEY).unwrap();
+    #[cfg(windows)]
+    windows_security::make_private(&path).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -72,6 +78,8 @@ pub fn config_file(name: &str, text: &str) -> String {
 /// (`authorized_keys`, empty) are in the test directory.
 pub fn server_config(name: &str, text: &str) -> String {
     let dir = dir(name);
+    #[cfg(windows)]
+    windows_security::make_private(&dir).unwrap();
     let key = dir.join("server_key");
     let keys = dir.join("authorized_keys");
     std::fs::create_dir_all(&keys).unwrap();
@@ -118,7 +126,6 @@ pub fn server_until_listening(args: &[&str]) -> Vec<String> {
 }
 
 /// `stpt server` running until dropped.
-#[cfg(unix)]
 pub struct RunningServer {
     child: std::process::Child,
     pub port: u16,
@@ -126,7 +133,6 @@ pub struct RunningServer {
     log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
-#[cfg(unix)]
 impl RunningServer {
     /// Starts `stpt server` with `args` and waits until it listens.
     pub fn start(args: &[&str]) -> Self {
@@ -138,7 +144,13 @@ impl RunningServer {
         use std::io::{BufRead, BufReader};
         use std::process::Stdio;
 
-        let mut child = Command::new(binary)
+        let mut command = Command::new(binary);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x08000000);
+        }
+        let mut child = command
             .arg("server")
             .args(args)
             .stderr(Stdio::piped())
@@ -181,9 +193,18 @@ impl RunningServer {
     }
 
     /// Stops the Server with TERM, as systemd does; returns its exit code.
+    #[allow(unreachable_code)]
     pub fn stop(mut self) -> Option<i32> {
+        #[cfg(windows)]
+        {
+            self.child.kill().unwrap();
+            return self.child.wait().unwrap().code();
+        }
+        #[cfg(unix)]
         let pid = self.child.id().to_string();
+        #[cfg(unix)]
         let sent = Command::new("kill").args(["-TERM", &pid]).status().unwrap();
+        #[cfg(unix)]
         assert!(sent.success());
         let start = std::time::Instant::now();
         loop {
@@ -201,15 +222,21 @@ impl RunningServer {
 
 /// Stops the Server with TERM, so its Sessions end with it; KILL would leave their
 /// processes running.
-#[cfg(unix)]
 impl Drop for RunningServer {
     fn drop(&mut self) {
         // Stopped already (`stop`): its process ID may belong to another process now.
         if let Ok(Some(_)) = self.child.try_wait() {
             return;
         }
-        let pid = self.child.id().to_string();
-        let _ = Command::new("kill").args(["-TERM", &pid]).status();
+        #[cfg(unix)]
+        {
+            let pid = self.child.id().to_string();
+            let _ = Command::new("kill").args(["-TERM", &pid]).status();
+        }
+        #[cfg(windows)]
+        {
+            let _ = self.child.kill();
+        }
         let start = std::time::Instant::now();
         while start.elapsed() < std::time::Duration::from_secs(10) {
             if let Ok(Some(_)) = self.child.try_wait() {
