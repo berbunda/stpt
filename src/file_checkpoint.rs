@@ -18,22 +18,19 @@ pub struct Checkpoint {
     _lock: File,
 }
 fn private_open(path: &Path) -> std::io::Result<File> {
+    #[cfg(unix)]
     let mut o = OpenOptions::new();
+    #[cfg(unix)]
     o.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         o.mode(0o600).custom_flags(nix::libc::O_NOFOLLOW);
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        // Protect the actual newly opened object before writing any token or
-        // record; inherited permissions and a preceding pathname check are insufficient.
-        o.access_mode(0xc0060080);
-        o.custom_flags(0x00200000);
-    }
+    #[cfg(unix)]
     let file = o.open(path)?;
+    #[cfg(windows)]
+    let file = crate::windows_security::open_private_state(path)?;
     #[cfg(windows)]
     protect_handle(&file)?;
     if !file.metadata()?.is_file() {
@@ -75,6 +72,7 @@ fn protect_handle(file: &File) -> std::io::Result<()> {
         },
     };
     crate::windows_security::check_current_owner(file)?;
+    crate::windows_security::check_handle(file, true)?;
     if file.metadata()?.file_attributes() & 0x400 != 0 {
         return Err(std::io::Error::other(
             "resume state cannot use reparse points",
@@ -130,14 +128,18 @@ pub fn local_path(path: &Path) -> Value {
 }
 impl Checkpoint {
     pub fn open(dir: &Path, binding: Value) -> Result<Self, Error> {
-        #[allow(unused_mut)]
+        #[cfg(unix)]
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
             builder.mode(0o700);
         }
-        match builder.create(dir) {
+        #[cfg(unix)]
+        let created = builder.create(dir);
+        #[cfg(windows)]
+        let created = crate::windows_security::create_private_state_directory(dir);
+        match created {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e.into()),

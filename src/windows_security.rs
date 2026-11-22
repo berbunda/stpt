@@ -234,6 +234,93 @@ pub fn create_private(path: &Path) -> io::Result<std::fs::File> {
         OwnedHandle::from_raw_handle(raw)
     }))
 }
+/// Atomically create private Client state, or validate an existing object.
+/// An inherited DACL followed by a later restriction can leave an already-open
+/// reader with access, so the descriptor must participate in CreateFileW.
+fn state_descriptor(inherit: bool) -> io::Result<Local> {
+    let own = current_sid()?;
+    let mut owner = std::ptr::null_mut();
+    if unsafe { ConvertSidToStringSidW(own.as_ptr() as _, &mut owner) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let _owner = Local(owner.cast());
+    let mut length = 0;
+    // SAFETY: ConvertSidToStringSidW returns an allocated NUL-terminated string,
+    // kept alive by _owner through descriptor conversion.
+    while unsafe { *owner.add(length) } != 0 {
+        length += 1;
+    }
+    let owner = String::from_utf16(unsafe { std::slice::from_raw_parts(owner, length) })
+        .map_err(|_| io::Error::other("invalid owner SID text"))?;
+    let grants = if inherit {
+        "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)"
+    } else {
+        "D:P(A;;FA;;;OW)(A;;FA;;;SY)"
+    };
+    let sddl: Vec<u16> = format!("O:{owner}{grants}")
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    let mut raw_sd = std::ptr::null_mut();
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            1,
+            &mut raw_sd,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(Local(raw_sd))
+}
+pub(crate) fn create_private_state_directory(path: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+    let sd = state_descriptor(true)?;
+    let sa = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: sd.0,
+        bInheritHandle: 0,
+    };
+    let name: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    if unsafe { CreateDirectoryW(name.as_ptr(), &sa) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+pub(crate) fn open_private_state(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::*;
+    let sd = state_descriptor(false)?;
+    let sa = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: sd.0,
+        bInheritHandle: 0,
+    };
+    let name: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let raw = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE | READ_CONTROL | WRITE_DAC,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            &sa,
+            OPEN_ALWAYS,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if raw == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    let file = std::fs::File::from(unsafe { OwnedHandle::from_raw_handle(raw) });
+    // The creation descriptor is ignored for an existing file. Reject unsafe
+    // existing access before any record bytes are read, truncated or written.
+    check_current_owner(&file)?;
+    check_handle(&file, true)?;
+    Ok(file)
+}
 #[cfg(test)]
 pub fn make_private(path: &Path) -> io::Result<()> {
     let file = OpenOptions::new()
@@ -266,6 +353,27 @@ mod tests {
         check_private(&path).unwrap();
         make_private(&path).unwrap();
         check_private(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let directory = path.with_extension("state-dir");
+        create_private_state_directory(&directory).unwrap();
+        check_private(&directory).unwrap();
+        let state_path = directory.join("state");
+        let state_file = open_private_state(&state_path).unwrap();
+        check_current_owner(&state_file).unwrap();
+        check_handle(&state_file, true).unwrap();
+        drop(state_file);
+        std::fs::remove_file(state_path).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+        let mut file = open_private_state(&path).unwrap();
+        check_current_owner(&file).unwrap();
+        check_handle(&file, true).unwrap();
+        use std::io::{Read, Seek, Write};
+        file.write_all(b"state").unwrap();
+        file.rewind().unwrap();
+        let mut bytes = [0; 5];
+        file.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"state");
+        drop(file);
         std::fs::remove_file(path).unwrap();
     }
     #[test]
@@ -304,6 +412,7 @@ mod tests {
             );
         };
         set("D:P(A;;FA;;;OW)(A;;FR;;;WD)");
+        assert!(open_private_state(&path).is_err());
         assert!(check(&path).is_ok());
         assert!(check_private(&path).is_err());
         set("D:P(A;;FA;;;WD)");

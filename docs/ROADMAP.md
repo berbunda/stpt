@@ -48,7 +48,7 @@ IDs A001–D008 were renamed to RA001–RD008 on 2026-10-11 (prefix scheme chang
 - [x] RE003  resume of transfers ← PE004 ➕ 2026-10-13 ✅ 2026-11-22
 - [x] RE004  metadata and Windows paths ← PE005 ➕ 2026-10-13 ✅ 2026-11-22 (Windows native file service completed in 0.4.1-0; G3 resolved)
 
-Tier RE scenario review completed ✅ 2026-11-22, program 0.4.1-1: [results and limits](RE_REVIEW.md).
+Tier RE scenario review completed ✅ 2026-11-22, program 0.4.1-2: [results and limits](RE_REVIEW.md).
 
 # 6	Tier RF — Client-side File Access
 - [ ] RF001  permission grants on the Client ← PF001 ➕ 2026-10-13

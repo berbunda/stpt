@@ -1,6 +1,6 @@
 # Tier RE scenario review
 
-Date: 2026-11-22. Program: **0.4.1-1**. Protocol: draft-48; normative wire rules are unchanged from draft-47. Scope: RE001–RE004 and all 30 scenarios in the [Tier PE review](https://github.com/berbunda/stpt-protocol/blob/main/docs/PE_REVIEW.md).
+Date: 2026-11-22. Program: **0.4.1-2** (Windows atomic-creation follow-up to 0.4.1-1). Protocol: draft-49; normative wire rules are unchanged from draft-47. Scope: RE001–RE004 and all 30 scenarios in the [Tier PE review](https://github.com/berbunda/stpt-protocol/blob/main/docs/PE_REVIEW.md).
 
 The review is complete with the fixes below. No unresolved implementation issue was identified within these scenarios after the fixes and final checks. This is scenario-based implementation validation, not a formal proof or a production security certification. Supported refusals and platform limits remain explicit.
 
@@ -8,12 +8,12 @@ The review is complete with the fixes below. No unresolved implementation issue 
 
 1. **Active FIN and resource lifetime.** A FIN was forwarded as a private worker close message even during an upload, where the worker parsed it as an invalid END and closed the whole Connection. During a backpressured download, waiting for worker output after FIN also bypassed the operation deadline. Reproduced before fixing on Windows; the deadline failure was independently reproduced on Linux. Active FIN now interrupts only the file Channel with NO_ERROR, drops unretained state and leaves other Channels usable. The relay keeps cancellation/deadline monitoring after input completion. Native upload-FIN and download-backpressure regressions pass on both platforms.
 2. **Client publication of verified bytes.** After closing verified staging, the Client reopened its source by pathname for hard-link/rename publication. A substituted staging name could publish different bytes. The regression reproduced the wrong bytes on both Windows and Linux before fixing. Unix now creates ordinary download staging inside a private directory and publishes through held source/destination directory descriptors. Windows retains the actual source file handle, denies write/delete sharing, and publishes with native handle-relative link/rename operations. Retained data also uses native non-followed opens and held publication objects. The replacement test now publishes the verified bytes or prevents the substitution; racing final destinations remain protected.
-3. **Resume-file privacy.** Unix now checks current ownership and private mode on each opened state file before truncation/writing, not just on its containing directory. Windows checks the actual object's current owner, refuses reparses and protects its DACL before writing, including newly created files; no pathname check is used as a substitute. This prevents relying on inherited grants or granting OWNER RIGHTS to an unrelated owner. Existing checkpoint/locking tests and a new Unix unsafe-state-file regression pass. Native Windows multi-Account logon was not added or claimed.
+3. **Resume-file privacy.** Unix now checks current ownership and private mode on each opened state file before truncation/writing, not just on its containing directory. Windows creates state directories/files atomically with an explicit current-user owner and protected owner/SYSTEM DACL, refuses unsafe existing state or reparses, and validates the actual opened object before writing. It never relies on briefly inherited grants followed by tightening. This prevents relying on inherited grants or granting OWNER RIGHTS to an unrelated owner. Existing checkpoint/locking tests and a new Unix unsafe-state-file regression pass. Native Windows multi-Account logon was not added or claimed.
 
 ## Execution results
 
-- Windows: `cargo test` **273 passed**, one manual large-transfer case ignored by default and explicitly run successfully; **274 passing test executions** including that case. Clippy all targets with `-D warnings` passed.
-- Ubuntu VM: `cargo test --offline --locked` **308 passed**, seven ignored: six pre-existing non-RE root/long-loss cases and the manual large-transfer case. The large case was explicitly run and passed, giving **309 passing test executions** including it. Clippy all targets with `-D warnings` passed.
+- Windows 0.4.1-2: `cargo test` **273 passed**, one manual large-transfer case ignored by default and explicitly run successfully; **274 passing test executions** including that case. Clippy all targets with `-D warnings` passed.
+- Ubuntu VM 0.4.1-1: `cargo test --offline --locked` **308 passed**, seven ignored: six pre-existing non-RE root/long-loss cases and the manual large-transfer case. The large case was explicitly run and passed, giving **309 passing test executions** including it. Clippy all targets with `-D warnings` passed.
 - Separate root Linux file suite: **61 passed**, with the already-executed manual large case excluded. This run exercises actual root/nobody authority separation and foreign authenticated Account token refusal; it overlaps the ordinary suite.
 - Real large download: **4295032832 bytes** (4 GiB + 64 KiB), complete digest and final receipt/result, bounded hash sink on both platforms. The source is sparse; Linux never needs a 4-GiB destination on its small tmpfs. An actual 4-GiB staged upload was not attempted; upload offset/count boundaries and resource refusals are checked separately.
 - Additional final targeted runs cover extended aggregate record/byte quotas, empty directory listings, source growth and native Windows early EOF. Formatting, diff, package/lock version, roadmap-ID preservation and document consistency checks passed.
@@ -27,6 +27,8 @@ cargo fmt -- --check
 cargo test --test windows_server review_download_above_four_gib -- --ignored --nocapture
 cargo test --test fs review_download_above_four_gib -- --ignored --nocapture
 ```
+
+The large-transfer runs used 0.4.1-1. The 0.4.1-2 follow-up changes Windows checkpoint creation only; the Unix runtime path is unchanged and its Linux evidence remains the 0.4.1-1 run. The final 0.4.1-2 Windows standard suite and Clippy passed. Atomic file creation passes the descriptor directly to [CreateFileW](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew); unsafe existing state is checked separately because that creation descriptor does not replace an existing object's security.
 
 The first manual command is Windows-only; the second is Linux-only. Privileged Linux file cases additionally ran under root in the isolated VM workspace.
 
