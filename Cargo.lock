@@ -673,7 +673,7 @@ dependencies = [
 
 [[package]]
 name = "stpt"
-version = "0.3.4-0"
+version = "0.3.5-0"
 dependencies = [
  "aws-lc-rs",
  "base64",

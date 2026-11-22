@@ -78,7 +78,23 @@ stpt fs remove alice@host /home/alice/empty-directory
 - Existing destinations are protected by default, including a destination created concurrently with the transfer. Pull `--replace` explicitly permits local replacement; rename `--replace` permits an atomic native replacement. **Push cannot replace an existing destination yet:** even with `--replace` it returns UNSUPPORTED. This preserves the protocol's regular-file-only replacement requirement without a check/rename race. There is no delete-and-retry fallback.
 - `list` prints kind, logical size (or `-`) and a byte-escaped entry name, separated by tabs; `stat` prints kind and size. A failed listing may already have printed incomplete batches. Neither transfers nor listings are filesystem snapshots. Minimal kind/size metadata is available; timestamps, permissions and source ACLs are not copied.
 - Final symlinks are inspected, removed or renamed as entries. This implementation refuses downloads through final symlinks; directory listing may follow one. Devices, FIFOs and sockets are not transferred. The service is not confined to the home directory: normal Account permissions apply.
-- Ctrl+C cancels the operation. A Connection loss or missing final result is an error; a modifying operation may already have committed. STPT does not automatically retry it. Resume remains RE003; Windows Server paths and extended metadata remain RE004. Windows Clients can transfer to Linux Servers now.
+- Ctrl+C cancels the operation. A Connection loss or missing final result is an error; a modifying operation may already have committed. STPT does not automatically retry it. Explicit resume is available as described below; Windows Server paths and extended metadata remain RE004. Windows Clients can transfer to Linux Servers now.
+
+## Resume
+Add `--resume-state DIRECTORY` to push or pull to opt in. After a lost Connection or file timeout, rerun the **same command** with the same directory to request resume explicitly:
+
+```
+stpt fs push alice@host ./local.bin /home/alice/remote.bin --resume-state ./upload-state
+stpt fs pull alice@host /home/alice/remote.bin ./copy.bin --resume-state ./download-state
+```
+
+The directory belongs to one transfer: it binds the verified Server Identity, Account, remote path, local path, algorithm and replacement policy. Use a dedicated private directory; STPT requires mode 0700 and the current owner on Unix, and restricts its Windows DACL to the owner and SYSTEM. Concurrent use is locked. Download state must be on a filesystem that can publish to the chosen local destination using the requested native operation; choosing a directory beside that destination is recommended. Both endpoints reread and hash the prefix, then verify the whole file including that prefix. A changed download length/prefix is refused; a changed upload prefix cancels the attempt. A changed suffix is not an immutable historical snapshot.
+
+There is no automatic retry, restart from zero or hash downgrade. `RESUME_BUSY` means the earlier upload still owns the token; retry the same command after it ends. `RESUME_UNAVAILABLE` can mean expired, evicted, mismatched, consumed or restarted Server state; it does not prove whether an upload was published. In particular, loss of the final result after FILE_END leaves an unknown outcome. Inspect the destination before deciding on a separate fresh transfer. A refused resume keeps its Client record; use another directory for a deliberate fresh attempt. A zero-byte download checkpoint cannot resume and likewise needs an explicit fresh attempt.
+
+Server upload state is private to the running Server and expires one hour after interruption. Fixed limits reserve the full declared lengths: 4 uploads / 8 GiB per Account, 16 uploads / 16 GiB total, within the 32-worker limit. Upload retention is admitted on the first request of a new file Channel. Only detected Connection loss or a no-progress timeout before complete FILE_END qualifies; Ctrl+C, explicit cancellation, errors, complete FILE_END and graceful Server shutdown discard upload state. Retained workers keep Account-owned staging and the original directory identity; current authentication, credentials, permissions and policy are rechecked. Server restart invalidates tokens. The Server holds no download resume state.
+
+Successful completion and explicit cancellation remove the Client record and partial data; an empty directory and its lock file remain for safe concurrent locking. Keep tokens and partial files private. To abandon saved Client state, remove the dedicated directory when no command uses it; interrupted Server uploads expire independently. Without `--resume-state`, transfers retain their previous cleanup behavior.
 
 # Private key, public key, fingerprint
 Three different texts appear around keys. Do not mix them up.

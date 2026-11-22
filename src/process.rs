@@ -93,7 +93,7 @@ fn parse_environment(text: &str) -> Vec<(String, String)> {
 }
 
 /// An operating system Account, as found in the user database.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Account {
     pub name: String,
     uid: Uid,

@@ -233,7 +233,8 @@ async fn perform(
     login: &mut Login<'_>,
 ) -> Result<ExitCode, Error> {
     match action {
-        Action::Files(operation, deadline) => {
+        Action::Files(mut operation, deadline) => {
+            operation.server_identity = connection.server_identity.as_spki().to_vec();
             let mut channel = connection
                 .open_files()
                 .await
@@ -241,7 +242,6 @@ async fn perform(
             let result = tokio::select! {
                 result=crate::file_client::run(&mut channel,operation,connection.peer_limit,deadline)=>result.map_err(Error::Files),
                 _=tokio::signal::ctrl_c()=>Err(Error::Interrupted),
-                reason=connection.connection.closed()=>Err(Error::Files(crate::file_client::Error::Stream(StreamError::Lost(reason)))),
                 ()=follow_network(connection.endpoint.clone(),connection.connection.remote_address())=>unreachable!(),
             };
             if result.is_ok()
@@ -431,6 +431,7 @@ fn resolve(address: &Address) -> Result<SocketAddr, Error> {
 
 /// Connection with a trusted Server key.
 pub struct Connection {
+    server_identity: crate::identity::PublicKey,
     files: Option<crate::files::Budget>,
     authenticated: bool,
     endpoint: quinn::Endpoint,
@@ -1474,11 +1475,12 @@ async fn connect(
             Ok(connection) => {
                 let (key, _) = outcome.expect("a Connection is established with a trusted key");
                 if store.get(address).is_none() {
-                    store.add(address.clone(), key)?;
+                    store.add(address.clone(), key.clone())?;
                     tracing::info!(%address, "Server key verified by fingerprint and stored");
                 }
                 tracing::debug!(%address, "TLS handshake completed, Server key trusted");
                 return Ok(Connection {
+                    server_identity: key.clone(),
                     files: None,
                     authenticated: false,
                     endpoint,

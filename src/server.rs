@@ -70,6 +70,8 @@ impl Default for Deadlines {
 pub struct Shared {
     #[cfg(unix)]
     pub file_workers: Arc<tokio::sync::Semaphore>,
+    #[cfg(unix)]
+    pub file_resume: Arc<crate::file_resume::Store>,
     pub max_file_size: u64,
     pub file_timeout: Duration,
     pub max_file_channels: u32,
@@ -120,6 +122,8 @@ pub fn run(
         let shared = Arc::new(Shared {
             #[cfg(unix)]
             file_workers: Arc::new(tokio::sync::Semaphore::new(32)),
+            #[cfg(unix)]
+            file_resume: Default::default(),
             max_file_size: config
                 .max_file_size
                 .unwrap_or(crate::file_protocol::DEFAULT_MAX_SIZE),
@@ -132,6 +136,16 @@ pub fn run(
             #[cfg(unix)]
             store: Store::start(policy),
         });
+        #[cfg(unix)]
+        let expiry = {
+            let store = shared.file_resume.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    store.expire();
+                }
+            })
+        };
         let endpoint = quic::listen(listen, &key)?;
         let local = endpoint.local_addr().map_err(|source| quic::Error::Bind {
             addr: listen,
@@ -142,6 +156,11 @@ pub fn run(
         tokio::select! {
             () = serve(endpoint.clone(), shared.clone()) => {}
             signal = stop => shut_down(&endpoint, signal).await,
+        }
+        #[cfg(unix)]
+        {
+            expiry.abort();
+            shared.file_resume.clear();
         }
         #[cfg(unix)]
         if timeout(
@@ -303,6 +322,8 @@ async fn serve_connection(
     let context = ChannelContext {
         #[cfg(unix)]
         file_workers: shared.file_workers.clone(),
+        #[cfg(unix)]
+        file_resume: shared.file_resume.clone(),
         max_file_size: shared.max_file_size,
         file_timeout: shared.file_timeout,
         files: crate::files::selected(&answer.capabilities)
@@ -459,6 +480,8 @@ async fn authenticate(
 struct ChannelContext {
     #[cfg(unix)]
     file_workers: Arc<tokio::sync::Semaphore>,
+    #[cfg(unix)]
+    file_resume: Arc<crate::file_resume::Store>,
     max_file_size: u64,
     file_timeout: Duration,
     files: Option<crate::files::Budget>,
@@ -509,6 +532,7 @@ async fn open_channel(
                             max_size: context.max_file_size,
                             timeout: context.file_timeout,
                             workers: context.file_workers.clone(),
+                            resume: context.file_resume.clone(),
                         },
                     )
                     .await;
@@ -657,6 +681,8 @@ mod tests {
             Self::serve(deadlines, account, |authorizer| Shared {
                 #[cfg(unix)]
                 file_workers: Arc::new(tokio::sync::Semaphore::new(32)),
+                #[cfg(unix)]
+                file_resume: Default::default(),
                 max_file_size: crate::file_protocol::DEFAULT_MAX_SIZE,
                 file_timeout: Duration::from_secs(60),
                 max_file_channels: crate::files::DEFAULT_SERVER_CAP,
@@ -673,6 +699,8 @@ mod tests {
             let store = Store::start(policy);
             Self::serve(Deadlines::DEFAULT, account, |authorizer| Shared {
                 file_workers: Arc::new(tokio::sync::Semaphore::new(32)),
+                #[cfg(unix)]
+                file_resume: Default::default(),
                 max_file_size: crate::file_protocol::DEFAULT_MAX_SIZE,
                 file_timeout: Duration::from_secs(60),
                 max_file_channels: crate::files::DEFAULT_SERVER_CAP,

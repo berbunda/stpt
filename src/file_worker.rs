@@ -8,7 +8,7 @@ use nix::sys::stat::{Mode, fstatat, mkdirat};
 use nix::unistd::{UnlinkatFlags, unlinkat};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
@@ -71,8 +71,16 @@ pub fn main() -> ExitCode {
     };
     let (mut input, mut output) = (std::io::stdin().lock(), std::io::stdout().lock());
     let mut last = None;
+    let mut saved = None;
     let run = (|| -> Result<(), Error> {
         while let Some(message) = p::read_ipc(&mut input)? {
+            if message.kind == 2 {
+                break;
+            }
+            if message.kind == 1 {
+                saved = None;
+                continue;
+            }
             let request = Request::parse(&message)?;
             if last.is_none() && request.id != 0 || last.is_some_and(|id| request.id <= id) {
                 return Err(Failure::violation(
@@ -88,8 +96,13 @@ pub fn main() -> ExitCode {
                 &mut output,
                 peer_limit.min(65535),
                 max_size,
+                &mut saved,
             ) {
-                Ok(()) => {}
+                Ok(()) => {
+                    if saved.is_some() {
+                        last = None;
+                    }
+                }
                 Err(Error::Status(status)) => {
                     send(&mut output, &p::result(id, status, None), peer_limit)?
                 }
@@ -183,14 +196,22 @@ fn handle(
     w: &mut impl Write,
     limit: u64,
     max_size: u64,
+    saved: &mut Option<Saved>,
 ) -> Result<(), Error> {
-    if q.resume || !(1..=7).contains(&q.kind) {
+    if q.resume
+        .as_ref()
+        .and_then(Value::as_array)
+        .and_then(|a| a.first())
+        .and_then(Value::as_uint)
+        .is_some_and(|n| n > 2)
+        || !(1..=7).contains(&q.kind)
+    {
         return Err(Error::Status(Status::Unsupported));
     }
     let path = native(&q.path, matches!(q.kind, 3 | 4))?;
     match q.kind {
         1 => download(&q, &path, r, w, limit, max_size),
-        2 => upload(&q, &path, r, w, limit, max_size),
+        2 => upload(&q, &path, r, w, limit, max_size, saved),
         3 => {
             let m = std::fs::symlink_metadata(path)?;
             send(w, &p::result(q.id, Status::Ok, Some(metadata(&m))), limit)
@@ -331,7 +352,7 @@ impl Staging {
         let file: File = openat(
             &staging.dir,
             "data",
-            OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
             Mode::from_bits_truncate(0o600),
         )?
         .into();
@@ -357,6 +378,13 @@ impl Drop for Staging {
         }
     }
 }
+struct Saved {
+    stage: Staging,
+    file: File,
+    count: u64,
+    request: Request,
+    token: Vec<u8>,
+}
 fn upload(
     q: &Request,
     path: &std::path::Path,
@@ -364,50 +392,138 @@ fn upload(
     w: &mut impl Write,
     limit: u64,
     max_size: u64,
+    saved: &mut Option<Saved>,
 ) -> Result<(), Error> {
     let length = q.length.unwrap();
     if length > max_size {
         return Err(Error::Status(Status::Limit));
     }
     let mut hash = p::Hash::new(q.algorithm).ok_or(Error::Status(Status::Unsupported))?;
+    let mode = q.resume.as_ref().and_then(Value::as_array);
+    let resumed = mode.is_some_and(|a| a[0].as_uint() == Some(1));
+    let retained = mode.is_some();
     let (dir, name) = parent(path)?;
-    if q.replace {
-        match fstatat(&dir, name.as_os_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
-            // POSIX has no conditional rename that both replaces and requires a
-            // regular destination at the mutation. Refuse rather than race it.
-            Ok(_) => return Err(Error::Status(Status::Unsupported)),
-            Err(nix::errno::Errno::ENOENT) => {}
-            Err(e) => return Err(e.into()),
+    let mut state = if resumed {
+        let mut state = saved
+            .take()
+            .ok_or(Error::Status(Status::ResumeUnavailable))?;
+        let old = &state.request;
+        let current = dir.metadata()?;
+        let original = state.stage.parent.metadata()?;
+        if old.path != q.path
+            || old.length != q.length
+            || old.algorithm != q.algorithm
+            || old.replace != q.replace
+            || mode.unwrap()[1] != Value::Bytes(state.token.clone())
+            || current.dev() != original.dev()
+            || current.ino() != original.ino()
+        {
+            return Err(Error::Status(Status::ResumeUnavailable));
         }
+        state.file.set_len(state.count)?;
+        state.file.seek(SeekFrom::Start(0))?;
+        hash_prefix(&mut state.file, state.count, &mut hash)?;
+        state
+    } else {
+        if q.replace {
+            match fstatat(&dir, name.as_os_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
+                Ok(_) => return Err(Error::Status(Status::Unsupported)),
+                Err(nix::errno::Errno::ENOENT) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let (stage, file) = Staging::new(dir)?;
+        let mut token = vec![0; 32];
+        if retained {
+            use aws_lc_rs::rand::{SecureRandom, SystemRandom};
+            SystemRandom::new()
+                .fill(&mut token)
+                .map_err(|_| abort("resume randomness"))?;
+        }
+        Saved {
+            stage,
+            file,
+            count: 0,
+            request: q.clone(),
+            token,
+        }
+    };
+    let mut acceptance = p::accepted(q.id, length, q.algorithm);
+    if retained {
+        acceptance.body.push((
+            Value::Uint(3),
+            Value::Array(vec![
+                Value::Bytes(state.token.clone()),
+                Value::Uint(state.count),
+                Value::Bytes(hash.clone().finish().to_vec()),
+            ]),
+        ));
     }
-    let (stage, mut file) = Staging::new(dir)?;
-    send(w, &p::accepted(q.id, length, q.algorithm), limit)?;
-    let mut count = 0;
+    send(w, &acceptance, limit)?;
     let status = loop {
         let m = next(r)?;
+        // Private parent command, never accepted from the wire. Checkpoint only
+        // after the relay established eligible loss/timeout before complete END.
+        if m.kind == 1 {
+            if retained {
+                state.file.set_len(state.count)?;
+                state.file.flush()?;
+                *saved = Some(state);
+                send(w, &Message::new(1, vec![]), limit)?;
+                return Ok(());
+            }
+            return Err(abort("unexpected checkpoint"));
+        }
         if m.kind == p::DATA {
-            let bytes = p::bytes(&m, q.id, count, length)?;
-            file.write_all(bytes).map_err(|error| {
-                let code = if io_status(&error) == Status::NoSpace {
-                    Code::LimitExceeded
-                } else {
-                    Code::InternalError
-                };
-                Error::Failure(Failure::new(code, "staging write failed"))
+            let bytes = p::bytes(&m, q.id, state.count, length)?;
+            state.file.write_all(bytes).map_err(|error| {
+                Error::Failure(Failure::new(
+                    if io_status(&error) == Status::NoSpace {
+                        Code::LimitExceeded
+                    } else {
+                        Code::InternalError
+                    },
+                    "staging write failed",
+                ))
             })?;
             hash.update(bytes);
-            count += bytes.len() as u64;
+            state.count += bytes.len() as u64;
         } else {
-            break p::verify_end(&m, q.id, count, length, hash.finish())?;
+            break p::verify_end(&m, q.id, state.count, length, hash.finish())?;
         }
     };
     if status != Status::Ok {
         return send(w, &p::result(q.id, status, None), limit);
     }
-    file.flush()?;
-    nix::unistd::close(file)?;
-    no_replace(&stage.dir, OsStr::new("data"), &stage.parent, &name)?;
+    state.file.flush()?;
+    nix::unistd::close(state.file)?;
+    // Re-resolve under current Account permissions; pin the original parent.
+    let (current, _) = parent(path)?;
+    let a = current.metadata()?;
+    let b = state.stage.parent.metadata()?;
+    if a.dev() != b.dev() || a.ino() != b.ino() {
+        return Err(Error::Status(Status::ResumeUnavailable));
+    }
+    no_replace(
+        &state.stage.dir,
+        OsStr::new("data"),
+        &state.stage.parent,
+        &name,
+    )?;
     send(w, &p::result(q.id, Status::Ok, None), limit)
+}
+fn hash_prefix(file: &mut File, mut remaining: u64, hash: &mut p::Hash) -> Result<(), Error> {
+    let mut buffer = vec![0; p::CHUNK];
+    while remaining > 0 {
+        let wanted = remaining.min(buffer.len() as u64) as usize;
+        let n = file.read(&mut buffer[..wanted])?;
+        if n == 0 {
+            return Err(Error::Status(Status::ResumeUnavailable));
+        }
+        hash.update(&buffer[..n]);
+        remaining -= n as u64;
+    }
+    Ok(())
 }
 fn download(
     q: &Request,
@@ -438,8 +554,25 @@ fn download(
     if length > max_size || length > p::MAX_SIZE {
         return Err(Error::Status(Status::Limit));
     }
-    send(w, &p::accepted(q.id, length, q.algorithm), limit)?;
     let mut count = 0;
+    let mut acceptance = p::accepted(q.id, length, q.algorithm);
+    if let Some(a) = q.resume.as_ref().and_then(Value::as_array) {
+        if a[0].as_uint() != Some(2) {
+            return Err(Error::Status(Status::Unsupported));
+        }
+        count = a[2].as_uint().unwrap();
+        if a[1].as_uint() != Some(length) {
+            return Err(Error::Status(Status::ResumeUnavailable));
+        }
+        hash_prefix(&mut file, count, &mut hash)?;
+        if a[3] != Value::Bytes(hash.clone().finish().to_vec()) {
+            return Err(Error::Status(Status::ResumeUnavailable));
+        }
+        acceptance
+            .body
+            .push((Value::Uint(3), Value::Array(vec![Value::Uint(count)])));
+    }
+    send(w, &acceptance, limit)?;
     let mut buffer = vec![0; p::CHUNK];
     let mut status = Status::Ok;
     while count < length {

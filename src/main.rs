@@ -12,8 +12,11 @@ mod console;
 mod control;
 mod destination;
 mod error;
+mod file_checkpoint;
 mod file_client;
 mod file_protocol;
+#[cfg(unix)]
+mod file_resume;
 #[cfg(unix)]
 mod file_worker;
 mod files;

@@ -115,6 +115,7 @@ pub struct Service<'a> {
     pub max_size: u64,
     pub timeout: Duration,
     pub workers: Arc<Semaphore>,
+    pub resume: Arc<crate::file_resume::Store>,
 }
 
 #[cfg(unix)]
@@ -243,22 +244,57 @@ async fn worker_relay(
             return Ok(());
         }
     };
-    let mut child = match account {
-        Ok(Some(account)) => match account.file_worker(peer_limit, service.max_size) {
+    let account = match account {
+        Ok(Some(a)) => a,
+        _ => {
+            abort(&mut send, &mut recv, Code::ChannelRejected);
+            return Ok(());
+        }
+    };
+    let retained = request.kind == 2
+        && request
+            .resume
+            .as_ref()
+            .and_then(Value::as_array)
+            .and_then(|a| a.first())
+            .and_then(Value::as_uint)
+            .is_some_and(|n| n <= 1);
+    let (lease, parked) = if retained {
+        match service.resume.acquire(&account, &request) {
+            Ok((l, w)) => (Some(l), w),
+            Err(status) => {
+                wire::write_message(&mut send, &p::result(request.id, status, None), peer_limit)
+                    .await
+                    .map_err(|_| Failure::new(Code::InternalError, "resume refusal"))?;
+                let _ = send.finish();
+                return Ok(());
+            }
+        }
+    } else {
+        (None, None)
+    };
+    let lease = std::sync::Mutex::new(lease);
+    let mut worker = if let Some(w) = parked {
+        drop(_worker_slot);
+        w
+    } else {
+        let mut child = match account.file_worker(peer_limit, service.max_size) {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(?e, "file worker start failed");
                 abort(&mut send, &mut recv, Code::ChannelRejected);
                 return Ok(());
             }
-        },
-        _ => {
-            abort(&mut send, &mut recv, Code::ChannelRejected);
-            return Ok(());
+        };
+        crate::file_resume::Worker {
+            input: child.stdin.take(),
+            output: child.stdout.take(),
+            child: Some(child),
+            permit: Some(_worker_slot),
         }
     };
-    let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = child.stdout.take().unwrap();
+    let stdin = worker.input.as_mut().unwrap();
+    let stdout = worker.output.as_mut().unwrap();
     let progress = std::sync::Mutex::new((true, tokio::time::Instant::now()));
     let stopped = send.stopped();
     let result = {
@@ -273,12 +309,31 @@ async fn worker_relay(
                 .await
                 .map_err(|_| StreamError::Reset(Code::InternalError.varint()))?;
             loop {
-                let Some(message) = wire::read_message(&mut recv, DEFAULT_MESSAGE_LIMIT).await?
+                let Some(mut message) =
+                    wire::read_message(&mut recv, DEFAULT_MESSAGE_LIMIT).await?
                 else {
-                    drop(stdin);
+                    let b = Message::new(2, vec![]).encode();
+                    stdin
+                        .write_all(&(b.len() as u32).to_be_bytes())
+                        .await
+                        .map_err(|_| StreamError::Reset(Code::InternalError.varint()))?;
+                    stdin
+                        .write_all(&b)
+                        .await
+                        .map_err(|_| StreamError::Reset(Code::InternalError.varint()))?;
                     return Ok::<_, StreamError>(());
                 };
                 exchange.lock().unwrap().incoming(&message)?;
+                if message.kind == p::END {
+                    lease.lock().unwrap().take();
+                }
+                if message.kind == wire::FILE_REQUEST && message.field(7).is_some() {
+                    // Retention is admitted on a fresh Channel only.
+                    message.body.retain(|(k, _)| *k != Value::Uint(7));
+                    message
+                        .body
+                        .push((Value::Uint(7), Value::Array(vec![Value::Uint(99)])));
+                }
                 progress.lock().unwrap().0 = true;
                 let b = message.encode();
                 stdin
@@ -329,6 +384,16 @@ async fn worker_relay(
                     };
                 }
                 exchange.lock().unwrap().outgoing(&m)?;
+                if m.kind == p::RESULT {
+                    lease.lock().unwrap().take();
+                }
+                if m.kind == p::ACCEPTED
+                    && let Some(l) = lease.lock().unwrap().as_ref()
+                    && let Some(a) = m.field(3).and_then(Value::as_array)
+                    && let Value::Bytes(token) = &a[0]
+                {
+                    l.token(token.clone());
+                }
                 wire::write_message(&mut send, &m, peer_limit).await?;
                 let mut state = progress.lock().unwrap();
                 state.1 = tokio::time::Instant::now();
@@ -349,44 +414,71 @@ async fn worker_relay(
         tokio::select! {
             r=&mut input=>match r {Ok(())=>output.await,Err(e)=>Err(e)},
             r=&mut output=>r.and_then(|()|Err(StreamError::Reset(Code::InternalError.varint()))),
-            _=stopped=>Err(StreamError::Reset(Code::NoError.varint())),
+            stopped=stopped=>match stopped {
+                Ok(Some(code))=>Err(StreamError::Reset(code)),
+                Err(error)=>Err(quinn::WriteError::from(error).into()),
+                _=>Err(StreamError::Reset(Code::NoError.varint())),
+            },
             ()=&mut deadline=>Err(StreamError::Reset(Code::Timeout.varint())),
         }
     };
-    // Dropping the pipe futures sends EOF/BrokenPipe so normal cancellation runs
-    // Account-owned staging cleanup. Only a stuck worker is forcibly killed.
-    drop(stdout);
-    match timeout(Duration::from_secs(2), child.wait()).await {
-        Ok(Ok(status)) if status.success() && result.is_ok() => {
-            if send.finish().is_ok() {
-                let _ = timeout(OPEN_TIMEOUT, send.stopped()).await;
+    let eligible = matches!(&result,Err(StreamError::Reset(c)) if *c==Code::Timeout.varint())
+        || matches!(
+            &result,
+            Err(StreamError::Lost(
+                quinn::ConnectionError::TimedOut
+                    | quinn::ConnectionError::Reset
+                    | quinn::ConnectionError::TransportError(_)
+            ))
+        );
+    if eligible && exchange.lock().unwrap().retaining() {
+        if let Some(lease) = lease.into_inner().unwrap() {
+            let checkpoint = async {
+                let b = Message::new(1, vec![]).encode();
+                stdin.write_all(&(b.len() as u32).to_be_bytes()).await?;
+                stdin.write_all(&b).await?;
+                let mut prefix = [0; 4];
+                stdout.read_exact(&mut prefix).await?;
+                let n = u32::from_be_bytes(prefix) as usize;
+                if n == 0 || n > 65535 {
+                    return Err(std::io::Error::other("checkpoint limit"));
+                }
+                let mut b = vec![0; n];
+                stdout.read_exact(&mut b).await?;
+                if !Message::decode(&b).is_ok_and(|m| m.kind == 1) {
+                    return Err(std::io::Error::other("checkpoint refused"));
+                }
+                Ok::<_, std::io::Error>(())
+            };
+            if matches!(
+                timeout(Duration::from_secs(2), checkpoint).await,
+                Ok(Ok(()))
+            ) {
+                lease.park(worker);
             }
+        }
+    } else {
+        drop(lease);
+        // EOF lets the Account-owned worker remove private staging.
+        worker.input.take();
+        if result.is_ok()
+            && matches!(timeout(Duration::from_secs(2),worker.child.as_mut().unwrap().wait()).await,Ok(Ok(status)) if status.success())
+        {
+            let _ = send.finish();
+            let _ = timeout(OPEN_TIMEOUT, send.stopped()).await;
+            return Ok(());
+        }
+    }
+    match result {
+        Err(StreamError::Failure(f)) => Err(f),
+        Err(StreamError::Reset(code)) => {
+            let _ = send.reset(code);
+            let _ = recv.stop(code);
             Ok(())
         }
-        other => {
-            if other.is_err() {
-                tracing::warn!("file worker stalled; private staging cleanup may be incomplete");
-                let _ = child.start_kill();
-                // Reap asynchronously and retain admission until the OS actually
-                // releases a stuck child; a D-state process cannot be waited on
-                // synchronously without defeating the Channel timeout.
-                tokio::spawn(async move {
-                    let _permit = _worker_slot;
-                    let _ = child.wait().await;
-                });
-            }
-            match result {
-                Err(StreamError::Failure(f)) => Err(f),
-                Err(StreamError::Reset(code)) => {
-                    let _ = send.reset(code);
-                    let _ = recv.stop(code);
-                    Ok(())
-                }
-                _ => {
-                    abort(&mut send, &mut recv, Code::InternalError);
-                    Ok(())
-                }
-            }
+        _ => {
+            abort(&mut send, &mut recv, Code::InternalError);
+            Ok(())
         }
     }
 }

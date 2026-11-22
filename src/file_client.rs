@@ -1,13 +1,14 @@
 //! Explicit Client file operations; peer names are only displayed, never local paths.
 use crate::cbor::Value;
 use crate::cli::{FsAction, Remote};
+use crate::file_checkpoint::Checkpoint;
 use crate::file_protocol::{self as p, Status};
 use crate::files::Channel;
 use crate::wire::{self, Code, Failure, Message, StreamError};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 #[derive(Debug)]
 pub enum Error {
@@ -51,7 +52,10 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 pub struct Operation {
+    pub server_identity: Vec<u8>,
     pub max_size: u64,
+    resume_state: Option<PathBuf>,
+    account: String,
     kind: u64,
     path: String,
     destination: Option<String>,
@@ -60,12 +64,19 @@ pub struct Operation {
     hash: u64,
 }
 pub fn split(action: FsAction) -> (Remote, Operation) {
+    let resume_state = match &action {
+        FsAction::Pull { resume_state, .. } | FsAction::Push { resume_state, .. } => {
+            resume_state.clone()
+        }
+        _ => None,
+    };
     let (remote, kind, path, destination, local, replace, hash) = match action {
         FsAction::Pull {
             target,
             local,
             replace,
             hash,
+            ..
         } => (
             target.remote,
             1,
@@ -81,6 +92,7 @@ pub fn split(action: FsAction) -> (Remote, Operation) {
             path,
             replace,
             hash,
+            ..
         } => (remote, 2, path, None, Some(local), replace, hash.id()),
         FsAction::Stat(t) => (t.remote, 3, t.path, None, None, false, 1),
         FsAction::List(t) => (t.remote, 4, t.path, None, None, false, 1),
@@ -100,9 +112,13 @@ pub fn split(action: FsAction) -> (Remote, Operation) {
             1,
         ),
     };
+    let account = remote.destination.account.clone();
     (
         remote,
         Operation {
+            server_identity: Vec::new(),
+            resume_state,
+            account,
             max_size: p::DEFAULT_MAX_SIZE,
             kind,
             path,
@@ -168,11 +184,22 @@ pub async fn run(
     limit: u64,
     deadline: Duration,
 ) -> Result<(), Error> {
+    let retained_upload = op.kind == 2 && op.resume_state.is_some();
     let result = perform(ch, op, limit, deadline).await;
     if matches!(&result, Err(Error::Limit)) {
         ch.abort(Code::LimitExceeded);
     }
     if matches!(&result, Err(Error::Timeout)) {
+        if retained_upload {
+            // Give the Server a bounded chance to observe TIMEOUT and checkpoint
+            // before the CLI closes its control Connection with NO_ERROR.
+            let _ = ch.send.reset(Code::Timeout.varint());
+            let _ = tokio::time::timeout(
+                Duration::from_secs(2),
+                wire::read_message(&mut ch.recv, 65535),
+            )
+            .await;
+        }
         ch.abort(Code::Timeout);
     }
     if let Err(Error::Protocol(f)) = &result {
@@ -222,6 +249,74 @@ async fn perform(
     if matches!(op.kind, 1 | 2) {
         fields.push((6, Value::Uint(op.hash)));
     }
+    let mut checkpoint = if let Some(dir) = &op.resume_state {
+        let local = op.local.as_ref().unwrap();
+        let absolute = std::path::absolute(local)?;
+        let binding = Value::Array(vec![
+            Value::Bytes(op.server_identity.clone()),
+            Value::Text(op.account.clone()),
+            remote_path(&op.path)?,
+            Value::Uint(op.kind),
+            Value::Uint(op.hash),
+            Value::Bool(op.replace),
+            crate::file_checkpoint::local_path(&absolute),
+        ]);
+        Some(Checkpoint::open(dir, binding)?)
+    } else {
+        None
+    };
+    let mut prepared = None;
+    if let Some(state) = checkpoint.as_mut() {
+        if op.kind == 2 {
+            if state.existing && (state.length != length || state.token.is_none()) {
+                return Err(Error::Usage(
+                    "upload source length changed or resume token missing",
+                ));
+            }
+            let mode = if let Some(t) = &state.token {
+                vec![Value::Uint(1), Value::Bytes(t.clone())]
+            } else {
+                vec![Value::Uint(0)]
+            };
+            fields.push((7, Value::Array(mode)));
+        } else {
+            if state.existing && state.offset == 0 {
+                return Err(Error::Usage(
+                    "no nonempty download checkpoint; choose a new resume-state directory for a fresh transfer",
+                ));
+            }
+            if state.existing && state.token.is_some() {
+                return Err(Error::Usage("invalid download resume record"));
+            }
+            let mut destination =
+                Destination::retained(op.local.as_ref().unwrap(), op.replace, state).await?;
+            let mut hash = p::Hash::new(op.hash).unwrap();
+            let offset = if state.existing { state.offset } else { 0 };
+            if offset > op.max_size || state.length > op.max_size {
+                return Err(Error::Limit);
+            }
+            let file = destination.file.as_mut().unwrap();
+            if file.metadata().await?.len() < offset {
+                return Err(Error::Usage(
+                    "local partial file is shorter than checkpoint",
+                ));
+            }
+            file.set_len(offset).await?;
+            prefix(file, offset, &mut hash, deadline).await?;
+            if offset > 0 {
+                fields.push((
+                    7,
+                    Value::Array(vec![
+                        Value::Uint(2),
+                        Value::Uint(state.length),
+                        Value::Uint(offset),
+                        Value::Bytes(hash.clone().finish().to_vec()),
+                    ]),
+                ));
+            }
+            prepared = Some((destination, hash, offset));
+        }
+    }
     send(
         ch,
         &Message::new(wire::FILE_REQUEST, fields),
@@ -240,28 +335,111 @@ async fn perform(
         }
         p::id(&first, 0)?;
         let accepted = p::size(&first, 1)?;
-        if p::uint(&first, 2)? != op.hash
-            || first.field(3).is_some()
-            || (op.kind == 2 && accepted != length)
-        {
+        if p::uint(&first, 2)? != op.hash || (op.kind == 2 && accepted != length) {
             return Err(Failure::violation("invalid transfer acceptance").into());
         }
         if accepted > op.max_size {
             return Err(Error::Limit);
         }
-        if op.kind == 2 {
-            return upload(ch, source.unwrap(), accepted, op.hash, limit, deadline).await;
+        let resume_requested = checkpoint
+            .as_ref()
+            .is_some_and(|state| op.kind == 2 || state.offset > 0);
+        if resume_requested != first.field(3).is_some() {
+            return Err(Failure::violation("missing or unexpected resume acceptance").into());
         }
-        return download(
-            ch,
-            op.local.as_ref().unwrap(),
-            op.replace,
-            accepted,
-            op.hash,
-            limit,
-            deadline,
-        )
-        .await;
+        let result = if op.kind == 2 {
+            let mut file = source.unwrap();
+            let mut hash = p::Hash::new(op.hash).unwrap();
+            let mut offset = 0;
+            if let Some(state) = checkpoint.as_mut() {
+                let a = first
+                    .field(3)
+                    .and_then(Value::as_array)
+                    .filter(|a| a.len() == 3)
+                    .ok_or_else(|| Failure::violation("invalid upload resume acceptance"))?;
+                let Value::Bytes(token) = &a[0] else {
+                    return Err(Failure::violation("invalid resume token").into());
+                };
+                offset = a[1]
+                    .as_uint()
+                    .filter(|n| *n <= accepted)
+                    .ok_or_else(|| Failure::violation("invalid upload resume offset"))?;
+                if token.len() != 32
+                    || state.token.as_ref().is_some_and(|t| t != token)
+                    || (state.token.is_none() && offset != 0)
+                {
+                    return Err(Failure::violation("inconsistent upload resume acceptance").into());
+                }
+                if !matches!(&a[2],Value::Bytes(d) if d.len()==32) {
+                    return Err(Failure::violation("invalid resume prefix digest").into());
+                }
+                prefix(&mut file, offset, &mut hash, deadline).await?;
+                if a[2] != Value::Bytes(hash.clone().finish().to_vec()) {
+                    if state.token.is_none() {
+                        return Err(Failure::violation(
+                            "fresh upload did not confirm empty prefix",
+                        )
+                        .into());
+                    }
+                    state.keep = false;
+                    ch.abort(Code::NoError);
+                    return Err(Error::Usage(
+                        "upload source prefix changed; resume cancelled",
+                    ));
+                }
+                state.keep = false;
+                state.token = Some(token.clone());
+                state.length = length;
+                state.offset = offset;
+                state.save()?;
+            }
+            upload(ch, file, accepted, hash, offset, limit, deadline).await
+        } else {
+            let (destination, hash, offset) = if let Some(prepared) = prepared {
+                prepared
+            } else {
+                (
+                    tokio::time::timeout(
+                        deadline,
+                        Destination::new(op.local.as_ref().unwrap(), op.replace),
+                    )
+                    .await
+                    .map_err(|_| Error::Timeout)??,
+                    p::Hash::new(op.hash).unwrap(),
+                    0,
+                )
+            };
+            if resume_requested {
+                let state = checkpoint.as_ref().unwrap();
+                if accepted != state.length
+                    || first.field(3) != Some(&Value::Array(vec![Value::Uint(offset)]))
+                {
+                    return Err(
+                        Failure::violation("inconsistent download resume acceptance").into(),
+                    );
+                }
+            }
+            if let Some(state) = checkpoint.as_mut() {
+                state.keep = false;
+                state.length = accepted;
+                state.save()?;
+            }
+            download(
+                ch,
+                destination,
+                accepted,
+                hash,
+                offset,
+                limit,
+                deadline,
+                &mut checkpoint,
+            )
+            .await
+        };
+        if let Some(state) = checkpoint.as_mut() {
+            state.keep = result.as_ref().is_err_and(retain_error);
+        }
+        return result;
     }
     let mut message = first;
     while message.kind == p::ENTRIES && op.kind == 4 {
@@ -322,13 +500,12 @@ async fn upload(
     ch: &mut Channel,
     mut file: tokio::fs::File,
     length: u64,
-    algorithm: u64,
+    mut hash: p::Hash,
+    mut count: u64,
     limit: u64,
     deadline: Duration,
 ) -> Result<(), Error> {
     let sender = async {
-        let mut count = 0;
-        let mut hash = p::Hash::new(algorithm).unwrap();
         let mut buffer = vec![0; p::CHUNK];
         let mut status = Status::Ok;
         while count < length {
@@ -385,8 +562,36 @@ struct Destination {
     temp: PathBuf,
     file: Option<tokio::fs::File>,
     replace: bool,
+    persistent: bool,
 }
 impl Destination {
+    async fn retained(path: &Path, replace: bool, state: &Checkpoint) -> Result<Self, Error> {
+        if !replace && tokio::fs::symlink_metadata(path).await.is_ok() {
+            return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists).into());
+        }
+        let temp = state.dir.join("data");
+        let mut options = tokio::fs::OpenOptions::new();
+        options.read(true).write(true);
+        if !state.existing {
+            options.create_new(true);
+        }
+        #[cfg(unix)]
+        {
+            options.mode(0o600).custom_flags(nix::libc::O_NOFOLLOW);
+        }
+        let file = options.open(&temp).await?;
+        if !file.metadata().await?.is_file() {
+            return Err(Error::Usage("resume partial is not a regular file"));
+        }
+        Ok(Self {
+            path: path.to_owned(),
+            temp,
+            file: Some(file),
+            replace,
+            persistent: true,
+        })
+    }
+
     async fn new(path: &Path, replace: bool) -> Result<Self, Error> {
         use aws_lc_rs::rand::{SecureRandom, SystemRandom};
         if path.file_name().is_none() {
@@ -421,6 +626,7 @@ impl Destination {
                 temp,
                 file: Some(tokio::fs::File::from_std(file)),
                 replace,
+                persistent: false,
             })
         })
         .await
@@ -456,27 +662,25 @@ impl Destination {
 impl Drop for Destination {
     fn drop(&mut self) {
         drop(self.file.take());
-        if let Err(e) = std::fs::remove_file(&self.temp)
+        if !self.persistent
+            && let Err(e) = std::fs::remove_file(&self.temp)
             && e.kind() != std::io::ErrorKind::NotFound
         {
             tracing::warn!(?e, "local download staging cleanup failed");
         }
     }
 }
+#[allow(clippy::too_many_arguments)]
 async fn download(
     ch: &mut Channel,
-    path: &Path,
-    replace: bool,
+    mut destination: Destination,
     length: u64,
-    algorithm: u64,
+    mut hash: p::Hash,
+    mut count: u64,
     limit: u64,
     deadline: Duration,
+    checkpoint: &mut Option<Checkpoint>,
 ) -> Result<(), Error> {
-    let mut destination = tokio::time::timeout(deadline, Destination::new(path, replace))
-        .await
-        .map_err(|_| Error::Timeout)??;
-    let mut count = 0;
-    let mut hash = p::Hash::new(algorithm).unwrap();
     let mut status = loop {
         let m = receive(ch, deadline).await?;
         if m.kind == p::DATA {
@@ -489,6 +693,11 @@ async fn download(
             .map_err(|_| Error::Timeout)??;
             hash.update(bytes);
             count += bytes.len() as u64;
+            if let Some(state) = checkpoint.as_mut() {
+                destination.file.as_mut().unwrap().flush().await?;
+                state.offset = count;
+                state.save()?;
+            }
         } else {
             break p::verify_end(&m, 0, count, length, hash.finish())?;
         }
@@ -519,10 +728,37 @@ async fn download(
     Ok(())
 }
 
+fn retain_error(e: &Error) -> bool {
+    matches!(e, Error::Timeout | Error::Stream(StreamError::Lost(_)))
+        || matches!(e,Error::Stream(StreamError::Reset(c)) if *c==Code::Timeout.varint())
+}
+async fn prefix(
+    file: &mut tokio::fs::File,
+    mut length: u64,
+    hash: &mut p::Hash,
+    deadline: Duration,
+) -> Result<(), Error> {
+    file.seek(std::io::SeekFrom::Start(0)).await?;
+    let mut buffer = vec![0; p::CHUNK];
+    while length > 0 {
+        let wanted = length.min(buffer.len() as u64) as usize;
+        let n = tokio::time::timeout(deadline, file.read(&mut buffer[..wanted]))
+            .await
+            .map_err(|_| Error::Timeout)??;
+        if n == 0 {
+            return Err(Error::Usage("resume prefix is shorter than checkpoint"));
+        }
+        hash.update(&buffer[..n]);
+        length -= n as u64;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::files::{Budget, tests::Pair};
+    use std::io::Write;
     fn directory(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!("stpt-fs-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
@@ -563,6 +799,9 @@ mod tests {
                 .await
                 .unwrap();
             let op = Operation {
+                server_identity: Vec::new(),
+                resume_state: None,
+                account: String::new(),
                 max_size: p::DEFAULT_MAX_SIZE,
                 kind: 1,
                 path: "/source".into(),
@@ -626,7 +865,7 @@ mod tests {
                 let path=dir.join("target");
                 let budget=Budget::new(1);
                 let mut channel=Channel::open(&pair.client,65535,&budget,Duration::from_secs(1)).await.unwrap();
-                let op=Operation {max_size:p::DEFAULT_MAX_SIZE,kind:1,path:"/source".into(),destination:None,local:Some(path),replace:false,hash:1};
+                let op=Operation {server_identity:Vec::new(),resume_state:None,account:String::new(),max_size:p::DEFAULT_MAX_SIZE,kind:1,path:"/source".into(),destination:None,local:Some(path),replace:false,hash:1};
                 let result=run(&mut channel,op,65535,Duration::from_millis(100)).await;
                 assert!(if length==0 {matches!(result,Err(Error::Timeout))}else{matches!(result,Err(Error::Limit))});
                 task.await.unwrap();
@@ -635,6 +874,167 @@ mod tests {
                 drop(channel);
                 std::fs::remove_dir_all(dir).unwrap();
             }).await.unwrap();
+        }
+    }
+    fn resume_operation(kind: u64, local: PathBuf, state: PathBuf) -> Operation {
+        Operation {
+            server_identity: vec![11; 44],
+            max_size: p::DEFAULT_MAX_SIZE,
+            resume_state: Some(state),
+            account: "account".into(),
+            kind,
+            path: "/remote".into(),
+            destination: None,
+            local: Some(local),
+            replace: false,
+            hash: 1,
+        }
+    }
+    async fn mock_open(
+        server: &quinn::Connection,
+    ) -> (quinn::SendStream, quinn::RecvStream, Message) {
+        let (mut send, mut recv) = server.accept_bi().await.unwrap();
+        wire::read_message(&mut recv, 65535).await.unwrap();
+        wire::write_message(&mut send, &Message::new(wire::FILES_READY, vec![]), 65535)
+            .await
+            .unwrap();
+        let q = wire::read_message(&mut recv, 65535).await.unwrap().unwrap();
+        (send, recv, q)
+    }
+    #[tokio::test]
+    async fn download_timeout_retains_only_checkpoint_then_resumes_full_hash() {
+        tokio::time::timeout(Duration::from_secs(5),async {
+            let dir=directory("resume-download");let local=dir.join("destination");let state=dir.join("state");
+            for attempt in 0..2 {
+                let pair=Pair::start().await;let server=pair.server.clone();
+                let task=tokio::spawn(async move {
+                    let(mut send,mut recv,q)=mock_open(&server).await;
+                    let mut h=p::Hash::new(1).unwrap();h.update(b"abc");
+                    let mut accepted=p::accepted(0,6,1);
+                    if attempt==0 {assert!(q.field(7).is_none());}else{
+                        assert_eq!(q.field(7),Some(&Value::Array(vec![Value::Uint(2),Value::Uint(6),Value::Uint(3),Value::Bytes(h.clone().finish().to_vec())])));
+                        accepted.body.push((Value::Uint(3),Value::Array(vec![Value::Uint(3)])));
+                    }
+                    wire::write_message(&mut send,&accepted,65535).await.unwrap();
+                    wire::write_message(&mut send,&p::data(0,if attempt==0{0}else{3},if attempt==0{b"abc".to_vec()}else{b"def".to_vec()}),65535).await.unwrap();
+                    if attempt==0 {assert!(matches!(wire::read_message(&mut recv,65535).await,Err(StreamError::Reset(c)) if c==Code::Timeout.varint()));}
+                    else {
+                        h.update(b"def");wire::write_message(&mut send,&p::end(0,Status::Ok,6,Some(h.finish())),65535).await.unwrap();
+                        let m=wire::read_message(&mut recv,65535).await.unwrap().unwrap();assert_eq!(p::status(&m).unwrap(),Status::Ok);
+                        wire::write_message(&mut send,&p::result(0,Status::Ok,None),65535).await.unwrap();
+                        let _=wire::read_message(&mut recv,65535).await;
+                    }
+                });
+                let budget=Budget::new(1);let mut channel=Channel::open(&pair.client,65535,&budget,Duration::from_secs(1)).await.unwrap();
+                let result=run(&mut channel,resume_operation(1,local.clone(),state.clone()),65535,Duration::from_millis(100)).await;
+                if attempt==0 {
+                    assert!(matches!(result,Err(Error::Timeout)));assert!(!local.exists());assert_eq!(std::fs::read(state.join("data")).unwrap(),b"abc");
+                    // Bytes beyond a persisted complete-message checkpoint must be trimmed.
+                    std::fs::OpenOptions::new().append(true).open(state.join("data")).unwrap().write_all(b"unconfirmed").unwrap();
+                }else{result.unwrap();assert_eq!(std::fs::read(&local).unwrap(),b"abcdef");assert!(!state.join("record").exists());}
+                drop(channel);task.await.unwrap();
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }).await.unwrap();
+    }
+    #[tokio::test]
+    async fn upload_explicit_resume_uses_server_offset_and_cancels_changed_prefix() {
+        for mismatch in [false, true] {
+            let dir = directory(if mismatch {
+                "resume-upload-mismatch"
+            } else {
+                "resume-upload"
+            });
+            let source = dir.join("source");
+            let state = dir.join("state");
+            std::fs::write(&source, b"abcdef").unwrap();
+            for attempt in 0..2 {
+                let pair = Pair::start().await;
+                let server = pair.server.clone();
+                let task = tokio::spawn(async move {
+                    let (mut send, mut recv, q) = mock_open(&server).await;
+                    let token = Value::Bytes(vec![5; 32]);
+                    assert_eq!(
+                        q.field(7),
+                        Some(&Value::Array(if attempt == 0 {
+                            vec![Value::Uint(0)]
+                        } else {
+                            vec![Value::Uint(1), token.clone()]
+                        }))
+                    );
+                    let mut h = p::Hash::new(1).unwrap();
+                    if attempt == 1 {
+                        h.update(if mismatch { b"bad" } else { b"abc" });
+                    }
+                    let mut accepted = p::accepted(0, 6, 1);
+                    accepted.body.push((
+                        Value::Uint(3),
+                        Value::Array(vec![
+                            token,
+                            Value::Uint(if attempt == 0 { 0 } else { 3 }),
+                            Value::Bytes(h.clone().finish().to_vec()),
+                        ]),
+                    ));
+                    wire::write_message(&mut send, &accepted, 65535)
+                        .await
+                        .unwrap();
+                    if attempt == 1 && mismatch {
+                        assert!(
+                            matches!(wire::read_message(&mut recv,65535).await,Err(StreamError::Reset(c)) if c==Code::NoError.varint())
+                        );
+                        return;
+                    }
+                    let mut count = if attempt == 0 { 0 } else { 3 };
+                    loop {
+                        let m = wire::read_message(&mut recv, 65535).await.unwrap().unwrap();
+                        if m.kind == p::DATA {
+                            let b = p::bytes(&m, 0, count, 6).unwrap();
+                            h.update(b);
+                            count += b.len() as u64;
+                        } else {
+                            assert_eq!(
+                                p::verify_end(&m, 0, count, 6, h.finish()).unwrap(),
+                                Status::Ok
+                            );
+                            break;
+                        }
+                    }
+                    if attempt == 0 {
+                        send.reset(Code::Timeout.varint()).unwrap();
+                        let _ = recv.stop(Code::Timeout.varint());
+                    } else {
+                        wire::write_message(&mut send, &p::result(0, Status::Ok, None), 65535)
+                            .await
+                            .unwrap();
+                        let _ = wire::read_message(&mut recv, 65535).await;
+                    }
+                });
+                let budget = Budget::new(1);
+                let mut channel =
+                    Channel::open(&pair.client, 65535, &budget, Duration::from_secs(1))
+                        .await
+                        .unwrap();
+                let result = run(
+                    &mut channel,
+                    resume_operation(2, source.clone(), state.clone()),
+                    65535,
+                    Duration::from_secs(1),
+                )
+                .await;
+                if attempt == 0 {
+                    assert!(result.is_err());
+                    assert!(state.join("record").exists());
+                } else if mismatch {
+                    assert!(matches!(result, Err(Error::Usage(_))));
+                    assert!(!state.join("record").exists());
+                } else {
+                    result.unwrap();
+                    assert!(!state.join("record").exists());
+                }
+                drop(channel);
+                task.await.unwrap();
+            }
+            std::fs::remove_dir_all(dir).unwrap();
         }
     }
 }

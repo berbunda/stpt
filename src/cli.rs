@@ -204,6 +204,9 @@ pub enum FsAction {
         replace: bool,
         #[arg(long, value_enum, default_value = "blake3")]
         hash: FileHash,
+        /// Private resume-state directory; rerun the same command to resume
+        #[arg(long, value_name = "DIRECTORY")]
+        resume_state: Option<PathBuf>,
     },
     /// Upload one regular file to an absolute Server path
     Push {
@@ -215,6 +218,9 @@ pub enum FsAction {
         replace: bool,
         #[arg(long, value_enum, default_value = "blake3")]
         hash: FileHash,
+        /// Private resume-state directory; rerun the same command to resume
+        #[arg(long, value_name = "DIRECTORY")]
+        resume_state: Option<PathBuf>,
     },
     /// Inspect a directory entry without following its final symlink
     Stat(FsPath),

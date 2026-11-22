@@ -34,6 +34,8 @@ pub enum Status {
     Limit = 11,
     Io = 12,
     Integrity = 13,
+    ResumeUnavailable = 14,
+    ResumeBusy = 15,
 }
 impl Status {
     pub fn from_value(n: u64) -> Self {
@@ -51,6 +53,8 @@ impl Status {
             10 => Self::Unsupported,
             11 => Self::Limit,
             13 => Self::Integrity,
+            14 => Self::ResumeUnavailable,
+            15 => Self::ResumeBusy,
             _ => Self::Io,
         }
     }
@@ -70,6 +74,8 @@ impl Status {
             Self::Limit => "LIMIT_EXCEEDED",
             Self::Io => "IO_ERROR",
             Self::Integrity => "INTEGRITY_ERROR",
+            Self::ResumeUnavailable => "RESUME_UNAVAILABLE",
+            Self::ResumeBusy => "RESUME_BUSY",
         }
     }
 }
@@ -142,6 +148,7 @@ pub fn receipt(id: u64, status: Status) -> Message {
     )
 }
 
+#[derive(Clone)]
 pub struct Request {
     pub id: u64,
     pub kind: u64,
@@ -150,7 +157,7 @@ pub struct Request {
     pub replace: bool,
     pub length: Option<u64>,
     pub algorithm: u64,
-    pub resume: bool,
+    pub resume: Option<Value>,
 }
 impl Request {
     pub fn parse(m: &Message) -> Result<Self, Failure> {
@@ -217,7 +224,7 @@ impl Request {
             replace,
             length,
             algorithm,
-            resume: m.field(7).is_some(),
+            resume: m.field(7).cloned(),
         })
     }
 }
@@ -254,6 +261,7 @@ pub fn valid_posix_component(bytes: &[u8]) -> bool {
         && !bytes.contains(&b'/')
 }
 
+#[derive(Clone)]
 pub enum Hash {
     Blake3(Box<blake3::Hasher>),
     Sha256(aws_lc_rs::digest::Context),
@@ -391,6 +399,9 @@ impl Exchange {
             count: 0,
         })
     }
+    pub fn retaining(&self) -> bool {
+        self.kind == 2 && self.phase == Phase::Upload
+    }
     pub fn active(&self) -> bool {
         self.phase != Phase::Idle
     }
@@ -432,6 +443,12 @@ impl Exchange {
         match m.kind {
             ACCEPTED => {
                 self.length = size(m, 1)?;
+                self.count = m
+                    .field(3)
+                    .and_then(Value::as_array)
+                    .and_then(|a| a.get(if self.kind == 2 { 1 } else { 0 }))
+                    .and_then(Value::as_uint)
+                    .unwrap_or(0);
                 self.phase = if self.kind == 2 {
                     Phase::Upload
                 } else {
