@@ -5,6 +5,7 @@ use crate::file_checkpoint::Checkpoint;
 use crate::file_protocol::{self as p, Status};
 use crate::files::Channel;
 use crate::wire::{self, Code, Failure, Message, StreamError};
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -57,13 +58,18 @@ pub struct Operation {
     resume_state: Option<PathBuf>,
     account: String,
     kind: u64,
-    path: String,
-    destination: Option<String>,
+    path: OsString,
+    destination: Option<OsString>,
+    metadata: bool,
     local: Option<PathBuf>,
     replace: bool,
     hash: u64,
 }
 pub fn split(action: FsAction) -> (Remote, Operation) {
+    let metadata = matches!(
+        &action,
+        FsAction::Stat { metadata: true, .. } | FsAction::List { metadata: true, .. }
+    );
     let resume_state = match &action {
         FsAction::Pull { resume_state, .. } | FsAction::Push { resume_state, .. } => {
             resume_state.clone()
@@ -94,8 +100,8 @@ pub fn split(action: FsAction) -> (Remote, Operation) {
             hash,
             ..
         } => (remote, 2, path, None, Some(local), replace, hash.id()),
-        FsAction::Stat(t) => (t.remote, 3, t.path, None, None, false, 1),
-        FsAction::List(t) => (t.remote, 4, t.path, None, None, false, 1),
+        FsAction::Stat { target: t, .. } => (t.remote, 3, t.path, None, None, false, 1),
+        FsAction::List { target: t, .. } => (t.remote, 4, t.path, None, None, false, 1),
         FsAction::Mkdir(t) => (t.remote, 5, t.path, None, None, false, 1),
         FsAction::Remove(t) => (t.remote, 6, t.path, None, None, false, 1),
         FsAction::Rename {
@@ -117,6 +123,7 @@ pub fn split(action: FsAction) -> (Remote, Operation) {
         remote,
         Operation {
             server_identity: Vec::new(),
+            metadata,
             resume_state,
             account,
             max_size: p::DEFAULT_MAX_SIZE,
@@ -129,23 +136,64 @@ pub fn split(action: FsAction) -> (Remote, Operation) {
         },
     )
 }
-fn remote_path(path: &str) -> Result<Value, Error> {
-    if !path.starts_with('/') {
-        return Err(Error::Usage("Server path must be an absolute POSIX path"));
+fn remote_path(path: &OsStr) -> Result<Value, Error> {
+    #[cfg(unix)]
+    let bytes = {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_bytes()
+    };
+    #[cfg(windows)]
+    let bytes = path
+        .to_str()
+        .ok_or(Error::Usage(
+            "remote paths must be Unicode scalar text on Windows",
+        ))?
+        .as_bytes();
+    if bytes.starts_with(b"//") {
+        return Err(Error::Usage("UNC paths are outside the file profile"));
+    }
+    if bytes.starts_with(b"/") {
+        // Preserve POSIX native bytes, including backslashes and non-UTF-8 names.
+        let mut names = Vec::new();
+        for name in bytes
+            .split(|b| *b == b'/')
+            .skip(1)
+            .filter(|n| !n.is_empty())
+        {
+            if !p::valid_posix_component(name) {
+                return Err(Error::Usage(
+                    "Server path must not contain '.', '..' or NUL",
+                ));
+            }
+            names.push(Value::Bytes(name.to_vec()));
+        }
+        return Ok(Value::Array(vec![Value::Uint(0), Value::Array(names)]));
+    }
+    let text = path.to_str().ok_or(Error::Usage(
+        "Windows remote paths must be Unicode scalar text",
+    ))?;
+    let a = text.as_bytes();
+    if a.len() < 3 || !a[0].is_ascii_alphabetic() || a[1] != b':' || !matches!(a[2], b'\\' | b'/') {
+        return Err(Error::Usage(
+            "Server path must be absolute POSIX or a Windows drive path; UNC, device and relative paths are unsupported",
+        ));
     }
     let mut names = Vec::new();
-    for name in path.split('/').skip(1) {
-        if name.is_empty() {
-            continue;
+    if a.len() > 3 {
+        for name in text[3..].split(['\\', '/']) {
+            if !p::valid_windows_component(name) {
+                return Err(Error::Usage(
+                    "invalid Windows path component or reserved device name",
+                ));
+            }
+            names.push(Value::Text(name.to_owned()));
         }
-        if !p::valid_posix_component(name.as_bytes()) {
-            return Err(Error::Usage(
-                "Server path must not contain '.', '..' or NUL",
-            ));
-        }
-        names.push(Value::Bytes(name.as_bytes().to_vec()));
     }
-    Ok(Value::Array(vec![Value::Uint(0), Value::Array(names)]))
+    Ok(Value::Array(vec![
+        Value::Uint(1),
+        Value::Text((a[0] as char).to_ascii_uppercase().to_string()),
+        Value::Array(names),
+    ]))
 }
 async fn send(ch: &mut Channel, m: &Message, limit: u64, deadline: Duration) -> Result<(), Error> {
     tokio::time::timeout(deadline, wire::write_message(&mut ch.send, m, limit))
@@ -166,10 +214,9 @@ fn final_result(m: &Message, kind: u64) -> Result<(), Error> {
     p::id(m, 0)?;
     let status = p::status(m)?;
     if status == Status::Ok && kind == 3 {
-        p::validate_metadata(
-            m.field(2)
-                .ok_or_else(|| Failure::violation("stat metadata missing"))?,
-        )?;
+        if m.field(2).is_none() {
+            return Err(Failure::violation("stat metadata missing").into());
+        }
     } else if m.field(2).is_some() {
         return Err(Failure::violation("unexpected file result metadata").into());
     }
@@ -216,10 +263,12 @@ async fn perform(
     limit: u64,
     deadline: Duration,
 ) -> Result<(), Error> {
+    let path_value = remote_path(&op.path)?;
+    let path_kind = path_value.as_array().unwrap()[0].as_uint().unwrap();
     let mut fields = vec![
         (0, Value::Uint(0)),
         (1, Value::Uint(op.kind)),
-        (2, remote_path(&op.path)?),
+        (2, path_value.clone()),
     ];
     if let Some(dest) = &op.destination {
         fields.push((3, remote_path(dest)?));
@@ -454,29 +503,35 @@ async fn perform(
                 .as_array()
                 .filter(|a| a.len() == 2)
                 .ok_or_else(|| Failure::violation("invalid file entry"))?;
-            let Value::Bytes(name) = &a[0] else {
-                return Err(Failure::violation("POSIX listing name is not bytes").into());
-            };
-            if !p::valid_posix_component(name) {
-                return Err(Failure::violation("invalid listing component").into());
+            if !p::valid_entry_name(&a[0], path_kind) {
+                return Err(
+                    Failure::violation("invalid listing component or name representation").into(),
+                );
             }
-            let (kind, size) = p::validate_metadata(&a[1])?;
+            let metadata = p::validate_metadata(&a[1], path_kind)?;
+            let name = match &a[0] {
+                Value::Bytes(b) => escape(b),
+                Value::Text(t) => escape_text(t),
+                _ => unreachable!(),
+            };
             println!(
-                "{}\t{}\t{}",
-                kind_name(kind),
-                size.map_or_else(|| "-".into(), |n| n.to_string()),
-                escape(name)
+                "{}\t{}\t{}{}",
+                kind_name(metadata.kind),
+                metadata.size.map_or_else(|| "-".into(), |n| n.to_string()),
+                name,
+                metadata_columns(&metadata, op.metadata)
             );
         }
         message = receive(ch, deadline).await?;
     }
     final_result(&message, op.kind)?;
     if op.kind == 3 {
-        let (kind, size) = p::validate_metadata(message.field(2).unwrap())?;
+        let metadata = p::validate_metadata(message.field(2).unwrap(), path_kind)?;
         println!(
-            "{}\t{}",
-            kind_name(kind),
-            size.map_or_else(|| "-".into(), |n| n.to_string())
+            "{}\t{}{}",
+            kind_name(metadata.kind),
+            metadata.size.map_or_else(|| "-".into(), |n| n.to_string()),
+            metadata_columns(&metadata, op.metadata)
         );
     }
     Ok(())
@@ -495,6 +550,32 @@ fn escape(bytes: &[u8]) -> String {
         .flat_map(|b| std::ascii::escape_default(*b))
         .map(char::from)
         .collect()
+}
+fn escape_text(text: &str) -> String {
+    let mut output = String::new();
+    for c in text.chars() {
+        if c.is_control()
+            || c == '\\'
+            || matches!(c,'\u{61c}'|'\u{200e}'|'\u{200f}'|'\u{2028}'|'\u{2029}'|'\u{202a}'..='\u{202e}'|'\u{2066}'..='\u{2069}')
+        {
+            output.extend(c.escape_default());
+        } else {
+            output.push(c);
+        }
+    }
+    output
+}
+fn metadata_columns(m: &p::Metadata, enabled: bool) -> String {
+    if !enabled {
+        return String::new();
+    }
+    // Seconds and fractional nanoseconds stay separate for pre-epoch times.
+    let time = m
+        .modified
+        .map_or_else(|| "-".into(), |(s, n)| format!("[{s},{n:09}]"));
+    let mode = m.mode.map_or_else(|| "-".into(), |n| format!("{n:03o}"));
+    let readonly = m.readonly.map_or_else(|| "-".into(), |b| b.to_string());
+    format!("\t{time}\t{mode}\t{readonly}")
 }
 async fn upload(
     ch: &mut Channel,
@@ -799,6 +880,7 @@ mod tests {
                 .await
                 .unwrap();
             let op = Operation {
+                metadata: false,
                 server_identity: Vec::new(),
                 resume_state: None,
                 account: String::new(),
@@ -865,7 +947,7 @@ mod tests {
                 let path=dir.join("target");
                 let budget=Budget::new(1);
                 let mut channel=Channel::open(&pair.client,65535,&budget,Duration::from_secs(1)).await.unwrap();
-                let op=Operation {server_identity:Vec::new(),resume_state:None,account:String::new(),max_size:p::DEFAULT_MAX_SIZE,kind:1,path:"/source".into(),destination:None,local:Some(path),replace:false,hash:1};
+                let op=Operation {metadata:false,server_identity:Vec::new(),resume_state:None,account:String::new(),max_size:p::DEFAULT_MAX_SIZE,kind:1,path:"/source".into(),destination:None,local:Some(path),replace:false,hash:1};
                 let result=run(&mut channel,op,65535,Duration::from_millis(100)).await;
                 assert!(if length==0 {matches!(result,Err(Error::Timeout))}else{matches!(result,Err(Error::Limit))});
                 task.await.unwrap();
@@ -878,6 +960,7 @@ mod tests {
     }
     fn resume_operation(kind: u64, local: PathBuf, state: PathBuf) -> Operation {
         Operation {
+            metadata: false,
             server_identity: vec![11; 44],
             max_size: p::DEFAULT_MAX_SIZE,
             resume_state: Some(state),
@@ -1035,6 +1118,150 @@ mod tests {
                 task.await.unwrap();
             }
             std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+    #[test]
+    fn cli_path_encoding_and_metadata_display_are_lossless() {
+        let path = remote_path(OsStr::new("c:\\Data\\東京\\é.txt")).unwrap();
+        assert_eq!(
+            path,
+            Value::Array(vec![
+                Value::Uint(1),
+                Value::Text("C".into()),
+                Value::Array(vec![
+                    Value::Text("Data".into()),
+                    Value::Text("東京".into()),
+                    Value::Text("é.txt".into())
+                ])
+            ])
+        );
+        assert_eq!(remote_path(OsStr::new("C:/Data/東京/é.txt")).unwrap(), path);
+        assert_eq!(
+            remote_path(OsStr::new("z:\\")).unwrap(),
+            Value::Array(vec![
+                Value::Uint(1),
+                Value::Text("Z".into()),
+                Value::Array(vec![])
+            ])
+        );
+        for bad in [
+            "relative",
+            "C:file",
+            "\\root",
+            "\\\\host\\share",
+            "//host/share",
+            "\\\\?\\C:\\file",
+            "\\\\.\\NUL",
+            "C:\\NUL.txt",
+            "C:\\a:stream",
+            "C:\\a.",
+            "C:\\a\\..\\b",
+            "C:\\a\\\\b",
+        ] {
+            assert!(remote_path(OsStr::new(bad)).is_err(), "{bad:?}");
+        }
+        let a = remote_path(OsStr::new("C:\\é")).unwrap();
+        let b = remote_path(OsStr::new("C:\\e\u{301}")).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(escape_text("東京é"), "東京é");
+        assert_eq!(
+            escape_text("\u{61c}\u{200e}\u{200f}"),
+            "\\u{61c}\\u{200e}\\u{200f}"
+        );
+        assert_eq!(escape_text("x\u{202e}y"), "x\\u{202e}y");
+        let m = p::Metadata {
+            kind: 1,
+            size: Some(3),
+            modified: Some((-1, 500000000)),
+            mode: Some(0o640),
+            readonly: None,
+        };
+        assert_eq!(metadata_columns(&m, true), "\t[-1,500000000]\t640\t-");
+        assert_eq!(metadata_columns(&m, false), "");
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let name = OsString::from_vec(vec![b'/', b't', b'/', 0xff, b'\\']);
+            assert_eq!(
+                remote_path(&name).unwrap(),
+                Value::Array(vec![
+                    Value::Uint(0),
+                    Value::Array(vec![
+                        Value::Bytes(vec![b't']),
+                        Value::Bytes(vec![0xff, b'\\'])
+                    ])
+                ])
+            );
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt;
+            assert!(remote_path(&OsString::from_wide(&[67, 58, 92, 0xd800])).is_err());
+        }
+    }
+    #[tokio::test]
+    async fn windows_listing_accepts_text_metadata_and_rejects_foreign_attributes() {
+        for bad in [false, true] {
+            let pair = Pair::start().await;
+            let server = pair.server.clone();
+            let task = tokio::spawn(async move {
+                let (mut send, mut recv, q) = mock_open(&server).await;
+                assert_eq!(q.field(2).unwrap().as_array().unwrap()[0], Value::Uint(1));
+                let meta = Value::Map(vec![
+                    (Value::Uint(0), Value::Uint(1)),
+                    (Value::Uint(1), Value::Uint(42)),
+                    (
+                        Value::Uint(if bad { 3 } else { 4 }),
+                        if bad {
+                            Value::Uint(0o600)
+                        } else {
+                            Value::Bool(true)
+                        },
+                    ),
+                ]);
+                let entry = Value::Array(vec![Value::Text("東京.txt".into()), meta]);
+                wire::write_message(
+                    &mut send,
+                    &Message::new(
+                        p::ENTRIES,
+                        vec![(0, Value::Uint(0)), (1, Value::Array(vec![entry]))],
+                    ),
+                    65535,
+                )
+                .await
+                .unwrap();
+                if !bad {
+                    wire::write_message(&mut send, &p::result(0, Status::Ok, None), 65535)
+                        .await
+                        .unwrap();
+                }
+                let _ = wire::read_message(&mut recv, 65535).await;
+            });
+            let budget = Budget::new(1);
+            let mut channel = Channel::open(&pair.client, 65535, &budget, Duration::from_secs(1))
+                .await
+                .unwrap();
+            let op = Operation {
+                server_identity: Vec::new(),
+                max_size: p::DEFAULT_MAX_SIZE,
+                resume_state: None,
+                account: "a".into(),
+                kind: 4,
+                path: "C:\\Data".into(),
+                destination: None,
+                local: None,
+                replace: false,
+                hash: 1,
+                metadata: true,
+            };
+            let result = run(&mut channel, op, 65535, Duration::from_secs(1)).await;
+            if bad {
+                assert!(matches!(result, Err(Error::Protocol(_))));
+            } else {
+                result.unwrap();
+            }
+            drop(channel);
+            task.await.unwrap();
         }
     }
 }

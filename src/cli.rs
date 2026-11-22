@@ -3,6 +3,7 @@
 //! The subcommand selects the role of the binary: `server` runs the Server,
 //! every other subcommand runs the Client.
 
+use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -177,8 +178,8 @@ pub enum ClientCommand {
 pub struct FsPath {
     #[command(flatten)]
     pub remote: Remote,
-    /// Absolute POSIX path on the Server (no shell expansion)
-    pub path: String,
+    /// Absolute POSIX or Windows drive path on the Server (no shell expansion)
+    pub path: OsString,
 }
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub enum FileHash {
@@ -213,7 +214,7 @@ pub enum FsAction {
         #[command(flatten)]
         remote: Remote,
         local: PathBuf,
-        path: String,
+        path: OsString,
         #[arg(long)]
         replace: bool,
         #[arg(long, value_enum, default_value = "blake3")]
@@ -223,9 +224,21 @@ pub enum FsAction {
         resume_state: Option<PathBuf>,
     },
     /// Inspect a directory entry without following its final symlink
-    Stat(FsPath),
+    Stat {
+        #[command(flatten)]
+        target: FsPath,
+        /// Append mtime, POSIX mode and Windows read-only columns
+        #[arg(long)]
+        metadata: bool,
+    },
     /// List one directory (not recursive)
-    List(FsPath),
+    List {
+        #[command(flatten)]
+        target: FsPath,
+        /// Append mtime, POSIX mode and Windows read-only columns
+        #[arg(long)]
+        metadata: bool,
+    },
     /// Create one directory; parents must already exist
     Mkdir(FsPath),
     /// Remove one entry or empty directory (not recursive)
@@ -235,7 +248,7 @@ pub enum FsAction {
         #[command(flatten)]
         target: FsPath,
         #[arg(id = "new_path", value_name = "DESTINATION")]
-        destination: String,
+        destination: OsString,
         #[arg(long)]
         replace: bool,
     },

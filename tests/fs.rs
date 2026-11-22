@@ -816,4 +816,112 @@ mod server {
             .unwrap();
         });
     }
+    #[test]
+    fn native_posix_cli_metadata_symlink_and_creation_policy() {
+        use std::ffi::OsString;
+        use std::fs::{File, FileTimes};
+        use std::os::unix::ffi::OsStringExt;
+        use std::time::{Duration, UNIX_EPOCH};
+        let s = Setup::new("fs-metadata", None, "");
+        let file = s
+            .data
+            .join(OsString::from_vec(vec![b'n', 0xff, b'\\', b'\n']));
+        std::fs::write(&file, b"abc").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o6751)).unwrap();
+        File::open(&file)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(UNIX_EPOCH - Duration::from_millis(500)))
+            .unwrap();
+        let invoke = |command: &str, path: &Path, metadata: bool| {
+            let mut c = Command::new(env!("CARGO_BIN_EXE_stpt"));
+            c.args(["fs", command, &s.dest, "--fingerprint", &s.fp])
+                .arg(path);
+            if metadata {
+                c.arg("--metadata");
+            }
+            c.env("APPDATA", &s.home)
+                .env("HOME", &s.home)
+                .env("XDG_CONFIG_HOME", &s.home)
+                .output()
+                .unwrap()
+        };
+        let meta = invoke("stat", &file, true);
+        assert!(meta.status.success(), "{}", stderr(&meta));
+        assert_eq!(stdout(&meta), "file\t3\t[-1,500000000]\t751\t-");
+        let plain = invoke("stat", &file, false);
+        assert_eq!(stdout(&plain), "file\t3");
+        let list = invoke("list", &s.data, true);
+        assert!(list.status.success(), "{}", stderr(&list));
+        assert!(stdout(&list).contains("n\\xff\\\\\\n\t[-1,500000000]\t751\t-"));
+        let link = s.data.join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        let meta = invoke("stat", &link, true);
+        assert!(meta.status.success());
+        let fields = stdout(&meta);
+        let parts: Vec<_> = fields.split('\t').collect();
+        assert_eq!(parts[0], "symlink");
+        assert_eq!(parts[1], "-");
+        assert_eq!(parts[3], "777");
+        let target = s.data.join("uploaded");
+        let out = Command::new(env!("CARGO_BIN_EXE_stpt"))
+            .args(["fs", "push", &s.dest, "--fingerprint", &s.fp])
+            .arg(&file)
+            .arg(&target)
+            .env("HOME", &s.home)
+            .env("XDG_CONFIG_HOME", &s.home)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", stderr(&out));
+        let meta = std::fs::metadata(&target).unwrap();
+        assert_eq!(meta.mode() & 0o7777, 0o600);
+        assert!(meta.mtime() >= 0);
+        assert_eq!(std::fs::read(target).unwrap(), b"abc");
+        let sparse = s.data.join("sparse");
+        File::create(&sparse)
+            .unwrap()
+            .set_len(p::DEFAULT_MAX_SIZE + 1)
+            .unwrap();
+        assert_eq!(
+            s.ok("stat", &[text(&sparse)]),
+            format!("file\t{}", p::DEFAULT_MAX_SIZE + 1)
+        );
+    }
+    #[test]
+    fn worker_paths_distinguish_shape_content_and_unsupported_kind() {
+        let mut worker = Worker::new();
+        let windows = Value::Array(vec![
+            Value::Uint(1),
+            Value::Text("C".into()),
+            Value::Array(vec![Value::Text("Data".into())]),
+        ]);
+        let message = |id: u64, path: Value| {
+            Message::new(
+                wire::FILE_REQUEST,
+                vec![(0, Value::Uint(id)), (1, Value::Uint(3)), (2, path)],
+            )
+        };
+        worker.send(&message(0, windows));
+        assert_eq!(p::status(&worker.recv()).unwrap(), p::Status::Unsupported);
+        for (id, name) in [
+            (1, b"..".to_vec()),
+            (2, b"a/b".to_vec()),
+            (3, b"a\0b".to_vec()),
+            (4, vec![]),
+        ] {
+            let posix = Value::Array(vec![Value::Uint(0), Value::Array(vec![Value::Bytes(name)])]);
+            worker.send(&message(id, posix));
+            assert_eq!(p::status(&worker.recv()).unwrap(), p::Status::InvalidPath);
+        }
+        let malformed = Value::Array(vec![
+            Value::Uint(0),
+            Value::Array(vec![Value::Text("wrong type".into())]),
+        ]);
+        worker.send(&message(5, malformed));
+        let failure = worker.recv();
+        assert_eq!(failure.kind, 0);
+        assert_eq!(
+            failure.field(0),
+            Some(&Value::Uint(wire::Code::ProtocolViolation as u64))
+        );
+    }
 }

@@ -261,6 +261,72 @@ pub fn valid_posix_component(bytes: &[u8]) -> bool {
         && !bytes.contains(&b'/')
 }
 
+/// Component rules of the remote Windows namespace, independent of host OS.
+/// Native volume type and reparse traversal checks belong to the Server backend.
+pub fn valid_windows_component(name: &str) -> bool {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.ends_with([' ', '.'])
+        || name
+            .chars()
+            .any(|c| c <= '\u{1f}' || "<>:\"/\\|?*".contains(c))
+    {
+        return false;
+    }
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap()
+        .trim_end_matches(' ')
+        .to_ascii_uppercase();
+    if matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) {
+        return false;
+    }
+    if let Some(suffix) = stem
+        .strip_prefix("COM")
+        .or_else(|| stem.strip_prefix("LPT"))
+        && matches!(
+            suffix,
+            "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+        )
+    {
+        return false;
+    }
+    true
+}
+/// Shape errors are protocol violations; invalid contents are operation statuses.
+pub fn valid_path_contents(path: &Value, root: bool) -> Result<bool, Failure> {
+    validate_path_shape(path)?;
+    let a = path.as_array().unwrap();
+    let kind = a[0].as_uint().unwrap();
+    let names = a[if kind == 0 { 1 } else { 2 }].as_array().unwrap();
+    if names.is_empty() && !root {
+        return Ok(false);
+    }
+    Ok(if kind == 0 {
+        names
+            .iter()
+            .all(|n| matches!(n,Value::Bytes(b) if valid_posix_component(b)))
+    } else {
+        matches!(&a[1],Value::Text(d) if d.len()==1 && d.as_bytes()[0].is_ascii_uppercase())
+            && names
+                .iter()
+                .all(|n| matches!(n,Value::Text(t) if valid_windows_component(t)))
+    })
+}
+/// Validate one received listing name for the requested remote path kind.
+pub fn valid_entry_name(name: &Value, path_kind: u64) -> bool {
+    match (name, path_kind) {
+        (Value::Bytes(b), 0) => valid_posix_component(b),
+        (Value::Text(t), 1) => valid_windows_component(t),
+        _ => false,
+    }
+}
+
 #[derive(Clone)]
 pub enum Hash {
     Blake3(Box<blake3::Hasher>),
@@ -333,7 +399,15 @@ pub fn verify_end(
         Ok(status)
     }
 }
-pub fn validate_metadata(value: &Value) -> Result<(u64, Option<u64>), Failure> {
+#[derive(Debug, PartialEq, Eq)]
+pub struct Metadata {
+    pub kind: u64,
+    pub size: Option<u64>,
+    pub modified: Option<(i64, u32)>,
+    pub mode: Option<u16>,
+    pub readonly: Option<bool>,
+}
+pub fn validate_metadata(value: &Value, path_kind: u64) -> Result<Metadata, Failure> {
     let m = Message {
         kind: RESULT,
         body: value
@@ -349,6 +423,7 @@ pub fn validate_metadata(value: &Value) -> Result<(u64, Option<u64>), Failure> {
     if (kind == 1) != length.is_some() && kind <= 3 {
         return Err(Failure::violation("invalid metadata size"));
     }
+    let mut modified = None;
     if let Some(t) = m.field(2) {
         let a = t
             .as_array()
@@ -359,6 +434,12 @@ pub fn validate_metadata(value: &Value) -> Result<(u64, Option<u64>), Failure> {
         {
             return Err(Failure::violation("invalid mtime"));
         }
+        let seconds = match a[0] {
+            Value::Uint(v) => v as i64,
+            Value::Nint(v) => -1 - (v as i64),
+            _ => unreachable!(),
+        };
+        modified = Some((seconds, a[1].as_uint().unwrap() as u32));
     }
     if m.field(3)
         .is_some_and(|v| v.as_uint().is_none_or(|n| n > 511))
@@ -366,7 +447,20 @@ pub fn validate_metadata(value: &Value) -> Result<(u64, Option<u64>), Failure> {
     {
         return Err(Failure::violation("invalid metadata attributes"));
     }
-    Ok((kind, length))
+    if (path_kind == 0 && m.field(4).is_some()) || (path_kind == 1 && m.field(3).is_some()) {
+        return Err(Failure::violation(
+            "metadata attribute belongs to the other path kind",
+        ));
+    }
+    let mode = m.field(3).and_then(Value::as_uint).map(|n| n as u16);
+    let readonly = m.field(4).map(|v| matches!(v, Value::Bool(true)));
+    Ok(Metadata {
+        kind,
+        size: if kind <= 3 { length } else { None },
+        modified: if kind <= 3 { modified } else { None },
+        mode: if kind <= 3 { mode } else { None },
+        readonly: if kind <= 3 { readonly } else { None },
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -567,14 +661,153 @@ mod tests {
     }
     #[test]
     fn metadata_is_bounded_and_regular_size_is_required() {
-        assert!(validate_metadata(&Value::Map(vec![(Value::Uint(0), Value::Uint(1))])).is_err());
+        assert!(validate_metadata(&Value::Map(vec![(Value::Uint(0), Value::Uint(1))]), 0).is_err());
         let bad_time = Value::Array(vec![Value::Uint(u64::MAX), Value::Uint(0)]);
         assert!(
-            validate_metadata(&Value::Map(vec![
-                (Value::Uint(0), Value::Uint(2)),
-                (Value::Uint(2), bad_time)
-            ]))
+            validate_metadata(
+                &Value::Map(vec![
+                    (Value::Uint(0), Value::Uint(2)),
+                    (Value::Uint(2), bad_time)
+                ]),
+                0
+            )
             .is_err()
         );
+    }
+    #[test]
+    fn windows_components_reject_devices_aliases_and_escapes() {
+        for name in [
+            "",
+            ".",
+            "..",
+            "trailing.",
+            "trailing ",
+            "CON",
+            "con.txt",
+            "NuL.tar.gz",
+            "AUX .txt",
+            "PRN",
+            "COM1",
+            "com9.log",
+            "LPT1",
+            "lpt9.txt",
+            "COM¹.txt",
+            "lpt²",
+            "LPT³.log",
+            "CONIN$",
+            "conout$.log",
+            "stream:secret",
+            "a/b",
+            "a\\b",
+            "a*",
+            "a?",
+            "a|",
+            "a<",
+            "a>",
+            "a\"",
+            "a\0",
+            "a\u{1f}",
+        ] {
+            assert!(!valid_windows_component(name), "{name:?}");
+        }
+        for name in [
+            "normal",
+            ".hidden",
+            "a b",
+            "CONSOLE",
+            "NUL2",
+            "COM0",
+            "COM10",
+            "LPT10",
+            "COM⁴",
+            "COM¹x",
+            "é",
+            "e\u{301}",
+            "東京",
+            "résumé.txt",
+        ] {
+            assert!(valid_windows_component(name), "{name:?}");
+        }
+        let windows = |drive: &str, names: Vec<Value>| {
+            Value::Array(vec![
+                Value::Uint(1),
+                Value::Text(drive.into()),
+                Value::Array(names),
+            ])
+        };
+        assert!(valid_path_contents(&windows("C", vec![]), true).unwrap());
+        assert!(!valid_path_contents(&windows("C", vec![]), false).unwrap());
+        for drive in ["c", "C:", "CC", "é", ""] {
+            assert!(!valid_path_contents(&windows(drive, vec![]), true).unwrap());
+        }
+        assert!(validate_path_shape(&windows("C", vec![Value::Bytes(vec![1])])).is_err());
+        assert!(!valid_entry_name(&Value::Bytes(b"name".to_vec()), 1));
+        assert!(!valid_entry_name(&Value::Text("name".into()), 0));
+        assert!(valid_entry_name(&Value::Bytes(vec![0xff, b'\\']), 0));
+    }
+    #[test]
+    fn metadata_platforms_negative_time_extremes_and_unknown_kinds() {
+        let metadata = |kind: u64, fields: Vec<(Value, Value)>| {
+            let mut f = vec![(Value::Uint(0), Value::Uint(kind))];
+            f.extend(fields);
+            Value::Map(f)
+        };
+        for seconds in [
+            Value::Nint(i64::MAX as u64),
+            Value::Nint(0),
+            Value::Uint(0),
+            Value::Uint(i64::MAX as u64),
+        ] {
+            let value = metadata(
+                2,
+                vec![
+                    (
+                        Value::Uint(2),
+                        Value::Array(vec![seconds, Value::Uint(999999999)]),
+                    ),
+                    (Value::Uint(3), Value::Uint(511)),
+                ],
+            );
+            let parsed = validate_metadata(&value, 0).unwrap();
+            assert!(parsed.modified.is_some());
+            assert_eq!(parsed.mode, Some(511));
+            assert!(validate_metadata(&value, 1).is_err());
+        }
+        let value = metadata(
+            1,
+            vec![
+                (Value::Uint(1), Value::Uint(u64::MAX)),
+                (Value::Uint(4), Value::Bool(true)),
+            ],
+        );
+        assert_eq!(validate_metadata(&value, 1).unwrap().size, Some(u64::MAX));
+        assert!(validate_metadata(&value, 0).is_err());
+        for bad in [Value::Uint(512), Value::Nint(0), Value::Bool(false)] {
+            assert!(validate_metadata(&metadata(0, vec![(Value::Uint(3), bad)]), 0).is_err());
+        }
+        for nanos in [Value::Uint(1000000000), Value::Nint(0), Value::Bool(false)] {
+            assert!(
+                validate_metadata(
+                    &metadata(
+                        2,
+                        vec![(Value::Uint(2), Value::Array(vec![Value::Nint(0), nanos]))]
+                    ),
+                    0
+                )
+                .is_err()
+            );
+        }
+        let unknown = metadata(
+            99,
+            vec![
+                (Value::Uint(1), Value::Uint(22)),
+                (Value::Uint(3), Value::Uint(511)),
+                (Value::Uint(77), Value::Text("future".into())),
+            ],
+        );
+        let parsed = validate_metadata(&unknown, 0).unwrap();
+        assert_eq!(parsed.kind, 99);
+        assert_eq!(parsed.size, None);
+        assert_eq!(parsed.mode, None);
     }
 }

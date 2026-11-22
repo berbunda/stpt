@@ -140,7 +140,7 @@ fn native(value: &Value, root: bool) -> Result<PathBuf, Error> {
         return Err(Error::Status(Status::Unsupported));
     }
     let names = a[1].as_array().unwrap();
-    if names.is_empty() && !root {
+    if !p::valid_path_contents(value, root)? {
         return Err(Error::Status(Status::InvalidPath));
     }
     let mut path = PathBuf::from("/");
@@ -184,12 +184,28 @@ fn metadata(m: &std::fs::Metadata) -> Value {
     } else {
         0
     };
+    posix_metadata(kind, m.len(), m.mtime(), m.mtime_nsec(), m.mode())
+}
+fn posix_metadata(kind: u64, size: u64, seconds: i64, nanos: i64, mode: u32) -> Value {
     let mut f = vec![(Value::Uint(0), Value::Uint(kind))];
     if kind == 1 {
-        f.push((Value::Uint(1), Value::Uint(m.len())));
+        f.push((Value::Uint(1), Value::Uint(size)));
     }
+    if (0..1_000_000_000).contains(&nanos) {
+        let sec = if seconds >= 0 {
+            Value::Uint(seconds as u64)
+        } else {
+            Value::Nint((-1 - seconds) as u64)
+        };
+        f.push((
+            Value::Uint(2),
+            Value::Array(vec![sec, Value::Uint(nanos as u64)]),
+        ));
+    }
+    f.push((Value::Uint(3), Value::Uint(u64::from(mode & 0o777))));
     Value::Map(f)
 }
+
 fn handle(
     q: Request,
     r: &mut impl Read,
@@ -238,10 +254,13 @@ fn handle(
                     nix::libc::S_IFLNK => 3,
                     _ => 0,
                 };
-                let mut fields = vec![(Value::Uint(0), Value::Uint(kind))];
-                if kind == 1 {
-                    fields.push((Value::Uint(1), Value::Uint(stat.st_size as u64)));
-                }
+                let meta = posix_metadata(
+                    kind,
+                    stat.st_size as u64,
+                    stat.st_mtime,
+                    stat.st_mtime_nsec,
+                    stat.st_mode,
+                );
                 let message = Message::new(
                     p::ENTRIES,
                     vec![
@@ -250,7 +269,7 @@ fn handle(
                             1,
                             Value::Array(vec![Value::Array(vec![
                                 Value::Bytes(name.to_vec()),
-                                Value::Map(fields),
+                                meta,
                             ])]),
                         ),
                     ],

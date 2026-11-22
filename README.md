@@ -60,7 +60,7 @@ A lost connection in `connect` is repaired automatically: the Client notices it 
 - `exec` does not reconnect: it reports the lost connection and exits with 255. Input is not numbered like output, so reconnecting could silently lose part of what a pipe sends to the command.
 
 # Files
-`stpt fs` transfers regular files and manages files on the Linux Server under the Account's filesystem permissions. It needs no terminal or Session. Paths on the Server are absolute POSIX paths; local paths use the Client's native syntax.
+`stpt fs` transfers regular files and manages files on the Linux Server under the Account's filesystem permissions. It needs no terminal or Session. Linux Server paths are absolute POSIX paths; local paths use the Client's native syntax. The CLI also encodes absolute Windows drive paths for compatible peers; Windows Server mode remains gated by G2/RC008.
 
 ```
 stpt fs push alice@host ./local.bin /home/alice/remote.bin
@@ -76,9 +76,23 @@ stpt fs remove alice@host /home/alice/empty-directory
 - Push and pull transfer one regular file. No recursive copying, wildcard expansion, implicit parent creation or automatic destination-name selection is performed. Uploads use private staging and are published atomically only after verification. An interrupted or failed upload does not expose a partial destination.
 - BLAKE3 verifies transfers by default. `--hash sha256` on push or pull explicitly requests SHA-256; the Server confirms that exact algorithm. Data stays inside QUIC/TLS in both cases. Files use bounded blocks, including files larger than 4 GiB; both roles default to an 8 GiB per-file limit.
 - Existing destinations are protected by default, including a destination created concurrently with the transfer. Pull `--replace` explicitly permits local replacement; rename `--replace` permits an atomic native replacement. **Push cannot replace an existing destination yet:** even with `--replace` it returns UNSUPPORTED. This preserves the protocol's regular-file-only replacement requirement without a check/rename race. There is no delete-and-retry fallback.
-- `list` prints kind, logical size (or `-`) and a byte-escaped entry name, separated by tabs; `stat` prints kind and size. A failed listing may already have printed incomplete batches. Neither transfers nor listings are filesystem snapshots. Minimal kind/size metadata is available; timestamps, permissions and source ACLs are not copied.
+- `list` prints kind, logical size (or `-`) and a byte-escaped entry name, separated by tabs; `stat` prints kind and size. A failed listing may already have printed incomplete batches. Neither transfers nor listings are filesystem snapshots. Add `--metadata` to stat/list to append mtime, POSIX rwx mode and Windows read-only columns. Timestamps, permissions and source ACLs are informational and are not copied.
 - Final symlinks are inspected, removed or renamed as entries. This implementation refuses downloads through final symlinks; directory listing may follow one. Devices, FIFOs and sockets are not transferred. The service is not confined to the home directory: normal Account permissions apply.
-- Ctrl+C cancels the operation. A Connection loss or missing final result is an error; a modifying operation may already have committed. STPT does not automatically retry it. Explicit resume is available as described below; Windows Server paths and extended metadata remain RE004. Windows Clients can transfer to Linux Servers now.
+- Ctrl+C cancels the operation. A Connection loss or missing final result is an error; a modifying operation may already have committed. STPT does not automatically retry it. Explicit resume and path/metadata rules are described below. Windows Server execution remains gated by G2/RC008. Windows Clients can transfer to Linux Servers now.
+
+## Paths and metadata
+The remote path chooses its own kind independently of the Client OS. `/home/alice/a` uses POSIX byte components; a Windows drive path such as `'C:\Data\a'` or `'c:/Data/a'` uses Unicode text components and an uppercase drive letter. Quote paths as required by your shell. POSIX paths supplied on Unix preserve non-UTF-8 bytes and ordinary backslashes; Windows input that cannot be represented as Unicode scalar text is refused. Names are never case-folded or Unicode-normalized. An unsupported path kind returns UNSUPPORTED; Linux Servers do not reinterpret Windows paths as POSIX names.
+
+Windows paths reject UNC, device/extended namespaces, drive-relative paths, ADS, empty components, `.`/`..`, control/reserved characters, trailing ASCII dots/spaces and reserved device names (including extensions and COM/LPT superscript variants). A drive root may be used for stat/list only. POSIX roots have the same operation restriction. Native filesystem name/length/permission checks still apply on the Server. Windows Server volume-type and reparse traversal enforcement depend on G2/RC008; this release does not enable a Windows Server or claim those native checks are operational.
+
+```
+stpt fs stat alice@host /home/alice/a --metadata
+stpt fs list alice@host /home/alice --metadata
+```
+
+The usual columns remain unchanged; `--metadata` appends `mtime`, `mode`, `readonly`, separated by tabs. Missing/inapplicable values are `-`. Mtime is UTC epoch `[seconds,nanoseconds]` with nine fractional digits: `[-1,500000000]` denotes half a second before 1970. POSIX mode is three octal rwx digits, with no set-ID/sticky bits; Windows read-only is `true`/`false`. Linux stat and directory listings inspect final links as entries and report their own metadata, not the target's. Stat sizes may exceed the configured transfer limit. Unknown entry kinds display as `other` without inferred attributes.
+
+Listing names are validated for their remote path kind and escaped for terminal display. POSIX bytes keep their byte-escaped form; Windows Unicode text preserves visible characters while escaping controls and direction-formatting characters. No local path is constructed from a remote listing name: downloads always use the explicit local destination, avoiding implicit name conversion, collisions and link traversal. Metadata never grants authority or changes destination ACLs, ownership, attributes or timestamps. New uploads retain their private creation policy; rename uses native metadata semantics.
 
 ## Resume
 Add `--resume-state DIRECTORY` to push or pull to opt in. After a lost Connection or file timeout, rerun the **same command** with the same directory to request resume explicitly:
