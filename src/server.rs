@@ -66,9 +66,7 @@ impl Default for Deadlines {
 
 /// What the Connections of a Server share.
 pub struct Shared {
-    #[cfg(unix)]
     pub file_workers: Arc<tokio::sync::Semaphore>,
-    #[cfg(unix)]
     pub file_resume: Arc<crate::file_resume::Store>,
     pub max_file_size: u64,
     pub file_timeout: Duration,
@@ -113,26 +111,19 @@ pub fn run(
     let listen = listen_address(listen, &config);
     quic::runtime()?.block_on(async {
         let shared = Arc::new(Shared {
-            #[cfg(unix)]
             file_workers: Arc::new(tokio::sync::Semaphore::new(32)),
-            #[cfg(unix)]
             file_resume: Default::default(),
             max_file_size: config
                 .max_file_size
                 .unwrap_or(crate::file_protocol::DEFAULT_MAX_SIZE),
             file_timeout: Duration::from_secs(config.file_timeout.unwrap_or(60)),
-            max_file_channels: if cfg!(windows) {
-                0
-            } else {
-                config
-                    .max_file_channels
-                    .unwrap_or(crate::files::DEFAULT_SERVER_CAP)
-            },
+            max_file_channels: config
+                .max_file_channels
+                .unwrap_or(crate::files::DEFAULT_SERVER_CAP),
             deadlines: Deadlines::DEFAULT,
             authorizer: Authorizer::new(keys_dir, Box::new(SystemAccounts)),
             store: Store::start(policy),
         });
-        #[cfg(unix)]
         let expiry = {
             let store = shared.file_resume.clone();
             tokio::spawn(async move {
@@ -153,12 +144,10 @@ pub fn run(
             () = serve(endpoint.clone(), shared.clone()) => {}
             signal = stop => shut_down(&endpoint, signal).await,
         }
-        #[cfg(unix)]
         {
             expiry.abort();
             shared.file_resume.clear();
         }
-        #[cfg(unix)]
         if timeout(
             Duration::from_secs(3),
             shared.file_workers.clone().acquire_many_owned(32),
@@ -320,9 +309,7 @@ async fn serve_connection(
     // §8.2, §14.5: Channels become available.
     connection.set_max_concurrent_bi_streams(VarInt::from_u32(1 + MAX_CHANNELS));
     let context = ChannelContext {
-        #[cfg(unix)]
         file_workers: shared.file_workers.clone(),
-        #[cfg(unix)]
         file_resume: shared.file_resume.clone(),
         max_file_size: shared.max_file_size,
         file_timeout: shared.file_timeout,
@@ -467,12 +454,9 @@ async fn authenticate(
 }
 
 /// What the Channels of an Authenticated Connection need to know.
-#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Clone)]
 struct ChannelContext {
-    #[cfg(unix)]
     file_workers: Arc<tokio::sync::Semaphore>,
-    #[cfg(unix)]
     file_resume: Arc<crate::file_resume::Store>,
     max_file_size: u64,
     file_timeout: Duration,
@@ -512,7 +496,6 @@ async fn open_channel(
             Ok(crate::files::KIND) => match &context.files {
                 None => Failure::violation("file Channel without negotiated capability"),
                 Some(budget) => {
-                    #[cfg(unix)]
                     let result = crate::files::serve_account(
                         send,
                         recv,
@@ -527,8 +510,7 @@ async fn open_channel(
                         },
                     )
                     .await;
-                    #[cfg(not(unix))]
-                    let result = crate::files::serve(send, recv, context.peer_limit, budget).await;
+
                     match result {
                         Ok(()) => return,
                         Err(failure) => failure,
@@ -668,9 +650,7 @@ mod tests {
         async fn start_as(deadlines: Deadlines, account: &str) -> Self {
             let store = Store::start(Policy::DEFAULT);
             Self::serve(deadlines, account, |authorizer| Shared {
-                #[cfg(unix)]
                 file_workers: Arc::new(tokio::sync::Semaphore::new(32)),
-                #[cfg(unix)]
                 file_resume: Default::default(),
                 max_file_size: crate::file_protocol::DEFAULT_MAX_SIZE,
                 file_timeout: Duration::from_secs(60),
@@ -687,7 +667,6 @@ mod tests {
             let store = Store::start(policy);
             Self::serve(Deadlines::DEFAULT, account, |authorizer| Shared {
                 file_workers: Arc::new(tokio::sync::Semaphore::new(32)),
-                #[cfg(unix)]
                 file_resume: Default::default(),
                 max_file_size: crate::file_protocol::DEFAULT_MAX_SIZE,
                 file_timeout: Duration::from_secs(60),
@@ -985,7 +964,7 @@ mod tests {
             let path = Value::Array(vec![Value::Uint(0), Value::Array(vec![])]);
             let operation = Message::new(wire::FILE_REQUEST, vec![(0, Value::Uint(0)), (1, Value::Uint(3)), (2, path)]);
             send.write_all(&frame(&operation.encode())).await.unwrap();
-            assert!(matches!(wire::read_message(&mut recv, DEFAULT_MESSAGE_LIMIT).await, Err(StreamError::Reset(code)) if code == if cfg!(unix) {Code::ChannelRejected.varint()} else {Code::InternalError.varint()}));
+            assert!(matches!(wire::read_message(&mut recv, DEFAULT_MESSAGE_LIMIT).await, Err(StreamError::Reset(code)) if code == Code::ChannelRejected.varint()));
             assert_eq!(request(&mut control_send, &mut control_recv, 3).await, LIST_RESULT);
         }).await.unwrap();
     }

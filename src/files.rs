@@ -98,18 +98,9 @@ pub async fn serve(
     peer_limit: u64,
     budget: &Budget,
 ) -> Result<(), Failure> {
-    serve_inner(
-        send,
-        recv,
-        peer_limit,
-        budget,
-        #[cfg(unix)]
-        None,
-    )
-    .await
+    serve_inner(send, recv, peer_limit, budget, None).await
 }
 
-#[cfg(unix)]
 pub struct Service<'a> {
     pub account: &'a str,
     pub max_size: u64,
@@ -118,7 +109,6 @@ pub struct Service<'a> {
     pub resume: Arc<crate::file_resume::Store>,
 }
 
-#[cfg(unix)]
 pub async fn serve_account(
     send: SendStream,
     recv: RecvStream,
@@ -134,7 +124,7 @@ async fn serve_inner(
     mut recv: RecvStream,
     peer_limit: u64,
     budget: &Budget,
-    #[cfg(unix)] service: Option<Service<'_>>,
+    service: Option<Service<'_>>,
 ) -> Result<(), Failure> {
     let _permit = match budget.acquire() {
         Ok(permit) => permit,
@@ -163,7 +153,6 @@ async fn serve_inner(
             Ok(())
         }
         Ok(Some(message)) if message.kind == wire::FILE_REQUEST => {
-            #[cfg(unix)]
             if let Some(service) = service {
                 return worker_relay(send, recv, peer_limit, message, service).await;
             }
@@ -209,7 +198,6 @@ pub struct Channel {
     closed: bool,
 }
 
-#[cfg(unix)]
 async fn worker_relay(
     mut send: SendStream,
     mut recv: RecvStream,

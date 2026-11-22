@@ -17,7 +17,7 @@ Every command with `ACCOUNT@HOST` also accepts `--fingerprint SHA256:...` (see S
 
 - The default port is 843 (UDP). IPv6 addresses go in brackets: `alice@[2001:db8::1]:843`.
 - `SESSION` is a Session ID, a unique prefix of it, or a Session name.
-- `stpt server` runs the Server, every other command the Client. Server mode is available on Linux and Windows 11 (ConPTY). Windows currently serves only its own process Account/token; its file service is unavailable (G3).
+- `stpt server` runs the Server, every other command the Client. Server mode is available on Linux and Windows 11 (ConPTY). Windows currently serves only its own process Account/token; file operations use the same Account/token on local volume drives (G3 resolved).
 - `stpt help COMMAND` shows the options of a command.
 - Messages go to standard error. `-v` shows more (`-vv`, `-vvv` even more), `-q` errors only. The Server logs to standard error, which systemd keeps in the journal.
 
@@ -60,7 +60,7 @@ A lost connection in `connect` is repaired automatically: the Client notices it 
 - `exec` does not reconnect: it reports the lost connection and exits with 255. Input is not numbered like output, so reconnecting could silently lose part of what a pipe sends to the command.
 
 # Files
-`stpt fs` transfers regular files and manages files on the Linux Server under the Account's filesystem permissions. It needs no terminal or Session. Linux Server paths are absolute POSIX paths; local paths use the Client's native syntax. The CLI also encodes absolute Windows drive paths for compatible peers; Windows Server file operations remain unavailable (G3).
+`stpt fs` transfers regular files and manages files on Linux and Windows Servers under the Account's filesystem permissions. It needs no terminal or Session. Linux Server paths are absolute POSIX paths; Windows Server paths are absolute local-volume drive paths. Local paths use the Client's native syntax. Windows serves the same exact current Account/token as its terminal service (see Windows Server below); G3 is resolved in 0.4.1-0.
 
 ```
 stpt fs push alice@host ./local.bin /home/alice/remote.bin
@@ -77,13 +77,13 @@ stpt fs remove alice@host /home/alice/empty-directory
 - BLAKE3 verifies transfers by default. `--hash sha256` on push or pull explicitly requests SHA-256; the Server confirms that exact algorithm. Data stays inside QUIC/TLS in both cases. Files use bounded blocks, including files larger than 4 GiB; both roles default to an 8 GiB per-file limit.
 - Existing destinations are protected by default, including a destination created concurrently with the transfer. Pull `--replace` explicitly permits local replacement; rename `--replace` permits an atomic native replacement. **Push cannot replace an existing destination yet:** even with `--replace` it returns UNSUPPORTED. This preserves the protocol's regular-file-only replacement requirement without a check/rename race. There is no delete-and-retry fallback.
 - `list` prints kind, logical size (or `-`) and a byte-escaped entry name, separated by tabs; `stat` prints kind and size. A failed listing may already have printed incomplete batches. Neither transfers nor listings are filesystem snapshots. Add `--metadata` to stat/list to append mtime, POSIX rwx mode and Windows read-only columns. Timestamps, permissions and source ACLs are informational and are not copied.
-- Final symlinks are inspected, removed or renamed as entries. This implementation refuses downloads through final symlinks; directory listing may follow one. Devices, FIFOs and sockets are not transferred. The service is not confined to the home directory: normal Account permissions apply.
-- Ctrl+C cancels the operation. A Connection loss or missing final result is an error; a modifying operation may already have committed. STPT does not automatically retry it. Explicit resume and path/metadata rules are described below. Windows Server terminals are supported; native file service remains unavailable (G3). Windows Clients can transfer to Linux Servers now.
+- Final symlinks are inspected, removed or renamed as entries. This implementation refuses downloads through final symlinks; Linux directory listing may follow one. Windows refuses traversal through every reparse point, including junctions and a final directory link. Devices, FIFOs and sockets are not transferred. The service is not confined to the home directory: normal Account permissions apply.
+- Ctrl+C cancels the operation. A Connection loss or missing final result is an error; a modifying operation may already have committed. STPT does not automatically retry it. Explicit resume and path/metadata rules are described below. File Channels and terminal Sessions can run concurrently on either primary platform.
 
 ## Paths and metadata
 The remote path chooses its own kind independently of the Client OS. `/home/alice/a` uses POSIX byte components; a Windows drive path such as `'C:\Data\a'` or `'c:/Data/a'` uses Unicode text components and an uppercase drive letter. Quote paths as required by your shell. POSIX paths supplied on Unix preserve non-UTF-8 bytes and ordinary backslashes; Windows input that cannot be represented as Unicode scalar text is refused. Names are never case-folded or Unicode-normalized. An unsupported path kind returns UNSUPPORTED; Linux Servers do not reinterpret Windows paths as POSIX names.
 
-Windows paths reject UNC, device/extended namespaces, drive-relative paths, ADS, empty components, `.`/`..`, control/reserved characters, trailing ASCII dots/spaces and reserved device names (including extensions and COM/LPT superscript variants). A drive root may be used for stat/list only. POSIX roots have the same operation restriction. Native filesystem name/length/permission checks still apply on the Server. Windows Server volume-type and reparse traversal enforcement remain unimplemented (G3). This release enables terminal Sessions on Windows but does not advertise file capability there.
+Windows paths reject UNC, device/extended namespaces, drive-relative paths, ADS, empty components, `.`/`..`, control/reserved characters, trailing ASCII dots/spaces and reserved device names (including extensions and COM/LPT superscript variants). A drive root may be used for stat/list only. POSIX roots have the same operation restriction. Native filesystem name/length/permission checks still apply on the Server. Windows resolves actual local drive roots to volume GUIDs, refuses network and substituted drive aliases, and opens one component at a time relative to pinned directory handles. It inspects final links for stat/remove/rename without following them. Uploads use protected owner/SYSTEM/Administrators ACLs, delete-on-close staging and atomic no-replace hard-link publication. Filesystems must support the required native ACL, handle identity and hard-link operations; unsupported operations are refused. Pinned directories cannot be moved or deleted until the operation or retained upload ends. Ordinary Windows sharing conflicts can cause ACCESS_DENIED.
 
 ```
 stpt fs stat alice@host /home/alice/a --metadata
@@ -157,7 +157,7 @@ listen = '127.0.0.1:843'
 
 Run `stpt server --config PATH --fingerprint`, verify the fingerprint on the Client, then start `stpt server --config PATH`. Select a reachable listen address explicitly for remote access. Private keys are created with an owner/SYSTEM/Administrators DACL; unsafe key/configuration ACLs and final reparse points are refused. Keep installation/configuration ancestor directories under trusted control as well.
 
-Windows supports `connect`, `exec`, Sessions, detach/reattach, resize and termination. `--no-shell` transports arguments through a private single-binary helper so empty arguments, quotes and metacharacters reach a native executable unchanged. Batch files require an explicit shell command. ConPTY dimensions are limited by Win32 signed coordinates (32767 per dimension); oversized openings are refused. TERM/KILL/HUP map to owned Job termination; unsupported POSIX signals are ignored. Closing the Server, even forcibly, closes its kill-on-close Jobs and ends Session descendants. Windows service installation is still RK007. `stpt fs` to a Windows Server is refused during capability negotiation until G3's native filesystem backend exists.
+Windows supports `connect`, `exec`, Sessions, detach/reattach, resize and termination. `--no-shell` transports arguments through a private single-binary helper so empty arguments, quotes and metacharacters reach a native executable unchanged. Batch files require an explicit shell command. ConPTY dimensions are limited by Win32 signed coordinates (32767 per dimension); oversized openings are refused. TERM/KILL/HUP map to owned Job termination; unsupported POSIX signals are ignored. Closing the Server, even forcibly, closes its kill-on-close Jobs and ends Session descendants. Windows service installation is still RK007. `stpt fs` is available for this same Account/token on local volume drives; file limits, explicit resume and private upload publication apply as described above. G3 is resolved; the complete Tier RE scenario review is still pending.
 
 # Server key
 The Server proves its identity with a key, as an ssh host key. It creates the key at its first start, in `/etc/stpt/server_key` on Linux or `%PROGRAMDATA%\stpt\server_key` on Windows (setting `identity_key`), readable by its owner only; the Server refuses a key file that others can read.
@@ -217,7 +217,7 @@ listen = "[::]:843"   # address and UDP port; IPv6 addresses in brackets; [::] a
 log_level = "info"    # error, warn, info, debug or trace; -v and -q override it
 identity_key = "/etc/stpt/server_key"   # Server key file, created if missing
 authorized_keys = "/etc/stpt/authorized_keys"   # directory of authorized user keys, one file per Account
-max_file_channels = 8   # per Connection; 0 disables selection; Windows Server always selects no files (G3)
+max_file_channels = 8   # per Connection; 0 disables selection
 max_file_size = 8589934592   # bytes per transfer, default 8 GiB
 file_timeout = 60   # seconds without file-operation progress (1–86400)
 exit_grace = 1   # seconds output is still sent after the program of a Session exited (0–60)

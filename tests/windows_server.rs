@@ -8,6 +8,8 @@ mod cbor;
 mod common;
 #[path = "../src/control.rs"]
 mod control;
+#[path = "../src/file_protocol.rs"]
+mod file_protocol;
 #[path = "../src/identity.rs"]
 mod identity;
 #[path = "../src/quic.rs"]
@@ -38,7 +40,10 @@ struct Setup {
 }
 impl Setup {
     fn new(name: &str) -> Self {
-        let config = server_config(name, "");
+        Self::with_config(name, "")
+    }
+    fn with_config(name: &str, extra: &str) -> Self {
+        let config = server_config(name, extra);
         let fp = stdout(&stpt(&["server", "--fingerprint", "--config", &config]));
         let mut user = vec![0u16; 257];
         let mut length = user.len() as u32;
@@ -71,6 +76,16 @@ impl Setup {
             fp,
             destination,
         }
+    }
+    fn fs(&self, command: &str, args: &[&str]) -> std::process::Output {
+        let mut a = vec!["fs", command, &self.destination, "--fingerprint", &self.fp];
+        a.extend_from_slice(args);
+        stpt_in(&self.home, &a)
+    }
+    fn ok(&self, command: &str, args: &[&str]) -> String {
+        let out = self.fs(command, args);
+        assert!(out.status.success(), "{command} {args:?}: {}", stderr(&out));
+        stdout(&out)
     }
     fn exec(&self, argv: &[&str]) -> std::process::Output {
         let mut args = vec!["exec", &self.destination, "--fingerprint", &self.fp];
@@ -111,7 +126,19 @@ impl Raw {
         let (mut send, mut recv) = connection.open_bi().await.unwrap();
         let hello = Message::new(
             wire::CLIENT_HELLO,
-            vec![(0, Value::Array(vec![Value::Uint(0xff000001)]))],
+            vec![
+                (0, Value::Array(vec![Value::Uint(0xff000001)])),
+                (
+                    1,
+                    Value::Map(vec![(
+                        Value::Uint(1),
+                        Value::Map(vec![
+                            (Value::Uint(0), Value::Uint(1)),
+                            (Value::Uint(1), Value::Uint(8)),
+                        ]),
+                    )]),
+                ),
+            ],
         );
         wire::write_message(&mut send, &hello, 65535).await.unwrap();
         assert_eq!(
@@ -143,6 +170,27 @@ impl Raw {
             send,
             recv,
         }
+    }
+    async fn file(&self, q: &Message) -> (quinn::SendStream, quinn::RecvStream, Message) {
+        let (mut send, mut recv) = self.connection.open_bi().await.unwrap();
+        wire::write_message(
+            &mut send,
+            &Message::new(wire::CHANNEL_OPEN, vec![(0, Value::Uint(2))]),
+            65535,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            wire::read_message(&mut recv, 65535)
+                .await
+                .unwrap()
+                .unwrap()
+                .kind,
+            wire::FILES_READY
+        );
+        wire::write_message(&mut send, q, 65535).await.unwrap();
+        let first = wire::read_message(&mut recv, 65535).await.unwrap().unwrap();
+        (send, recv, first)
     }
     async fn open(
         &self,
@@ -218,12 +266,8 @@ fn windows_exec_preserves_argv_stdout_stderr_and_exit() {
         &s.home,
         &["fs", "stat", &s.destination, "--fingerprint", &s.fp, r"C:\"],
     );
-    assert_eq!(out.status.code(), Some(255));
-    assert!(
-        stderr(&out).contains("file capability was not selected"),
-        "{}",
-        stderr(&out)
-    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "directory\t-");
 }
 #[test]
 fn conpty_input_resize_and_exit_over_authenticated_quic() {
@@ -421,4 +465,625 @@ fn conpty_login_shell_accepts_commands_and_sets_utf8_terminal_environment() {
         .await
         .unwrap();
     });
+}
+
+fn path_value(path: &Path) -> Value {
+    let text = path.to_str().unwrap();
+    assert_eq!(&text[1..3], ":\\");
+    Value::Array(vec![
+        Value::Uint(1),
+        Value::Text(text[..1].to_ascii_uppercase()),
+        Value::Array(
+            text[3..]
+                .split('\\')
+                .filter(|s| !s.is_empty())
+                .map(|s| Value::Text(s.into()))
+                .collect(),
+        ),
+    ])
+}
+fn upload_request(path: &Path, mode: Value) -> Message {
+    Message::new(
+        wire::FILE_REQUEST,
+        vec![
+            (0, Value::Uint(0)),
+            (1, Value::Uint(2)),
+            (2, path_value(path)),
+            (5, Value::Uint(6)),
+            (6, Value::Uint(1)),
+            (7, mode),
+        ],
+    )
+}
+#[test]
+fn windows_files_cli_roundtrip_management_and_private_publication() {
+    let s = Setup::new("win-files-cli");
+    let data = dir("win-files-cli-data");
+    let source = data.join("source");
+    let remote = data.join("東京.txt");
+    let copy = data.join("copy");
+    let bytes: Vec<_> = (0..150000).map(|n| (n % 251) as u8).collect();
+    std::fs::write(&source, &bytes).unwrap();
+    for hash in ["blake3", "sha256"] {
+        s.ok(
+            "push",
+            &[
+                source.to_str().unwrap(),
+                remote.to_str().unwrap(),
+                "--hash",
+                hash,
+            ],
+        );
+        windows_security::check_private(&remote).unwrap();
+        s.ok(
+            "pull",
+            &[
+                remote.to_str().unwrap(),
+                copy.to_str().unwrap(),
+                "--hash",
+                hash,
+            ],
+        );
+        assert_eq!(std::fs::read(&copy).unwrap(), bytes);
+        assert_eq!(s.ok("stat", &[remote.to_str().unwrap()]), "file\t150000");
+        assert!(s.ok("list", &[data.to_str().unwrap()]).contains("東京.txt"));
+        assert!(
+            stderr(&s.fs(
+                "push",
+                &[source.to_str().unwrap(), remote.to_str().unwrap()]
+            ))
+            .contains("ALREADY_EXISTS")
+        );
+        assert!(
+            stderr(&s.fs(
+                "push",
+                &[
+                    source.to_str().unwrap(),
+                    remote.to_str().unwrap(),
+                    "--replace"
+                ]
+            ))
+            .contains("UNSUPPORTED")
+        );
+        s.ok("remove", &[remote.to_str().unwrap()]);
+        s.ok("remove", &[copy.to_str().unwrap()]);
+    }
+    let moved = data.join("moved");
+    let folder = data.join("folder");
+    s.ok("mkdir", &[folder.to_str().unwrap()]);
+    s.ok(
+        "rename",
+        &[source.to_str().unwrap(), moved.to_str().unwrap()],
+    );
+    std::fs::write(&source, b"old").unwrap();
+    assert!(
+        stderr(&s.fs(
+            "rename",
+            &[moved.to_str().unwrap(), source.to_str().unwrap()]
+        ))
+        .contains("ALREADY_EXISTS")
+    );
+    s.ok(
+        "rename",
+        &[
+            moved.to_str().unwrap(),
+            source.to_str().unwrap(),
+            "--replace",
+        ],
+    );
+    assert_eq!(std::fs::read(&source).unwrap(), bytes);
+    std::fs::write(folder.join("child"), b"x").unwrap();
+    assert!(stderr(&s.fs("remove", &[folder.to_str().unwrap()])).contains("NOT_EMPTY"));
+    s.ok("remove", &[folder.join("child").to_str().unwrap()]);
+    s.ok("remove", &[folder.to_str().unwrap()]);
+    for hash in ["blake3", "sha256"] {
+        std::fs::write(&source, []).unwrap();
+        s.ok(
+            "push",
+            &[
+                source.to_str().unwrap(),
+                remote.to_str().unwrap(),
+                "--hash",
+                hash,
+            ],
+        );
+        s.ok(
+            "pull",
+            &[
+                remote.to_str().unwrap(),
+                copy.to_str().unwrap(),
+                "--hash",
+                hash,
+            ],
+        );
+        assert_eq!(std::fs::metadata(&copy).unwrap().len(), 0);
+        s.ok("remove", &[remote.to_str().unwrap()]);
+        s.ok("remove", &[copy.to_str().unwrap()]);
+    }
+    assert!(std::fs::read_dir(&data).unwrap().all(|e| {
+        !e.unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".stpt-")
+    }));
+}
+#[test]
+fn windows_files_resume_cross_connection_busy_consumed_cancel_and_parent_pin() {
+    use file_protocol as p;
+    quic::runtime().unwrap().block_on(async {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let s = Setup::new("win-files-resume");
+            let data = dir("win-files-resume-data");
+            let target = data.join("target");
+            let client = Raw::login(&s).await;
+            let fresh = upload_request(&target, Value::Array(vec![Value::Uint(0)]));
+            let (mut send, mut recv, a) = client.file(&fresh).await;
+            assert_eq!(a.kind, p::ACCEPTED, "{a:?}");
+            let token = a.field(3).unwrap().as_array().unwrap()[0].clone();
+            let resume = upload_request(&target, Value::Array(vec![Value::Uint(1), token]));
+            let (_, _, busy) = client.file(&resume).await;
+            assert_eq!(p::status(&busy).unwrap(), p::Status::ResumeBusy);
+            assert!(
+                std::fs::rename(&data, data.with_extension("moved")).is_err(),
+                "pinned parent must not move"
+            );
+            wire::write_message(&mut send, &p::data(0, 0, b"abc".to_vec()), 65535)
+                .await
+                .unwrap();
+            loop {
+                if std::fs::read_dir(&data)
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .any(|e| {
+                        e.file_name().to_string_lossy().starts_with(".stpt-upload-")
+                            && std::fs::metadata(e.path()).is_ok_and(|m| m.len() == 3)
+                    })
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            send.reset(wire::Code::Timeout.varint()).unwrap();
+            recv.stop(wire::Code::Timeout.varint()).unwrap();
+            let second = Raw::login(&s).await;
+            let (mut send, mut recv, a) = loop {
+                let a = second.file(&resume).await;
+                if a.2.kind == p::RESULT && p::status(&a.2).unwrap() == p::Status::ResumeBusy {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    continue;
+                }
+                break a;
+            };
+            assert_eq!(a.kind, p::ACCEPTED, "{a:?}");
+            assert_eq!(a.field(3).unwrap().as_array().unwrap()[1], Value::Uint(3));
+            wire::write_message(&mut send, &p::data(0, 3, b"def".to_vec()), 65535)
+                .await
+                .unwrap();
+            let mut h = p::Hash::new(1).unwrap();
+            h.update(b"abcdef");
+            wire::write_message(
+                &mut send,
+                &p::end(0, p::Status::Ok, 6, Some(h.finish())),
+                65535,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                p::status(&wire::read_message(&mut recv, 65535).await.unwrap().unwrap()).unwrap(),
+                p::Status::Ok
+            );
+            let (_, _, a) = second.file(&resume).await;
+            assert_eq!(p::status(&a).unwrap(), p::Status::ResumeUnavailable);
+            assert_eq!(std::fs::read(&target).unwrap(), b"abcdef");
+            send.finish().unwrap();
+            let _ = wire::read_message(&mut recv, 65535).await;
+            let cancel = data.join("cancel");
+            let (mut send, mut recv, a) = second
+                .file(&upload_request(&cancel, Value::Array(vec![Value::Uint(0)])))
+                .await;
+            let token = a.field(3).unwrap().as_array().unwrap()[0].clone();
+            send.reset(wire::Code::NoError.varint()).unwrap();
+            recv.stop(wire::Code::NoError.varint()).unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let (_, _, a) = second
+                .file(&upload_request(
+                    &cancel,
+                    Value::Array(vec![Value::Uint(1), token]),
+                ))
+                .await;
+            assert_eq!(p::status(&a).unwrap(), p::Status::ResumeUnavailable);
+            let (open_send, mut terminal, attached) = client
+                .open(terminal::Open {
+                    command: Some(terminal::Command::Line(
+                        "Write-Output 'files-and-terminal'; exit 0".into(),
+                    )),
+                    ..Default::default()
+                })
+                .await;
+            let _ = attached.session;
+            read_until(&mut terminal, "files-and-terminal").await;
+            drop(open_send);
+            client.close().await;
+            second.close().await;
+        })
+        .await
+        .unwrap();
+    });
+}
+
+#[test]
+fn windows_files_reparse_metadata_and_native_name_refusals() {
+    use file_protocol as p;
+    let s = Setup::new("win-files-paths");
+    let data = dir("win-files-paths-data");
+    let real = data.join("real");
+    std::fs::create_dir(&real).unwrap();
+    let source = real.join("source");
+    std::fs::write(&source, b"kept").unwrap();
+    let junction = data.join("junction");
+    let out = Command::new("cmd.exe")
+        .args(["/d", "/c", "mklink", "/J"])
+        .arg(&junction)
+        .arg(&real)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(s.ok("stat", &[junction.to_str().unwrap()]), "symlink\t-");
+    assert!(
+        s.ok("list", &[data.to_str().unwrap()])
+            .contains("symlink\t-\tjunction")
+    );
+    for (op, args) in [
+        ("list", vec![junction.clone()]),
+        ("stat", vec![junction.join("source")]),
+        ("pull", vec![junction.join("source"), data.join("copy")]),
+        ("mkdir", vec![junction.join("new")]),
+        ("push", vec![source.clone(), junction.join("upload")]),
+    ] {
+        let args: Vec<_> = args.iter().map(|p| p.to_str().unwrap()).collect();
+        assert!(stderr(&s.fs(op, &args)).contains("UNSUPPORTED"), "{op}");
+    }
+    let renamed = data.join("renamed-junction");
+    s.ok(
+        "rename",
+        &[junction.to_str().unwrap(), renamed.to_str().unwrap()],
+    );
+    s.ok("remove", &[renamed.to_str().unwrap()]);
+    assert_eq!(std::fs::read(&source).unwrap(), b"kept");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&source)
+        .unwrap();
+    file.set_modified(std::time::UNIX_EPOCH - Duration::new(1, 123456700))
+        .unwrap();
+    drop(file);
+    let mut permissions = std::fs::metadata(&source).unwrap().permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(&source, permissions).unwrap();
+    quic::runtime().unwrap().block_on(async {
+        let client = Raw::login(&s).await;
+        let request = |path| {
+            Message::new(
+                wire::FILE_REQUEST,
+                vec![(0, Value::Uint(0)), (1, Value::Uint(3)), (2, path)],
+            )
+        };
+        let (_, _, m) = client.file(&request(path_value(&source))).await;
+        assert_eq!(p::status(&m).unwrap(), p::Status::Ok);
+        let meta = p::validate_metadata(m.field(2).unwrap(), 1).unwrap();
+        assert_eq!(meta.readonly, Some(true));
+        assert_eq!(meta.modified, Some((-2, 876543300)));
+        let (_, _, m) = client
+            .file(&request(Value::Array(vec![
+                Value::Uint(0),
+                Value::Array(vec![]),
+            ])))
+            .await;
+        assert_eq!(p::status(&m).unwrap(), p::Status::Unsupported);
+        for name in ["NUL", "x:stream", "..", "trailing."] {
+            let mut path = path_value(&source);
+            if let Value::Array(a) = &mut path
+                && let Value::Array(names) = &mut a[2]
+            {
+                *names.last_mut().unwrap() = Value::Text(name.into());
+            }
+            let (_, _, m) = client.file(&request(path)).await;
+            assert_eq!(p::status(&m).unwrap(), p::Status::InvalidPath);
+        }
+        client.close().await;
+    });
+    assert!(!s.fs("remove", &[source.to_str().unwrap()]).status.success());
+    let mut permissions = std::fs::metadata(&source).unwrap().permissions();
+    #[allow(
+        clippy::permissions_set_readonly_false,
+        reason = "Windows-only attribute restoration"
+    )]
+    permissions.set_readonly(false);
+    std::fs::set_permissions(&source, permissions).unwrap();
+    use std::os::windows::ffi::OsStringExt;
+    let odd = real.join(std::ffi::OsString::from_wide(&[0xd800]));
+    std::fs::write(&odd, b"unrepresentable").unwrap();
+    assert!(stderr(&s.fs("list", &[real.to_str().unwrap()])).contains("UNSUPPORTED"));
+    std::fs::remove_file(odd).unwrap();
+}
+#[test]
+fn windows_worker_integrity_race_and_forced_exit_clean_staging() {
+    use file_protocol as p;
+    use std::process::Stdio;
+    let data = dir("win-files-worker-data");
+    let target = data.join("target");
+    let spawn = || {
+        Command::new(env!("CARGO_BIN_EXE_stpt"))
+            .args(["__stpt-file-worker", "65535", "1048576"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    for force in [false, true] {
+        let mut child = spawn();
+        let mut input = child.stdin.take().unwrap();
+        let mut output = child.stdout.take().unwrap();
+        let q = upload_request(&target, Value::Array(vec![Value::Uint(0)]));
+        p::write_ipc(&mut input, &q).unwrap();
+        assert_eq!(p::read_ipc(&mut output).unwrap().unwrap().kind, p::ACCEPTED);
+        p::write_ipc(&mut input, &p::data(0, 0, b"abcdef".to_vec())).unwrap();
+        if force {
+            child.kill().unwrap();
+            child.wait().unwrap();
+        } else {
+            p::write_ipc(&mut input, &p::end(0, p::Status::Ok, 6, Some([0; 32]))).unwrap();
+            assert_eq!(
+                p::status(&p::read_ipc(&mut output).unwrap().unwrap()).unwrap(),
+                p::Status::Integrity
+            );
+            drop(input);
+            assert!(child.wait().unwrap().success());
+        }
+        assert!(!target.exists());
+        assert!(std::fs::read_dir(&data).unwrap().all(|e| {
+            !e.unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".stpt-upload-")
+        }));
+    }
+    let mut child = spawn();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = child.stdout.take().unwrap();
+    p::write_ipc(
+        &mut input,
+        &upload_request(&target, Value::Array(vec![Value::Uint(0)])),
+    )
+    .unwrap();
+    assert_eq!(p::read_ipc(&mut output).unwrap().unwrap().kind, p::ACCEPTED);
+    std::fs::write(&target, b"raced").unwrap();
+    p::write_ipc(&mut input, &p::data(0, 0, b"abcdef".to_vec())).unwrap();
+    let mut h = p::Hash::new(1).unwrap();
+    h.update(b"abcdef");
+    p::write_ipc(&mut input, &p::end(0, p::Status::Ok, 6, Some(h.finish()))).unwrap();
+    assert_eq!(
+        p::status(&p::read_ipc(&mut output).unwrap().unwrap()).unwrap(),
+        p::Status::Exists
+    );
+    drop(input);
+    assert!(child.wait().unwrap().success());
+    assert_eq!(std::fs::read(target).unwrap(), b"raced");
+}
+#[test]
+fn windows_server_restart_discards_retained_token_and_stage() {
+    use file_protocol as p;
+    quic::runtime().unwrap().block_on(async {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let mut s = Setup::new("win-files-restart");
+            let data = dir("win-files-restart-data");
+            let target = data.join("target");
+            let client = Raw::login(&s).await;
+            let (mut send, mut recv, a) = client
+                .file(&upload_request(&target, Value::Array(vec![Value::Uint(0)])))
+                .await;
+            assert_eq!(a.kind, p::ACCEPTED);
+            let token = a.field(3).unwrap().as_array().unwrap()[0].clone();
+            send.reset(wire::Code::Timeout.varint()).unwrap();
+            recv.stop(wire::Code::Timeout.varint()).unwrap();
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let new = RunningServer::start(&["--listen", "127.0.0.1:0", "--config", &s.config]);
+            let old = std::mem::replace(&mut s.server, new);
+            old.stop();
+            client.close().await;
+            loop {
+                if std::fs::read_dir(&data).unwrap().all(|e| {
+                    !e.unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".stpt-upload-")
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let client = Raw::login(&s).await;
+            let (_, _, a) = client
+                .file(&upload_request(
+                    &target,
+                    Value::Array(vec![Value::Uint(1), token]),
+                ))
+                .await;
+            assert_eq!(p::status(&a).unwrap(), p::Status::ResumeUnavailable);
+            assert!(!target.exists());
+            client.close().await;
+        })
+        .await
+        .unwrap();
+    });
+}
+
+#[test]
+fn windows_download_resume_verifies_prefix_and_full_hash_both_algorithms() {
+    use file_protocol as p;
+    let s = Setup::new("win-files-download-resume");
+    let data = dir("win-files-download-resume-data");
+    let source = data.join("source");
+    std::fs::write(&source, b"abcdef").unwrap();
+    quic::runtime().unwrap().block_on(async {
+        tokio::time::timeout(Duration::from_secs(12), async {
+            let client = Raw::login(&s).await;
+            for algorithm in [1, 2] {
+                for offset in [3, 6] {
+                    let mut prefix = p::Hash::new(algorithm).unwrap();
+                    prefix.update(&b"abcdef"[..offset]);
+                    let request = |digest| {
+                        Message::new(
+                            wire::FILE_REQUEST,
+                            vec![
+                                (0, Value::Uint(0)),
+                                (1, Value::Uint(1)),
+                                (2, path_value(&source)),
+                                (6, Value::Uint(algorithm)),
+                                (
+                                    7,
+                                    Value::Array(vec![
+                                        Value::Uint(2),
+                                        Value::Uint(6),
+                                        Value::Uint(offset as u64),
+                                        Value::Bytes(digest),
+                                    ]),
+                                ),
+                            ],
+                        )
+                    };
+                    let (_, _, m) = client.file(&request(vec![0; 32])).await;
+                    assert_eq!(p::status(&m).unwrap(), p::Status::ResumeUnavailable);
+                    let (mut send, mut recv, a) =
+                        client.file(&request(prefix.finish().to_vec())).await;
+                    assert_eq!(a.kind, p::ACCEPTED);
+                    let mut suffix = Vec::new();
+                    let end = loop {
+                        let m = wire::read_message(&mut recv, 65535).await.unwrap().unwrap();
+                        if m.kind == p::END {
+                            break m;
+                        }
+                        assert_eq!(m.kind, p::DATA);
+                        if let Value::Bytes(b) = m.field(2).unwrap() {
+                            suffix.extend_from_slice(b);
+                        }
+                    };
+                    assert_eq!(suffix, &b"abcdef"[offset..]);
+                    let mut full = p::Hash::new(algorithm).unwrap();
+                    full.update(b"abcdef");
+                    assert_eq!(
+                        p::verify_end(&end, 0, 6, 6, full.finish()).unwrap(),
+                        p::Status::Ok
+                    );
+                    wire::write_message(
+                        &mut send,
+                        &Message::new(p::RECEIVED, vec![(0, Value::Uint(0)), (1, Value::Uint(0))]),
+                        65535,
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        p::status(&wire::read_message(&mut recv, 65535).await.unwrap().unwrap())
+                            .unwrap(),
+                        p::Status::Ok
+                    );
+                    send.finish().unwrap();
+                    let _ = wire::read_message(&mut recv, 65535).await;
+                }
+            }
+            client.close().await;
+        })
+        .await
+        .unwrap();
+    });
+}
+#[test]
+fn windows_file_deadline_retains_upload_and_server_policy_applies() {
+    use file_protocol as p;
+    let s = Setup::with_config("win-files-policy", "file_timeout=1\nmax_file_size=6\n");
+    let data = dir("win-files-policy-data");
+    let source = data.join("large");
+    std::fs::write(&source, b"too large").unwrap();
+    assert!(
+        stderr(&s.fs(
+            "push",
+            &[
+                source.to_str().unwrap(),
+                data.join("target").to_str().unwrap()
+            ]
+        ))
+        .contains("LIMIT_EXCEEDED")
+    );
+    quic::runtime().unwrap().block_on(async{tokio::time::timeout(Duration::from_secs(8),async{
+ let client=Raw::login(&s).await;let target=data.join("target");let(_send,mut recv,a)=client.file(&upload_request(&target,Value::Array(vec![Value::Uint(0)]))).await;assert_eq!(a.kind,p::ACCEPTED);let token=a.field(3).unwrap().as_array().unwrap()[0].clone();assert!(matches!(wire::read_message(&mut recv,65535).await,Err(wire::StreamError::Reset(code)) if code==wire::Code::Timeout.varint()));
+ let(mut send,mut recv,a)=loop{let a=client.file(&upload_request(&target,Value::Array(vec![Value::Uint(1),token.clone()]))).await;if a.2.kind==p::RESULT&&p::status(&a.2).unwrap()==p::Status::ResumeBusy{tokio::time::sleep(Duration::from_millis(10)).await;continue;}break a;};assert_eq!(a.kind,p::ACCEPTED);send.reset(wire::Code::NoError.varint()).unwrap();recv.stop(wire::Code::NoError.varint()).unwrap();client.close().await;
+ }).await.unwrap();});
+    let off = Setup::with_config("win-files-disabled", "max_file_channels=0\n");
+    assert!(
+        stderr(&off.fs("stat", &[data.to_str().unwrap()]))
+            .contains("file capability was not selected")
+    );
+}
+
+#[test]
+fn windows_upload_keeps_private_acl_and_checks_destination_authority_at_publication() {
+    use file_protocol as p;
+    use std::process::Stdio;
+    let s = Setup::new("win-files-acl");
+    let data = dir("win-files-acl-data");
+    let source = data.join("source");
+    std::fs::write(&source, b"abcdef").unwrap();
+    let target = data.join("public-parent-upload");
+    let out = Command::new("icacls.exe")
+        .arg(&data)
+        .args(["/grant", "*S-1-1-0:(OI)(CI)F"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    s.ok(
+        "push",
+        &[source.to_str().unwrap(), target.to_str().unwrap()],
+    );
+    windows_security::check_private(&target).unwrap();
+    let dest = data.join("denied");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_stpt"))
+        .args(["__stpt-file-worker", "65535", "1048576"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = child.stdout.take().unwrap();
+    p::write_ipc(
+        &mut input,
+        &upload_request(&dest, Value::Array(vec![Value::Uint(0)])),
+    )
+    .unwrap();
+    assert_eq!(p::read_ipc(&mut output).unwrap().unwrap().kind, p::ACCEPTED);
+    let out = Command::new("icacls.exe")
+        .arg(&data)
+        .arg("/deny")
+        .arg(format!("{}:(WD)", s.account))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    p::write_ipc(&mut input, &p::data(0, 0, b"abcdef".to_vec())).unwrap();
+    let mut hash = p::Hash::new(1).unwrap();
+    hash.update(b"abcdef");
+    p::write_ipc(
+        &mut input,
+        &p::end(0, p::Status::Ok, 6, Some(hash.finish())),
+    )
+    .unwrap();
+    let result = p::read_ipc(&mut output).unwrap().unwrap();
+    drop(input);
+    child.wait().unwrap();
+    let out = Command::new("icacls.exe")
+        .arg(&data)
+        .args(["/remove:d", &s.account])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(p::status(&result).unwrap(), p::Status::Access, "{result:?}");
+    assert!(!dest.exists());
 }

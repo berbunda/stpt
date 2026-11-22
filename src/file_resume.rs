@@ -183,14 +183,14 @@ mod tests {
     }
     #[tokio::test]
     async fn binding_busy_expiry_and_quotas_do_not_disclose_records() {
-        let account = Account::lookup(
-            &nix::unistd::User::from_uid(nix::unistd::geteuid())
-                .unwrap()
-                .unwrap()
-                .name,
-        )
-        .unwrap()
-        .unwrap();
+        #[cfg(unix)]
+        let name = nix::unistd::User::from_uid(nix::unistd::geteuid())
+            .unwrap()
+            .unwrap()
+            .name;
+        #[cfg(windows)]
+        let name = Account::current_name().unwrap();
+        let account = Account::lookup(&name).unwrap().unwrap();
         let store = Arc::new(Store::default());
         let q = request(1024, Value::Array(vec![Value::Uint(0)]));
         let (lease, _) = store.acquire(&account, &q).unwrap();

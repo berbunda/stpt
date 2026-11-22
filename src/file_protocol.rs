@@ -558,7 +558,6 @@ impl Exchange {
 }
 
 /// Private IPC uses a fixed u32 length, never exposed on a QUIC stream.
-#[cfg(unix)]
 pub fn read_ipc(r: &mut impl std::io::Read) -> Result<Option<Message>, Failure> {
     let mut prefix = [0; 4];
     let n = r
@@ -578,7 +577,6 @@ pub fn read_ipc(r: &mut impl std::io::Read) -> Result<Option<Message>, Failure> 
         .map_err(|_| Failure::new(crate::wire::Code::InternalError, "worker truncated message"))?;
     Message::decode(&b).map(Some)
 }
-#[cfg(unix)]
 pub fn write_ipc(w: &mut impl std::io::Write, m: &Message) -> std::io::Result<()> {
     let b = m.encode();
     w.write_all(&(b.len() as u32).to_be_bytes())?;

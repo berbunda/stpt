@@ -31,6 +31,30 @@ pub struct Account {
     home: PathBuf,
 }
 impl Account {
+    pub fn file_worker(&self, peer_limit: u64, max_size: u64) -> io::Result<tokio::process::Child> {
+        if Self::lookup(&self.name)?.as_ref() != Some(self) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Account changed",
+            ));
+        }
+        let mut command = tokio::process::Command::new(std::env::current_exe()?);
+        command
+            .arg("__stpt-file-worker")
+            .arg(peer_limit.to_string())
+            .arg(max_size.to_string())
+            .env_clear()
+            .current_dir(
+                std::env::var_os("SystemRoot")
+                    .ok_or_else(|| io::Error::other("SystemRoot unavailable"))?,
+            )
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .kill_on_drop(true);
+        command.creation_flags(CREATE_NO_WINDOW);
+        command.spawn()
+    }
     pub fn current_name() -> io::Result<String> {
         let mut name = vec![0u16; 257];
         let mut length = name.len() as u32;

@@ -9,7 +9,7 @@ use windows_sys::Win32::{
     Security::{Authorization::*, *},
     System::Threading::*,
 };
-struct Local(*mut std::ffi::c_void);
+pub(crate) struct Local(pub(crate) *mut std::ffi::c_void);
 impl Drop for Local {
     fn drop(&mut self) {
         unsafe { LocalFree(self.0) };
@@ -155,7 +155,7 @@ pub fn check_handle(file: &std::fs::File, private: bool) -> io::Result<()> {
     Ok(())
 }
 
-fn descriptor(inherit: bool) -> io::Result<Local> {
+pub(crate) fn descriptor(inherit: bool) -> io::Result<Local> {
     let s = if inherit {
         "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
     } else {

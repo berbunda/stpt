@@ -14,9 +14,13 @@ mod error;
 mod file_checkpoint;
 mod file_client;
 mod file_protocol;
-#[cfg(unix)]
 mod file_resume;
 #[cfg(unix)]
+#[path = "file_storage_unix.rs"]
+mod file_storage;
+#[cfg(windows)]
+#[path = "file_storage_windows.rs"]
+mod file_storage;
 mod file_worker;
 mod files;
 mod hello;
@@ -53,7 +57,6 @@ fn main() -> ExitCode {
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__stpt-native-exec")) {
         return process::native_exec();
     }
-    #[cfg(unix)]
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__stpt-file-worker")) {
         return crate::file_worker::main();
     }

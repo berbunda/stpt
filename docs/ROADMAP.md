@@ -46,7 +46,7 @@ IDs A001–D008 were renamed to RA001–RD008 on 2026-10-11 (prefix scheme chang
 - [x] RE001  file transfer Channel ← PE001 ➕ 2026-10-13 ✅ 2026-11-21
 - [x] RE002  `stpt fs`: transfer and file management ← PE002, PE003 ➕ 2026-10-13 ✅ 2026-11-21
 - [x] RE003  resume of transfers ← PE004 ➕ 2026-10-13 ✅ 2026-11-22
-- [x] RE004  metadata and Windows paths ← PE005 ➕ 2026-10-13 ✅ 2026-11-22 (Windows native file service remains G3)
+- [x] RE004  metadata and Windows paths ← PE005 ➕ 2026-10-13 ✅ 2026-11-22 (Windows native file service completed in 0.4.1-0; G3 resolved)
 
 # 6	Tier RF — Client-side File Access
 - [ ] RF001  permission grants on the Client ← PF001 ➕ 2026-10-13
