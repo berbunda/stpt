@@ -126,6 +126,14 @@ pub fn run(command: ClientCommand, common: &Common) -> Result<ExitCode, Error> {
     let runtime = quic::runtime()?;
     let _guard = runtime.enter();
     let addr = resolve(&remote.destination.address)?;
+    let consent = if matches!(action, Action::Attach { .. } | Action::Terminal(..)) {
+        std::env::var_os(crate::consent::ENV)
+            .map(|p| crate::consent::Pair::load(Path::new(&p)))
+            .transpose()
+            .map_err(Error::SessionLocal)?
+    } else {
+        None
+    };
     let mut connection = runtime.block_on(login_to_offer(
         &remote,
         addr,
@@ -133,8 +141,17 @@ pub fn run(command: ClientCommand, common: &Common) -> Result<ExitCode, Error> {
         &key,
         ask_user,
         matches!(&action, Action::Files(..)),
+        consent.clone(),
     ))?;
+    connection.reverse_policy = (
+        config
+            .max_file_size
+            .unwrap_or(crate::file_protocol::DEFAULT_MAX_SIZE),
+        Duration::from_secs(config.file_timeout.unwrap_or(60)),
+    );
     let mut login = Login {
+        consent,
+        reverse_policy: connection.reverse_policy,
         remote: &remote,
         store: &mut store,
         key: &key,
@@ -155,17 +172,6 @@ const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(20);
 /// The longest pause between attempts of automatic reattach.
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 
-/// A Connection with a trusted Server key, HELLO exchanged and authenticated (§10, §12).
-async fn login_to(
-    remote: &Remote,
-    addr: SocketAddr,
-    store: &mut TrustStore,
-    key: &UserKey,
-    confirm: impl Fn(&Address, &Fingerprint) -> Result<bool, Error>,
-) -> Result<Connection, Error> {
-    login_to_offer(remote, addr, store, key, confirm, false).await
-}
-
 async fn login_to_offer(
     remote: &Remote,
     addr: SocketAddr,
@@ -173,11 +179,26 @@ async fn login_to_offer(
     key: &UserKey,
     confirm: impl Fn(&Address, &Fingerprint) -> Result<bool, Error>,
     files: bool,
+    consent: Option<crate::consent::Pair>,
 ) -> Result<Connection, Error> {
     let mut connection = connect(remote, addr, store, confirm).await?;
-    let hello = if files {
+    connection.consent = consent;
+    let hello = if files || connection.consent.is_some() {
         match connection
-            .exchange_hello_offer(SERVER_HELLO_TIMEOUT, ClientHello::with_files(1))
+            .exchange_hello_offer(
+                SERVER_HELLO_TIMEOUT,
+                if files {
+                    ClientHello::with_files(1)
+                } else {
+                    let mut h = ClientHello::ours();
+                    h.capabilities.push((2, crate::files::parameters(1)));
+                    #[cfg(target_os = "linux")]
+                    if crate::reverse::mount_client::supported() {
+                        h.capabilities.push((3, crate::cbor::Value::Uint(1)));
+                    }
+                    h
+                },
+            )
             .await
         {
             Ok(hello) => hello,
@@ -201,6 +222,16 @@ async fn login_to_offer(
             fingerprint: key.public_key().fingerprint(),
             key_line: key.public_key().to_base64(),
         });
+    }
+    if let Some(pair) = connection.consent.as_mut() {
+        pair.mount = crate::hello::mount(&hello.capabilities);
+    }
+    if crate::hello::reverse_limit(&hello.capabilities).is_some() {
+        connection
+            .connection
+            .set_max_concurrent_bi_streams(1u32.into());
+    } else {
+        connection.consent = None;
     }
     tracing::info!(%account, key = %key.public_key().fingerprint(), "Connection authenticated");
     Ok(connection)
@@ -431,9 +462,11 @@ fn resolve(address: &Address) -> Result<SocketAddr, Error> {
 
 /// Connection with a trusted Server key.
 pub struct Connection {
+    reverse_policy: (u64, Duration),
+    consent: Option<crate::consent::Pair>,
     server_identity: crate::identity::PublicKey,
     files: Option<crate::files::Budget>,
-    authenticated: bool,
+    authenticated_account: Option<String>,
     endpoint: quinn::Endpoint,
     connection: quinn::Connection,
     /// Control stream once opened; kept until the Connection is closed, as dropping
@@ -535,13 +568,13 @@ impl Connection {
         wire::write_message(send, &request.to_message(), self.peer_limit).await?;
         let message = reply(recv, deadline, "AUTH_RESULT", State::Established).await?;
         let accepted = auth::result_from_message(&message)?;
-        self.authenticated = accepted;
+        self.authenticated_account = accepted.then(|| account.to_owned());
         Ok(accepted)
     }
 
     /// Opens an authenticated, negotiated file Channel for `fs`.
     pub async fn open_files(&self) -> Result<crate::files::Channel, StreamError> {
-        if !self.authenticated {
+        if self.authenticated_account.is_none() {
             return Err(Failure::new(
                 Code::ChannelRejected,
                 "file Channel requires authentication",
@@ -576,6 +609,7 @@ struct Channel {
     send: quinn::SendStream,
     recv: quinn::RecvStream,
     attached: Attached,
+    _permissions: crate::permissions::Permissions,
 }
 
 impl Connection {
@@ -604,7 +638,19 @@ impl Connection {
             Err(error) => return Err(self.failed(error).await),
         };
         tracing::info!(session = %attached.session, attachment = attached.attachment, "attached");
+        let account = self.authenticated_account.as_deref().ok_or_else(|| {
+            Error::Protocol(Failure::violation(
+                "terminal Attachment without authentication",
+            ))
+        })?;
+        let permissions = crate::permissions::Permissions::new(
+            self.server_identity.fingerprint(),
+            account,
+            attached.session,
+            attached.attachment,
+        );
         Ok(Channel {
+            _permissions: permissions,
             send,
             recv,
             attached,
@@ -671,6 +717,8 @@ fn shutting_down(reason: &quinn::ConnectionError) -> bool {
 
 /// What a new Connection to the same Server takes (§15.12).
 struct Login<'a> {
+    reverse_policy: (u64, Duration),
+    consent: Option<crate::consent::Pair>,
     remote: &'a Remote,
     store: &'a mut TrustStore,
     key: &'a UserKey,
@@ -709,7 +757,12 @@ impl<F: Future<Output = &'static str>> Terminal<F> {
     /// Relays local input and remote output until the remote program exits or the
     /// Attachment ends.
     async fn relay(&mut self, channel: Channel, local: LocalInput, over: &Connection) -> Relayed {
-        let Channel { send, mut recv, .. } = channel;
+        let Channel {
+            send,
+            mut recv,
+            attached,
+            _permissions: permissions,
+        } = channel;
         let session = self.session;
         let (pty, read_only) = (self.mode.pty, self.mode.read_only);
         let (detach, mut detached) = tokio::sync::oneshot::channel();
@@ -750,6 +803,7 @@ impl<F: Future<Output = &'static str>> Terminal<F> {
             }
             result = interrupted => result,
             by = self.terminated.as_mut() => Err(Received::Local(Error::Terminated(by))),
+            () = crate::reverse::listen(&over.connection,over.consent.as_ref(),permissions,attached.session,attached.attachment,over.peer_limit,over.reverse_policy) => Err(Received::Stream(StreamError::Lost(over.connection.closed().await))),
         };
         network.abort();
         if let Some(watcher) = watcher {
@@ -928,8 +982,17 @@ async fn attach_again(login: &mut Login<'_>, open: &Open) -> Result<(Connection,
         .await
         .expect("resolving does not panic")?;
     // Nobody can be asked now: a key not known by now is an error.
-    let mut connection =
-        login_to(login.remote, addr, login.store, login.key, refuse_unknown).await?;
+    let mut connection = login_to_offer(
+        login.remote,
+        addr,
+        login.store,
+        login.key,
+        refuse_unknown,
+        false,
+        login.consent.clone(),
+    )
+    .await?;
+    connection.reverse_policy = login.reverse_policy;
     let channel = connection.open_terminal(open).await?;
     Ok((connection, channel))
 }
@@ -1480,9 +1543,14 @@ async fn connect(
                 }
                 tracing::debug!(%address, "TLS handshake completed, Server key trusted");
                 return Ok(Connection {
+                    consent: None,
+                    reverse_policy: (
+                        crate::file_protocol::DEFAULT_MAX_SIZE,
+                        Duration::from_secs(60),
+                    ),
                     server_identity: key.clone(),
                     files: None,
-                    authenticated: false,
+                    authenticated_account: None,
                     endpoint,
                     connection,
                     control: None,

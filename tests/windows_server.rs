@@ -1261,3 +1261,112 @@ fn file_fin_during_upload_keeps_connection_usable() {
     let target = data.join("target");
     quic::runtime().unwrap().block_on(async{tokio::time::timeout(Duration::from_secs(8),async{let client=Raw::login(&s).await;let(mut send,mut recv,a)=client.file(&upload_request(&target,Value::Array(vec![Value::Uint(0)]))).await;assert_eq!(a.kind,p::ACCEPTED);send.finish().unwrap();assert!(matches!(wire::read_message(&mut recv,65535).await,Err(wire::StreamError::Reset(code)) if code==wire::Code::NoError.varint()),"interrupted upload must be Channel-local");assert!(client.connection.close_reason().is_none());let q=Message::new(wire::FILE_REQUEST,vec![(0,Value::Uint(0)),(1,Value::Uint(3)),(2,path_value(&target))]);let(_,_,m)=client.file(&q).await;assert_eq!(p::status(&m).unwrap(),p::Status::NotFound);client.close().await;}).await.unwrap();});
 }
+
+#[test]
+fn session_local_lists_and_pins_the_requested_attachment() {
+    let s = Setup::new("win-rf002");
+    let exe = env!("CARGO_BIN_EXE_stpt");
+    let list = s.exec(&["--no-shell", exe, "session", "attachments"]);
+    assert!(list.status.success(), "{}", stderr(&list));
+    assert_eq!(stdout(&list), "1");
+    let unsupported = s.exec(&["--no-shell", exe, "session", "read"]);
+    assert!(!unsupported.status.success());
+    assert!(
+        stderr(&unsupported).contains("Attachment 1: client file access was not negotiated"),
+        "{}",
+        stderr(&unsupported)
+    );
+    quic::runtime().unwrap().block_on(async {
+        let mut first = Raw::login(&s).await;
+        let second = Raw::login(&s).await;
+        let exe = exe.replace('\'', "''");
+        let script = [
+            "$null=[Console]::ReadLine()".to_owned(),
+            format!("& '{exe}' session attachments"),
+            format!("& '{exe}' session read"),
+            format!("& '{exe}' session mount --attachment 2"),
+            "Write-Output 'shared-done'".into(),
+            "$null=[Console]::ReadLine()".into(),
+            format!("& '{exe}' session read --attachment 2"),
+            format!("& '{exe}' session read"),
+            "Write-Output 'detached-done'".into(),
+        ]
+        .join("; ");
+        let (mut send, mut recv, a) = first
+            .open(terminal::Open {
+                command: Some(terminal::Command::Line(script)),
+                ..Default::default()
+            })
+            .await;
+        let (_s2, _r2, b) = second
+            .open(terminal::Open {
+                session: Some(a.session),
+                read_only: Some(true),
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(b.attachment, 2);
+        // Same OS Account, correct public Session ID, outside this Session Job.
+        let foreign = Command::new(env!("CARGO_BIN_EXE_stpt"))
+            .env("STPT_SESSION", a.session.to_string())
+            .args(["session", "attachments"])
+            .output()
+            .unwrap();
+        assert!(!foreign.status.success());
+        assert!(foreign.stdout.is_empty());
+
+        let go = terminal::data(wire::TERMINAL_DATA, b"go\r\n");
+        wire::write_message(&mut send, &go, 65535).await.unwrap();
+        let buf = tokio::time::timeout(
+            Duration::from_secs(15),
+            read_until(&mut recv, "shared-done"),
+        )
+        .await
+        .unwrap();
+        let out = String::from_utf8_lossy(&buf).replace("\r\n", "\n");
+        for expected in [
+            "1\n2\n",
+            "several live Attachments",
+            "Attachment 2: client file access was not negotiated",
+        ] {
+            assert!(out.contains(expected), "{out}");
+        }
+        let detach = Message::new(
+            wire::SESSION_DETACH,
+            vec![
+                (0, Value::Uint(1)),
+                (1, Value::Bytes(a.session.0.to_vec())),
+                (2, Value::Uint(b.attachment)),
+            ],
+        );
+        wire::write_message(&mut first.send, &detach, 65535)
+            .await
+            .unwrap();
+        let result = wire::read_message(&mut first.recv, 65535)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.field(1), Some(&Value::Uint(0)));
+        wire::write_message(&mut send, &go, 65535).await.unwrap();
+        let buf = tokio::time::timeout(
+            Duration::from_secs(15),
+            read_until(&mut recv, "detached-done"),
+        )
+        .await
+        .unwrap();
+        let out = String::from_utf8_lossy(&buf);
+        assert!(out.contains("Attachment is not live"), "{out}");
+        assert!(
+            out.contains("Attachment 1: client file access was not negotiated"),
+            "{out}"
+        );
+        first.close().await;
+        second.close().await;
+    });
+}
+
+#[test]
+fn reverse_file_requests_use_selected_client_and_local_consent() {
+    let s = Setup::new("win-reverse-files");
+    common::reverse::scenario(&s.home, &s.destination, &s.fp);
+}

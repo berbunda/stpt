@@ -283,6 +283,14 @@ async fn serve_connection(
     })??;
     let hello = ClientHello::from_message(&message)?;
     let answer = ServerHello::answer_with_files(&hello, shared.max_file_channels)?;
+    #[cfg(target_os = "linux")]
+    let answer = {
+        let mut answer = answer;
+        if crate::hello::mount(&hello.capabilities) && crate::fuse_mount::available() {
+            answer.capabilities.push((3, crate::cbor::Value::Uint(1)));
+        }
+        answer
+    };
     let peer_limit = hello.limits.max_message;
     wire::write_message(&mut send, &answer.to_message(), peer_limit).await?;
     let established = Instant::now();
@@ -309,6 +317,10 @@ async fn serve_connection(
     // §8.2, §14.5: Channels become available.
     connection.set_max_concurrent_bi_streams(VarInt::from_u32(1 + MAX_CHANNELS));
     let context = ChannelContext {
+        #[cfg(target_os = "linux")]
+        mount: crate::hello::mount(&answer.capabilities),
+        reverse: crate::hello::reverse_limit(&answer.capabilities)
+            .map(|_| std::sync::Arc::new(tokio::sync::Semaphore::new(1))),
         file_workers: shared.file_workers.clone(),
         file_resume: shared.file_resume.clone(),
         max_file_size: shared.max_file_size,
@@ -456,6 +468,9 @@ async fn authenticate(
 /// What the Channels of an Authenticated Connection need to know.
 #[derive(Clone)]
 struct ChannelContext {
+    #[cfg(target_os = "linux")]
+    mount: bool,
+    reverse: Option<std::sync::Arc<tokio::sync::Semaphore>>,
     file_workers: Arc<tokio::sync::Semaphore>,
     file_resume: Arc<crate::file_resume::Store>,
     max_file_size: u64,
@@ -519,6 +534,11 @@ async fn open_channel(
             },
             Ok(control::TERMINAL) => {
                 let channel = crate::attachment::Channel {
+                    #[cfg(target_os = "linux")]
+                    mount: context.mount,
+                    reverse: context.reverse,
+                    max_size: context.max_file_size,
+                    progress: context.file_timeout,
                     send,
                     recv,
                     peer_limit: context.peer_limit,
@@ -532,6 +552,7 @@ async fn open_channel(
                     Err(failure) => failure,
                 }
             }
+            Ok(3) => Failure::violation("client initiated a Server-only Channel"),
             Ok(kind) => {
                 tracing::info!(%remote, kind, "Channel of unknown kind rejected");
                 let code = Code::ChannelRejected.varint();

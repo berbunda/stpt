@@ -1,5 +1,6 @@
 #![allow(dead_code, reason = "every test crate uses a part of the helpers")]
 
+pub mod reverse;
 #[cfg(windows)]
 #[allow(dead_code)]
 #[path = "../../src/windows_security.rs"]
@@ -134,6 +135,11 @@ pub struct RunningServer {
 }
 
 impl RunningServer {
+    #[cfg(target_os = "linux")]
+    pub fn kill_test_server(&mut self) {
+        self.child.kill().unwrap();
+    }
+
     /// Starts `stpt server` with `args` and waits until it listens.
     pub fn start(args: &[&str]) -> Self {
         Self::start_binary(Path::new(env!("CARGO_BIN_EXE_stpt")), args)

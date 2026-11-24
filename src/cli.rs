@@ -64,6 +64,13 @@ impl Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Review Client file requests in this trusted local terminal
+    Consent,
+    /// Request access to Client files from inside the current Session
+    Session {
+        #[command(subcommand)]
+        action: crate::session_local::Action,
+    },
     /// Run the Server
     Server {
         /// Address and UDP port to listen on [default: all addresses, port 843]
@@ -305,6 +312,10 @@ fn session_name(name: &str) -> Result<String, &'static str> {
 
 pub fn run(cli: Cli) -> Result<ExitCode, Error> {
     match cli.command {
+        Command::Consent => crate::consent::run().map_err(Error::SessionLocal),
+        Command::Session { action } => {
+            crate::session_local::run(action).map_err(Error::SessionLocal)
+        }
         Command::Server {
             listen,
             fingerprint,

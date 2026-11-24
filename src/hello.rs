@@ -155,7 +155,13 @@ impl ServerHello {
         })?;
         Ok(Self {
             version,
-            capabilities: crate::files::select(&hello.capabilities, file_cap),
+            capabilities: {
+                let mut caps = crate::files::select(&hello.capabilities, file_cap);
+                if reverse_limit(&hello.capabilities).is_some() {
+                    caps.push((2, crate::files::parameters(1)));
+                }
+                caps
+            },
             limits: Limits::default(),
             auth_methods: vec![AUTH_PUBLICKEY_ED25519],
         })
@@ -209,6 +215,16 @@ impl ServerHello {
                     "selected capability {id:#x} was not offered"
                 )));
             }
+        }
+        if self.capabilities.iter().any(|(id, _)| *id == 2)
+            && !matches!((reverse_limit(&self.capabilities),reverse_limit(&offered.capabilities)), (Some(n),Some(max)) if n<=max)
+        {
+            return Err(Failure::violation("invalid client file access selection"));
+        }
+        if self.capabilities.iter().any(|(id, _)| *id == 3)
+            && !(mount(&self.capabilities) && mount(&offered.capabilities))
+        {
+            return Err(Failure::violation("invalid mount selection"));
         }
         crate::files::check_selection(&self.capabilities, &offered.capabilities)?;
         Ok(())
@@ -288,6 +304,16 @@ fn capabilities_value(capabilities: &Capabilities) -> Value {
     )
 }
 
+pub fn mount(caps: &Capabilities) -> bool {
+    caps.iter()
+        .any(|(id, v)| *id == 3 && v.as_uint() == Some(1))
+        && reverse_limit(caps).is_some()
+}
+pub fn reverse_limit(caps: &Capabilities) -> Option<u64> {
+    let (_, v) = caps.iter().find(|(id, _)| *id == 2)?;
+    crate::files::parse(v).filter(|v| *v <= 65535)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,6 +389,24 @@ mod tests {
         assert_eq!(err.code, Code::VersionNegotiationFailed);
     }
 
+    #[test]
+    fn mount_selection_requires_both_offered_profiles() {
+        let mut offer = ClientHello::ours();
+        offer.capabilities.push((2, crate::files::parameters(1)));
+        offer.capabilities.push((3, Value::Uint(1)));
+        let mut answer = ServerHello::answer(&offer).unwrap();
+        answer.capabilities.push((3, Value::Uint(1)));
+        assert!(answer.check(&offer).is_ok());
+        let mut wrong = answer.clone();
+        wrong.capabilities.retain(|(id, _)| *id != 2);
+        assert!(wrong.check(&offer).is_err());
+        let mut malformed = offer.clone();
+        malformed.capabilities.last_mut().unwrap().1 = Value::Bool(true);
+        assert!(!mount(&malformed.capabilities));
+        assert!(answer.check(&malformed).is_err());
+        offer.capabilities.pop();
+        assert!(answer.check(&offer).is_err());
+    }
     #[test]
     fn client_checks_the_answer() {
         let hello = ClientHello::ours();

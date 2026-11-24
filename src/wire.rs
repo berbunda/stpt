@@ -242,6 +242,14 @@ pub async fn read_message(
         Err(ReadExactError::FinishedEarly(0)) => return Ok(None),
         Err(e) => return Err(e.into()),
     }
+    read_started_message(recv, limit, first[0]).await.map(Some)
+}
+pub async fn read_started_message(
+    recv: &mut RecvStream,
+    limit: u64,
+    first: u8,
+) -> Result<Message, StreamError> {
+    let first = [first];
     let mut length = [0u8; 8];
     let size = varint_size(first[0]);
     length[0] = first[0];
@@ -259,7 +267,7 @@ pub async fn read_message(
     }
     let mut payload = vec![0u8; length as usize];
     recv.read_exact(&mut payload).await?;
-    Ok(Some(Message::decode(&payload)?))
+    Ok(Message::decode(&payload)?)
 }
 
 /// Writes `message` as one frame; `limit` is the peer's message size limit.

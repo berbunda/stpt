@@ -37,7 +37,15 @@ pub const SYSTEM_ENVIRONMENT: [&str; 3] = [
 ];
 
 /// Variables only the Server sets; neither system files nor the Client change them.
-const SERVER_VARIABLES: [&str; 6] = ["HOME", "USER", "LOGNAME", "SHELL", "TERM", "STPT_SESSION"];
+const SERVER_VARIABLES: [&str; 7] = [
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TERM",
+    "STPT_SESSION",
+    "STPT_LOCAL_FD",
+];
 
 /// The system-wide login environment from `files`; missing files are skipped. Blocks.
 pub fn system_environment(files: &[&str]) -> Vec<(String, String)> {
@@ -96,7 +104,7 @@ fn parse_environment(text: &str) -> Vec<(String, String)> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Account {
     pub name: String,
-    uid: Uid,
+    pub(crate) uid: Uid,
     gid: Gid,
     groups: Vec<Gid>,
     home: PathBuf,
@@ -199,11 +207,28 @@ nix::ioctl_write_int_bad!(set_controlling_terminal, nix::libc::TIOCSCTTY);
 /// group (§14.9). `env` holds further variables in rising precedence: the system
 /// environment, those taken from the Client (already checked against the allowlist)
 /// and `STPT_SESSION`. The Server must run as root, or as the Account itself.
+#[cfg(any(not(target_os = "linux"), test))]
 pub fn spawn(
     account: &Account,
     program: &Program,
     env: &[(String, String)],
     io: Io,
+) -> io::Result<Child> {
+    spawn_in(
+        account,
+        program,
+        env,
+        io,
+        #[cfg(target_os = "linux")]
+        None,
+    )
+}
+pub fn spawn_in(
+    account: &Account,
+    program: &Program,
+    env: &[(String, String)],
+    io: Io,
+    #[cfg(target_os = "linux")] namespace: Option<std::sync::Arc<std::fs::File>>,
 ) -> io::Result<Child> {
     let switch_user = nix::unistd::geteuid().is_root();
     if !switch_user && account.uid != nix::unistd::geteuid() {
@@ -245,6 +270,10 @@ pub fn spawn(
             .stderr(Stdio::piped()),
     };
 
+    let local_fd = env
+        .iter()
+        .find(|(k, _)| k == "STPT_LOCAL_FD")
+        .and_then(|(_, v)| v.parse::<i32>().ok());
     let uid = account.uid;
     let gid = account.gid;
     let groups = account.groups.clone();
@@ -255,6 +284,20 @@ pub fn spawn(
     // `signal` installs no handler, it only restores default dispositions.
     unsafe {
         command.pre_exec(move || {
+            #[cfg(target_os = "linux")]
+            if let Some(ref ns) = namespace
+                && nix::libc::setns(
+                    std::os::fd::AsRawFd::as_raw_fd(ns.as_ref()),
+                    nix::libc::CLONE_NEWNS,
+                ) != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if let Some(fd) = local_fd
+                && nix::libc::fcntl(fd, nix::libc::F_SETFD, 0) < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
             // Signals the Server ignores stay ignored across exec (a Server started in
             // the background by a shell ignores INT and QUIT), and a shell cannot even
             // trap them then. The Account's programs start with the default

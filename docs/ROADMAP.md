@@ -51,11 +51,13 @@ IDs A001–D008 were renamed to RA001–RD008 on 2026-10-11 (prefix scheme chang
 Tier RE scenario review completed ✅ 2026-11-22, program 0.4.1-2: [results and limits](RE_REVIEW.md).
 
 # 6	Tier RF — Client-side File Access
-- [ ] RF001  permission grants on the Client ← PF001 ➕ 2026-10-13
-- [ ] RF002  `stpt` command inside a Session ← PF002 ➕ 2026-10-13
-- [ ] RF003  Server-opened Channel, confirmation dialog ← PF003 ➕ 2026-10-13
-- [ ] RF004  directory mount on Linux (FUSE) ← PF004 ➕ 2026-10-13
+- [x] RF001  permission grants on the Client ← PF001 ➕ 2026-10-13 ✅ 2026-11-24
+- [x] RF002  `stpt` command inside a Session ← PF002 ➕ 2026-10-13 ✅ 2026-11-24
+- [x] RF003  Server-opened Channel, confirmation dialog ← PF003 ➕ 2026-10-13 ✅ 2026-11-24
+- [x] RF004  directory mount on Linux (FUSE) ← PF004 ➕ 2026-10-13 ✅ 2026-11-24
 - [ ] RF005  Migrate the Linux mount backend to `fuser` 0.19.0, remove the obsolete `abi-7-31` feature and port the mount and `Filesystem` APIs. Verify read-only access and revocation of pending reads and open descriptors on native Linux FUSE. ← PF004 ➕ 2026-11-25
+
+Tier RF scenario review ✅ 2026-11-24, program 0.4.5-1. [Results, fixes and coverage](RF_REVIEW.md).
 
 # 7	Tier RG — Port Forwarding
 - [ ] RG001  local forwarding ← PG001 ➕ 2026-10-13

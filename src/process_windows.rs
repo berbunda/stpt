@@ -484,6 +484,27 @@ pub async fn signal_group(account: &Account, group: Pid, signal: Signal) -> io::
     }
     Ok(())
 }
+pub fn in_session_job(leader: Pid, pid: u32) -> bool {
+    let Some(job) = registry()
+        .lock()
+        .unwrap()
+        .get(&leader.0)
+        .and_then(Weak::upgrade)
+    else {
+        return false;
+    };
+    // SAFETY: own the process and Job handles during the kernel membership check.
+    unsafe {
+        let raw = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if raw.is_null() {
+            return false;
+        }
+        let process = OwnedHandle::from_raw_handle(raw);
+        let mut member = 0;
+        IsProcessInJob(process.as_raw_handle(), job.0.as_raw_handle(), &mut member) != 0
+            && member != 0
+    }
+}
 pub fn groups_in_session(pid: Pid) -> Vec<Pid> {
     vec![pid]
 }

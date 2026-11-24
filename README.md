@@ -249,3 +249,46 @@ cargo build --release
 The program is `target/release/stpt` (`stpt.exe` on Windows).
 
 Roadmap of the program: `docs/ROADMAP.md`.
+
+The Client keeps file permissions separate for each terminal Attachment (RF001, 0.4.2-0). Version 0.4.4-0 adds one-time approval for requests from inside a Session. Client-initiated transfers remain available with `stpt fs`.
+
+### Choosing a Client from inside a Session
+
+Run `stpt session attachments` in the remote shell to list the live Attachment IDs of that Session, one decimal ID per line. The Server-side binary must be on the shell's PATH or invoked by its installed path. A request can omit the target when exactly one Attachment is live. With several, specify the exact ID, including for a read-only terminal Attachment.
+
+```text
+stpt session attachments
+stpt session read --attachment 2
+stpt session create 4096 --attachment 2
+stpt session mount --attachment 2
+```
+
+To enable file requests, open a second terminal on the Client and run `stpt consent`. Keep it open. In the local shell that will launch `stpt connect` or `stpt exec`, set the pairing file path printed by the consent terminal.
+
+```sh
+export STPT_CONSENT_FILE='/path/printed/by/stpt'
+```
+
+```powershell
+$env:STPT_CONSENT_FILE = 'C:\path printed by stpt'
+```
+
+Only the selected Attachment receives the request. In the consent terminal, check the Server fingerprint, Account, Session, Attachment, operation and size for a create. Enter an absolute local path, review the selected path and type the displayed one-time answer. Press Enter to refuse. Without pairing, the Client leaves this service disabled.
+
+Inside the Session, `stpt session read > received.bin` writes the verified contents to standard output. For a create, supply the declared number of bytes on standard input, for example `printf hello | stpt session create 5` in a POSIX shell. The Client publishes the new file only after checking length and BLAKE3. An existing destination is preserved. If the create result is lost after publication became possible, the caller reports an unknown outcome. Check the selected destination before starting a new request.
+
+### Mounting a Client directory on a Linux Server
+
+With the Linux Client paired to `stpt consent`, run the following inside the Session. If only one Attachment is live, omit `--attachment 2`.
+
+```sh
+directory=$(stpt session mount --attachment 2) && ls -la -- "$directory"
+```
+
+Select the absolute directory in the Client's second terminal and enter the displayed confirmation. Until revoked, processes in this Session can list names, inspect metadata and read regular files under the selected root. Other Attachments can drive those processes. Server administrators can keep copies. The mounted view is read-only, with execution disabled.
+
+**To revoke**, press Enter in the consent terminal or stop `stpt consent`. Exiting the setup command leaves the mount available. Detaching the granting Attachment, ending the Session or detecting a lost Connection disconnects it. A silent network loss can take until the QUIC idle deadline to detect. Reconnecting requires a new request and confirmation.
+
+The Linux Server backend requires root, usable `/dev/fuse`, `fusectl` and permission to create and enter private mount namespaces. The Linux Client uses `openat2` for confined access. If these requirements cannot be met the request fails. Windows retains individual read/create requests.
+
+If the Server's FUSE worker exits during a read, the pending read fails and the Client closes the grant. An open file descriptor cannot keep the mount readable. See the [Tier RF scenario review](docs/RF_REVIEW.md).

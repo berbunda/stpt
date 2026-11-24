@@ -17,6 +17,7 @@ pub const EXIT_STPT_ERROR: u8 = 255;
 
 #[derive(Debug)]
 pub enum Error {
+    SessionLocal(io::Error),
     Files(crate::file_client::Error),
     Config(config::Error),
     Transport(quic::Error),
@@ -99,6 +100,7 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::SessionLocal(e) => write!(f, "session: {e}"),
             Self::Files(e) => write!(f, "fs: {e}"),
             Self::Config(e) => write!(f, "config: {e}"),
             Self::Transport(e) => write!(f, "transport: {e}"),

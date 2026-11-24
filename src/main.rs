@@ -7,6 +7,7 @@ mod cli;
 mod client;
 mod commands;
 mod config;
+mod consent;
 mod console;
 mod control;
 mod destination;
@@ -23,11 +24,14 @@ mod file_storage;
 mod file_storage;
 mod file_worker;
 mod files;
+#[cfg(target_os = "linux")]
+mod fuse_mount;
 mod hello;
 mod identity;
 mod listing;
 mod logging;
 mod modes;
+mod permissions;
 #[cfg(unix)]
 mod process;
 #[cfg(windows)]
@@ -40,8 +44,10 @@ mod pty;
 mod pty;
 mod quic;
 mod requests;
+mod reverse;
 mod server;
 mod session;
+mod session_local;
 mod terminal;
 mod tls;
 mod trust;
@@ -53,6 +59,21 @@ use std::io::Write;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    #[cfg(target_os = "linux")]
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__stpt-mount-tree")) {
+        return if reverse::mount_client::helper().is_ok() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
+    #[cfg(target_os = "linux")]
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__stpt-fuse")) {
+        return match fuse_mount::helper() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(_) => ExitCode::FAILURE,
+        };
+    }
     #[cfg(windows)]
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__stpt-native-exec")) {
         return process::native_exec();

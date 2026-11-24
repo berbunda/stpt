@@ -26,6 +26,11 @@ use crate::wire::{
 
 /// A terminal Channel stream with what the Server knows about its Connection.
 pub struct Channel {
+    #[cfg(target_os = "linux")]
+    pub mount: bool,
+    pub reverse: Option<Arc<tokio::sync::Semaphore>>,
+    pub max_size: u64,
+    pub progress: std::time::Duration,
     pub send: SendStream,
     pub recv: RecvStream,
     /// Message size limit of the Client.
@@ -125,6 +130,12 @@ async fn attach(
     store: &Arc<Store>,
 ) -> Result<(Arc<Session>, crate::session::Attachment), Failure> {
     let info = AttachmentInfo {
+        #[cfg(target_os = "linux")]
+        mount: channel.mount,
+        reverse: channel.reverse.clone(),
+        max_size: channel.max_size,
+        progress: channel.progress,
+        peer_limit: channel.peer_limit,
         attached: SystemTime::now(),
         key: channel.key.clone(),
         connection: channel.connection.clone(),

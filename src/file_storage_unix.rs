@@ -339,6 +339,9 @@ pub struct LocalPublication {
     name: OsString,
 }
 impl LocalPublication {
+    pub fn selected_destination(&self) -> std::io::Result<(File, std::ffi::OsString)> {
+        Ok((self.target.try_clone()?, self.name.clone()))
+    }
     pub fn new(path: &std::path::Path) -> Result<(Self, File, PathBuf), Error> {
         let absolute = std::path::absolute(path)?;
         let (target, name) = parent(&absolute)?;

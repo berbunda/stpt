@@ -25,7 +25,7 @@ pub fn parameters(max_channels: u64) -> Value {
     ])
 }
 
-fn parse(value: &Value) -> Option<u64> {
+pub(crate) fn parse(value: &Value) -> Option<u64> {
     let entries = value.as_map()?;
     if !entries.iter().all(|(k, _)| k.is_int()) {
         return None;
@@ -719,6 +719,11 @@ pub(crate) mod tests {
     }
 
     impl Pair {
+        #[cfg(target_os = "linux")]
+        pub(crate) fn rebind_client(&self) {
+            crate::quic::rebind(&self._client, self.client.remote_address()).unwrap();
+        }
+
         pub(crate) async fn start() -> Self {
             let key = crate::identity::ServerKey::generate();
             let server = crate::quic::listen("127.0.0.1:0".parse().unwrap(), &key).unwrap();

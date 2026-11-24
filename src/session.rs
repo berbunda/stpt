@@ -150,7 +150,17 @@ impl Store {
                 format!("Session name {name:?} in use"),
             ));
         }
+        let local = crate::session_local::Endpoint::new(id, &mut env)
+            .map_err(|e| rejected(format!("Session endpoint: {e}")))?;
         let spawn_failed = |e| rejected(format!("starting the program: {e}"));
+        #[cfg(target_os = "linux")]
+        let namespace = crate::fuse_mount::available()
+            .then(crate::fuse_mount::namespace)
+            .and_then(Result::ok);
+        #[cfg(target_os = "linux")]
+        let spawn = |io| process::spawn_in(&account, &program, &env, io, namespace.clone());
+        #[cfg(not(target_os = "linux"))]
+        let spawn = |io| process::spawn(&account, &program, &env, io);
         let (io, output, child) = match (open.size, &open.term) {
             (Some(size), Some(term)) => {
                 let Pty { master, slave } =
@@ -159,14 +169,12 @@ impl Store {
                     slave,
                     term: term.clone(),
                 };
-                let child =
-                    process::spawn(&account, &program, &env, slave).map_err(spawn_failed)?;
+                let child = spawn(slave).map_err(spawn_failed)?;
                 let master = Arc::new(master);
                 (SessionIo::Pty(master.clone()), Output::Pty(master), child)
             }
             _ => {
-                let mut child =
-                    process::spawn(&account, &program, &env, Io::Pipes).map_err(spawn_failed)?;
+                let mut child = spawn(Io::Pipes).map_err(spawn_failed)?;
                 let output = Output::Pipes {
                     stdout: child.stdout.take(),
                     stderr: child.stderr.take(),
@@ -183,6 +191,8 @@ impl Store {
             created: SystemTime::now(),
             creator,
             command: open.command.as_ref().map(display),
+            #[cfg(target_os = "linux")]
+            namespace,
             leader: child.id().map(|pid| Pid::from_raw(pid as i32)),
             account,
             io,
@@ -201,6 +211,8 @@ impl Store {
                 exited_at: None,
                 modes: Modes::new(),
             }),
+            reverse_end: watch::channel(false).0,
+            first_attach: tokio::sync::Notify::new(),
             terminated: watch::channel(false).0,
         });
         sessions.insert(id, session.clone());
@@ -212,7 +224,7 @@ impl Store {
             pty = session.pty(),
             "Session created"
         );
-        tokio::spawn(session.clone().run(self.clone(), child, output));
+        tokio::spawn(session.clone().run(self.clone(), child, output, local));
         Ok(session)
     }
 
@@ -304,6 +316,12 @@ pub enum Event {
 /// Who is attached, for the Session list (§15.10).
 #[derive(Debug, Clone)]
 pub struct AttachmentInfo {
+    #[cfg(target_os = "linux")]
+    pub mount: bool,
+    pub reverse: Option<Arc<tokio::sync::Semaphore>>,
+    pub max_size: u64,
+    pub progress: std::time::Duration,
+    pub peer_limit: u64,
     pub attached: SystemTime,
     pub key: KeyInfo,
     /// Its Connection, for the current remote address.
@@ -352,12 +370,16 @@ pub struct Session {
     pub command: Option<String>,
     /// The primary process: leader of the Session's process group and, with a PTY,
     /// of its terminal session.
+    #[cfg(target_os = "linux")]
+    namespace: Option<Arc<std::fs::File>>,
     leader: Option<Pid>,
     account: Account,
     io: SessionIo,
     detach_timeout: Option<Duration>,
     policy: Policy,
     inner: Mutex<Inner>,
+    reverse_end: watch::Sender<bool>,
+    first_attach: tokio::sync::Notify,
     terminated: watch::Sender<bool>,
 }
 
@@ -397,6 +419,101 @@ pub struct AttachmentView {
 }
 
 impl Session {
+    #[cfg(target_os = "linux")]
+    pub fn owns_local_process(&self, pid: i32, uid: u32) -> bool {
+        pid > 0
+            && self.account.uid.as_raw() == uid
+            && self
+                .leader
+                .is_some_and(|leader| nix::unistd::getsid(Some(Pid::from_raw(pid))) == Ok(leader))
+    }
+    #[cfg(windows)]
+    pub fn owns_local_pid(&self, pid: u32) -> bool {
+        self.leader
+            .is_some_and(|leader| process::in_session_job(leader, pid))
+    }
+    pub fn local_request(
+        &self,
+        action: crate::session_local::Action,
+    ) -> Result<crate::session_local::Reply, String> {
+        let inner = self.lock();
+        if inner.state != State::Running {
+            return Err("Session is not running".into());
+        }
+        let live = inner
+            .slots
+            .iter()
+            .filter(|s| s.info.connection.close_reason().is_none());
+        if matches!(action, crate::session_local::Action::Attachments) {
+            use std::fmt::Write;
+            let mut ids = String::new();
+            for slot in live {
+                writeln!(ids, "{}", slot.id).expect("String write");
+            }
+            return Ok(crate::session_local::Reply::Ids(ids));
+        }
+        // Pin the actual Connection under the registry lock. A subsequent check
+        // concerns only this tuple, even if a second Client has since attached.
+        let (id, (info, end)) = crate::session_local::select(
+            live.map(|s| (s.id, (s.info.clone(), s.end.subscribe()))),
+            action.target(),
+        )?;
+        drop(inner);
+        let connection = &info.connection;
+        let registry = self.lock();
+        if registry.state != State::Running
+            || connection.close_reason().is_some()
+            || !registry
+                .slots
+                .iter()
+                .any(|s| s.id == id && s.info.connection.stable_id() == connection.stable_id())
+        {
+            return Err("selected Attachment ended".into());
+        }
+        if info.reverse.is_none() {
+            return Err(format!(
+                "Attachment {id}: client file access was not negotiated"
+            ));
+        }
+        let permit = info
+            .reverse
+            .as_ref()
+            .unwrap()
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| "Client file Channel limit exceeded")?;
+        if matches!(action, crate::session_local::Action::Mount { .. }) {
+            #[cfg(target_os = "linux")]
+            if info.mount {
+                let target = crate::fuse_mount::Target::new(
+                    self.namespace
+                        .clone()
+                        .ok_or("Session lacks a private mount namespace")?,
+                    self.leader.ok_or("Session leader ended")?.as_raw(),
+                    self.account.uid.as_raw(),
+                );
+                return crate::reverse::mount_server::dispatch(
+                    self.id,
+                    id,
+                    info,
+                    end,
+                    self.reverse_end.subscribe(),
+                    target,
+                    permit,
+                );
+            }
+            return Err("Client directory mount was not negotiated".into());
+        }
+        crate::reverse::dispatch(
+            self.id,
+            id,
+            info,
+            end,
+            self.reverse_end.subscribe(),
+            action,
+            permit,
+        )
+    }
     pub fn pty(&self) -> bool {
         matches!(self.io, SessionIo::Pty(_))
     }
@@ -503,6 +620,9 @@ impl Session {
             State::Exited(exit) => Some(exit),
             _ => None,
         };
+        if id == 1 {
+            self.first_attach.notify_one();
+        }
         Ok(Attachment {
             id,
             read_only: request.read_only,
@@ -709,7 +829,10 @@ impl Session {
             let mut inner = self.lock();
             let previous = inner.state;
             match previous {
-                State::Running => inner.state = State::Terminating,
+                State::Running => {
+                    inner.state = State::Terminating;
+                    self.reverse_end.send_replace(true);
+                }
                 State::Exited(_) => {
                     inner.state = State::Terminated;
                     for slot in inner.slots.drain(..) {
@@ -785,10 +908,27 @@ impl Session {
 
     /// Reads the output until the program has exited, then makes the Session
     /// Exited, or Terminated if it was being terminated.
-    async fn run(self: Arc<Self>, store: Arc<Store>, mut child: Child, mut output: Output) {
-        let exit = self.pump(&mut output, &mut child).await;
+    async fn run(
+        self: Arc<Self>,
+        store: Arc<Store>,
+        mut child: Child,
+        mut output: Output,
+        local: crate::session_local::Endpoint,
+    ) {
+        let exit = {
+            let pump = self.pump(&mut output, &mut child);
+            tokio::pin!(pump);
+            let service = async {
+                self.first_attach.notified().await;
+                if let Err(error) = local.serve(&self).await {
+                    tracing::warn!(%error,"Session command endpoint stopped");
+                }
+            };
+            tokio::select! {exit=&mut pump=>exit, ()=service=>pump.await}
+        };
         let (targets, terminated) = {
             let mut inner = self.lock();
+            self.reverse_end.send_replace(true);
             let terminated = match inner.state {
                 State::Running => {
                     inner.state = State::Exited(exit);
