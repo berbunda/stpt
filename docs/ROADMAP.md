@@ -55,6 +55,7 @@ Tier RE scenario review completed ✅ 2026-11-22, program 0.4.1-2: [results and 
 - [ ] RF002  `stpt` command inside a Session ← PF002 ➕ 2026-10-13
 - [ ] RF003  Server-opened Channel, confirmation dialog ← PF003 ➕ 2026-10-13
 - [ ] RF004  directory mount on Linux (FUSE) ← PF004 ➕ 2026-10-13
+- [ ] RF005  Migrate the Linux mount backend to `fuser` 0.19.0, remove the obsolete `abi-7-31` feature and port the mount and `Filesystem` APIs. Verify read-only access and revocation of pending reads and open descriptors on native Linux FUSE. ← PF004 ➕ 2026-11-25
 
 # 7	Tier RG — Port Forwarding
 - [ ] RG001  local forwarding ← PG001 ➕ 2026-10-13
