@@ -66,6 +66,8 @@ impl Default for Deadlines {
 
 /// What the Connections of a Server share.
 pub struct Shared {
+    pub forwarding: crate::forwarding::Config,
+    pub forward_budget: Arc<crate::forwarding::runtime::Global>,
     pub file_workers: Arc<tokio::sync::Semaphore>,
     pub file_resume: Arc<crate::file_resume::Store>,
     pub max_file_size: u64,
@@ -111,6 +113,8 @@ pub fn run(
     let listen = listen_address(listen, &config);
     quic::runtime()?.block_on(async {
         let shared = Arc::new(Shared {
+            forwarding: config.forwarding.clone(),
+            forward_budget: Default::default(),
             file_workers: Arc::new(tokio::sync::Semaphore::new(32)),
             file_resume: Default::default(),
             max_file_size: config
@@ -282,7 +286,26 @@ async fn serve_connection(
         )
     })??;
     let hello = ClientHello::from_message(&message)?;
-    let answer = ServerHello::answer_with_files(&hello, shared.max_file_channels)?;
+    let mut answer = ServerHello::answer_with_files(&hello, shared.max_file_channels)?;
+    if !shared.forwarding.accounts.is_empty()
+        && let Some(offer) = crate::forwarding::selected(&hello.capabilities)
+    {
+        let mut selected = offer;
+        selected.rules = selected.rules.min(8);
+        selected.flows = selected.flows.min(64);
+        selected.modes.retain(|m| {
+            shared
+                .forwarding
+                .accounts
+                .values()
+                .any(|p| p.modes().contains(m))
+        });
+        if !selected.modes.is_empty() {
+            answer
+                .capabilities
+                .push((crate::forwarding::CAP, selected.value()));
+        }
+    }
     #[cfg(target_os = "linux")]
     let answer = {
         let mut answer = answer;
@@ -315,8 +338,29 @@ async fn serve_connection(
         "Connection authenticated"
     );
     // §8.2, §14.5: Channels become available.
-    connection.set_max_concurrent_bi_streams(VarInt::from_u32(1 + MAX_CHANNELS));
+    let forwarding_streams =
+        crate::forwarding::selected(&answer.capabilities).map_or(0, |s| (s.rules + s.flows) as u32);
+    connection
+        .set_max_concurrent_bi_streams(VarInt::from_u32(1 + MAX_CHANNELS + forwarding_streams));
     let context = ChannelContext {
+        ordinary: Arc::new(tokio::sync::Semaphore::new(MAX_CHANNELS as usize)),
+        forwarding: crate::forwarding::selected(&answer.capabilities).map(|selection| {
+            crate::forwarding::runtime::State::new(
+                connection.clone(),
+                peer_limit,
+                selection,
+                Some(accepted.account.clone()),
+                Some(
+                    shared
+                        .forwarding
+                        .accounts
+                        .get(&accepted.account)
+                        .cloned()
+                        .unwrap_or_default(),
+                ),
+                shared.forward_budget.clone(),
+            )
+        }),
         #[cfg(target_os = "linux")]
         mount: crate::hello::mount(&answer.capabilities),
         reverse: crate::hello::reverse_limit(&answer.capabilities)
@@ -468,6 +512,8 @@ async fn authenticate(
 /// What the Channels of an Authenticated Connection need to know.
 #[derive(Clone)]
 struct ChannelContext {
+    ordinary: Arc<tokio::sync::Semaphore>,
+    forwarding: Option<Arc<crate::forwarding::runtime::State>>,
     #[cfg(target_os = "linux")]
     mount: bool,
     reverse: Option<std::sync::Arc<tokio::sync::Semaphore>>,
@@ -506,8 +552,46 @@ async fn open_channel(
     context: ChannelContext,
 ) {
     let remote = connection.remote_address();
-    let failure = match wire::read_message(&mut recv, DEFAULT_MESSAGE_LIMIT).await {
+    let opening = tokio::time::timeout(
+        crate::forwarding::OPEN,
+        wire::read_message(&mut recv, DEFAULT_MESSAGE_LIMIT),
+    )
+    .await;
+    let opening = match opening {
+        Ok(r) => r,
+        Err(_) => {
+            let _ = send.reset(Code::Timeout.varint());
+            let _ = recv.stop(Code::Timeout.varint());
+            return;
+        }
+    };
+    let _ordinary = match &opening {
+        Ok(Some(m))
+            if !matches!(
+                control::channel_kind(m),
+                Ok(crate::forwarding::RULE | crate::forwarding::FLOW)
+            ) =>
+        {
+            match context.ordinary.clone().try_acquire_owned() {
+                Ok(p) => Some(p),
+                Err(_) => {
+                    let _ = send.reset(Code::LimitExceeded.varint());
+                    let _ = recv.stop(Code::LimitExceeded.varint());
+                    return;
+                }
+            }
+        }
+        _ => None,
+    };
+    let failure = match opening {
         Ok(Some(message)) => match control::channel_kind(&message) {
+            Ok(crate::forwarding::RULE | crate::forwarding::FLOW) => {
+                if let Some(state) = context.forwarding {
+                    state.dispatch(send, recv, message).await;
+                    return;
+                }
+                Failure::violation("forwarding without selected capability")
+            }
             Ok(crate::files::KIND) => match &context.files {
                 None => Failure::violation("file Channel without negotiated capability"),
                 Some(budget) => {
@@ -623,6 +707,7 @@ fn listen_address(cli: Option<SocketAddr>, config: &ServerConfig) -> SocketAddr 
 
 #[cfg(test)]
 mod tests {
+    include!("forwarding/server_review.rs");
     use super::*;
     use crate::auth::UserKey;
     use crate::authorized::Accounts;
@@ -671,6 +756,8 @@ mod tests {
         async fn start_as(deadlines: Deadlines, account: &str) -> Self {
             let store = Store::start(Policy::DEFAULT);
             Self::serve(deadlines, account, |authorizer| Shared {
+                forwarding: Default::default(),
+                forward_budget: Default::default(),
                 file_workers: Arc::new(tokio::sync::Semaphore::new(32)),
                 file_resume: Default::default(),
                 max_file_size: crate::file_protocol::DEFAULT_MAX_SIZE,
@@ -687,6 +774,8 @@ mod tests {
         async fn start_with(policy: Policy, account: &str) -> Self {
             let store = Store::start(policy);
             Self::serve(Deadlines::DEFAULT, account, |authorizer| Shared {
+                forwarding: Default::default(),
+                forward_budget: Default::default(),
                 file_workers: Arc::new(tokio::sync::Semaphore::new(32)),
                 file_resume: Default::default(),
                 max_file_size: crate::file_protocol::DEFAULT_MAX_SIZE,
@@ -1552,8 +1641,31 @@ mod tests {
         /// without TERMINAL_EXIT (§14.10).
         async fn detach(send: &mut quinn::SendStream, recv: &mut quinn::RecvStream) {
             send.finish().unwrap();
-            let end = wire::read_message(recv, DEFAULT_MESSAGE_LIMIT).await;
-            assert!(end.unwrap().is_none(), "FIN without TERMINAL_EXIT");
+            while let Some(message) = wire::read_message(recv, DEFAULT_MESSAGE_LIMIT)
+                .await
+                .unwrap()
+            {
+                assert!(
+                    matches!(message.kind, wire::TERMINAL_DATA | wire::TERMINAL_STDERR),
+                    "detach must end without TERMINAL_EXIT, got {}",
+                    message.kind
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn detach_allows_output_already_queued_before_fin() {
+            let a = authenticated().await;
+            let (mut send, mut recv) = a
+                .open(&command(
+                    "printf ready; sleep 0.02; printf queued; while :; do sleep 0.1; done",
+                    false,
+                ))
+                .await;
+            attached(&mut recv).await;
+            read_until(&mut recv, "ready").await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            detach(&mut send, &mut recv).await;
         }
 
         fn attach_to(session: SessionId) -> Open {

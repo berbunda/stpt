@@ -115,6 +115,26 @@ impl Account {
     /// Executes the same binary directly as the Account, without its login shell.
     /// Credentials change only in the fork/exec child, never on a Tokio thread.
     pub fn file_worker(&self, peer_limit: u64, max_size: u64) -> io::Result<Child> {
+        self.worker_command("__stpt-file-worker")?
+            .arg(peer_limit.to_string())
+            .arg(max_size.to_string())
+            .spawn()
+    }
+    pub fn network_worker(
+        &self,
+        operation: &str,
+        value: &str,
+        ipc: std::os::fd::OwnedFd,
+    ) -> io::Result<Child> {
+        self.worker_command("__stpt-network-worker")?
+            .arg(operation)
+            .arg(value)
+            .stdin(Stdio::from(ipc))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+    }
+    fn worker_command(&self, helper: &str) -> io::Result<Command> {
         let root = nix::unistd::geteuid().is_root();
         if !root
             && (self.uid != nix::unistd::geteuid()
@@ -133,9 +153,7 @@ impl Account {
         #[cfg(not(target_os = "linux"))]
         let executable = std::env::current_exe()?;
         let mut c = Command::new(executable);
-        c.arg("__stpt-file-worker")
-            .arg(peer_limit.to_string())
-            .arg(max_size.to_string())
+        c.arg(helper)
             .env_clear()
             .current_dir("/")
             .stdin(Stdio::piped())
@@ -156,7 +174,7 @@ impl Account {
                 Ok(())
             });
         }
-        c.spawn()
+        Ok(c)
     }
 
     /// Looks the Account up (`getpwnam`, `getgrouplist`); blocks.

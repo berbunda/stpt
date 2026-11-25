@@ -227,6 +227,7 @@ impl ServerHello {
             return Err(Failure::violation("invalid mount selection"));
         }
         crate::files::check_selection(&self.capabilities, &offered.capabilities)?;
+        crate::forwarding::check(&self.capabilities, &offered.capabilities)?;
         Ok(())
     }
 }

@@ -97,6 +97,13 @@ const DETACH_NOTE: &str = "Closing the window or losing the connection only deta
 /// Subcommands of the Client role.
 #[derive(Debug, Subcommand)]
 pub enum ClientCommand {
+    /// Forward TCP ports without a terminal Session (stops on Connection loss)
+    Forward {
+        #[command(flatten)]
+        remote: Remote,
+        #[command(flatten)]
+        options: Box<crate::forwarding::runtime::Options>,
+    },
     /// Transfer files and manage Server files (no terminal Session)
     Fs {
         #[command(subcommand)]

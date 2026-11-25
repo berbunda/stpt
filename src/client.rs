@@ -51,6 +51,10 @@ pub fn run(command: ClientCommand, common: &Common) -> Result<ExitCode, Error> {
     config::log_source(path.as_deref());
 
     let (remote, action) = match command {
+        ClientCommand::Forward { remote, options } => {
+            options.validate().map_err(Error::Forwarding)?;
+            (remote, Action::Forward(*options))
+        }
         ClientCommand::Fs { action } => {
             let (remote, mut operation) = crate::file_client::split(action);
             operation.max_size = config
@@ -140,7 +144,10 @@ pub fn run(command: ClientCommand, common: &Common) -> Result<ExitCode, Error> {
         &mut store,
         &key,
         ask_user,
-        matches!(&action, Action::Files(..)),
+        (
+            matches!(&action, Action::Files(..)),
+            matches!(&action, Action::Forward(_)),
+        ),
         consent.clone(),
     ))?;
     connection.reverse_policy = (
@@ -178,16 +185,24 @@ async fn login_to_offer(
     store: &mut TrustStore,
     key: &UserKey,
     confirm: impl Fn(&Address, &Fingerprint) -> Result<bool, Error>,
-    files: bool,
+    services: (bool, bool),
     consent: Option<crate::consent::Pair>,
 ) -> Result<Connection, Error> {
+    let (files, forwarding) = services;
     let mut connection = connect(remote, addr, store, confirm).await?;
     connection.consent = consent;
-    let hello = if files || connection.consent.is_some() {
+    let hello = if files || connection.consent.is_some() || forwarding {
         match connection
             .exchange_hello_offer(
                 SERVER_HELLO_TIMEOUT,
-                if files {
+                if forwarding {
+                    let mut h = ClientHello::ours();
+                    h.capabilities.push((
+                        crate::forwarding::CAP,
+                        crate::forwarding::Selection::offer().value(),
+                    ));
+                    h
+                } else if files {
                     ClientHello::with_files(1)
                 } else {
                     let mut h = ClientHello::ours();
@@ -239,6 +254,7 @@ async fn login_to_offer(
 
 /// What a Client command does once the Connection is Authenticated.
 enum Action {
+    Forward(crate::forwarding::runtime::Options),
     Files(crate::file_client::Operation, Duration),
     /// A new Session: its terminal Channel, and whether it has a PTY.
     Terminal(Open, bool),
@@ -264,6 +280,37 @@ async fn perform(
     login: &mut Login<'_>,
 ) -> Result<ExitCode, Error> {
     match action {
+        Action::Forward(options) => {
+            let selection = connection.forwarding.clone().ok_or_else(|| {
+                Error::Forwarding(crate::forwarding::runtime::Error::Status(
+                    crate::forwarding::Status::Unsupported,
+                ))
+            })?;
+            let state = crate::forwarding::runtime::State::new(
+                connection.connection.clone(),
+                connection.peer_limit,
+                selection,
+                None,
+                None,
+                Default::default(),
+            );
+            connection
+                .connection
+                .set_max_concurrent_bi_streams(64u32.into());
+            let accept = tokio::spawn(crate::forwarding::runtime::accept(state.clone()));
+            let result = forward_with_network(
+                state,
+                options,
+                follow_network(
+                    connection.endpoint.clone(),
+                    connection.connection.remote_address(),
+                ),
+            )
+            .await
+            .map_err(Error::Forwarding);
+            accept.abort();
+            result.map(|()| ExitCode::SUCCESS)
+        }
         Action::Files(mut operation, deadline) => {
             operation.server_identity = connection.server_identity.as_spki().to_vec();
             let mut channel = connection
@@ -318,6 +365,113 @@ async fn perform(
             session,
             attachment,
         } => commands::detach(connection, &session, attachment).await,
+    }
+}
+
+// Keep the route monitor alive for the entire forwarding-only command, without reconnecting.
+async fn forward_with_network(
+    state: std::sync::Arc<crate::forwarding::runtime::State>,
+    options: crate::forwarding::runtime::Options,
+    network: impl Future<Output = ()>,
+) -> Result<(), crate::forwarding::runtime::Error> {
+    tokio::select! {r=crate::forwarding::runtime::run(state,options)=>r,()=network=>unreachable!("route monitor runs until the command ends")}
+}
+
+#[cfg(test)]
+mod forwarding_review {
+    use super::*;
+    use crate::forwarding::{
+        self as f,
+        runtime::{Mode, Options, State},
+    };
+    use tokio::io::AsyncWriteExt;
+    #[tokio::test]
+    async fn foreground_forwarding_polls_route_watcher_and_preserves_live_tcp_flow() {
+        timeout(Duration::from_secs(5), async {
+            let pair = crate::files::tests::Pair::start().await;
+            pair.client.set_max_concurrent_bi_streams(8u32.into());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let state = State::new(
+                pair.client.clone(),
+                DEFAULT_MESSAGE_LIMIT,
+                f::Selection::offer(),
+                None,
+                None,
+                Default::default(),
+            );
+            let trigger = tokio::sync::Notify::new();
+            let migrated = tokio::sync::Notify::new();
+            let network = async {
+                trigger.notified().await;
+                pair.rebind_client();
+                migrated.notify_one();
+                std::future::pending::<()>().await;
+            };
+            let options = Options {
+                mode: Mode::Remote,
+                bind: "127.0.0.1:0".parse().unwrap(),
+                target: Some(f::Target {
+                    host: f::Host::Ip(listener.local_addr().unwrap().ip()),
+                    port: listener.local_addr().unwrap().port(),
+                }),
+                allow_non_loopback: false,
+                ingress: vec![],
+            };
+            let accept = tokio::spawn(f::runtime::accept(state.clone()));
+            let drive = async {
+                let (mut rule, mut request) = pair.server.accept_bi().await.unwrap();
+                let m = wire::read_message(&mut request, DEFAULT_MESSAGE_LIMIT)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(m.field(0).and_then(Value::as_uint), Some(f::RULE));
+                let id = u64::from(rule.id());
+                wire::write_message(
+                    &mut rule,
+                    &f::Status::Ok.reply(f::READY, Some("127.0.0.1:40000".parse().unwrap())),
+                    DEFAULT_MESSAGE_LIMIT,
+                )
+                .await
+                .unwrap();
+                let (mut send, mut recv) = pair.server.open_bi().await.unwrap();
+                wire::write_message(
+                    &mut send,
+                    &Message::new(
+                        wire::CHANNEL_OPEN,
+                        vec![(0, Value::Uint(f::FLOW)), (1, Value::Uint(id))],
+                    ),
+                    DEFAULT_MESSAGE_LIMIT,
+                )
+                .await
+                .unwrap();
+                let (mut target, _) = listener.accept().await.unwrap();
+                let m = wire::read_message(&mut recv, DEFAULT_MESSAGE_LIMIT)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(f::outcome(&m, f::CONNECTED, true).unwrap().0, f::Status::Ok);
+                let before = pair.server.remote_address();
+                trigger.notify_one();
+                migrated.notified().await;
+                target.write_all(b"foreground migrated").await.unwrap();
+                let m = wire::read_message(&mut recv, DEFAULT_MESSAGE_LIMIT)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    m.field(0),
+                    Some(&Value::Bytes(b"foreground migrated".to_vec()))
+                );
+                assert_ne!(pair.server.remote_address(), before);
+                pair.server.close(Code::NoError.varint(), b"");
+                accept.abort();
+            };
+            let (result, ()) =
+                tokio::join!(forward_with_network(state.clone(), options, network), drive);
+            assert!(result.is_err());
+        })
+        .await
+        .unwrap();
     }
 }
 
@@ -465,6 +619,7 @@ pub struct Connection {
     reverse_policy: (u64, Duration),
     consent: Option<crate::consent::Pair>,
     server_identity: crate::identity::PublicKey,
+    forwarding: Option<crate::forwarding::Selection>,
     files: Option<crate::files::Budget>,
     authenticated_account: Option<String>,
     endpoint: quinn::Endpoint,
@@ -548,6 +703,7 @@ impl Connection {
             return Err(Failure::violation("the Server does not offer publickey-ed25519").into());
         }
         self.peer_limit = hello.limits.max_message;
+        self.forwarding = crate::forwarding::selected(&hello.capabilities);
         self.files = crate::files::selected(&hello.capabilities)
             .map(|max| crate::files::Budget::new(max.min(u64::from(u32::MAX)) as u32));
         Ok(hello)
@@ -988,7 +1144,7 @@ async fn attach_again(login: &mut Login<'_>, open: &Open) -> Result<(Connection,
         login.store,
         login.key,
         refuse_unknown,
-        false,
+        (false, false),
         login.consent.clone(),
     )
     .await?;
@@ -1549,6 +1705,7 @@ async fn connect(
                         Duration::from_secs(60),
                     ),
                     server_identity: key.clone(),
+                    forwarding: None,
                     files: None,
                     authenticated_account: None,
                     endpoint,

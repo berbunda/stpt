@@ -60,10 +60,12 @@ Tier RE scenario review completed ✅ 2026-11-22, program 0.4.1-2: [results and 
 Tier RF scenario review ✅ 2026-11-24, program 0.4.5-1. [Results, fixes and coverage](RF_REVIEW.md).
 
 # 7	Tier RG — Port Forwarding
-- [ ] RG001  local forwarding ← PG001 ➕ 2026-10-13
-- [ ] RG002  remote forwarding ← PG002 ➕ 2026-10-13
-- [ ] RG003  dynamic forwarding (SOCKS) ← PG003 ➕ 2026-10-13
-- [ ] RG004  Server forwarding policy ← PG004 ➕ 2026-10-13
+- [x] RG001  local forwarding ← PG001 ➕ 2026-10-13 ✅ 2026-11-25
+- [x] RG002  remote forwarding ← PG002 ➕ 2026-10-13 ✅ 2026-11-25
+- [x] RG003  dynamic forwarding (SOCKS) ← PG003 ➕ 2026-10-13 ✅ 2026-11-25
+- [x] RG004  Server forwarding policy ← PG004 ➕ 2026-10-13 ✅ 2026-11-25
+
+Tier RG full scenario review completed ✅ 2026-11-25, program 0.5.0-1. [Evidence and coverage limits](RG_REVIEW.md).
 
 # 8	Tier RH — Audit
 - [ ] RH001  Server audit log ← PH001 ➕ 2026-10-13

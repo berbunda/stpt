@@ -24,6 +24,7 @@ mod file_storage;
 mod file_storage;
 mod file_worker;
 mod files;
+mod forwarding;
 #[cfg(target_os = "linux")]
 mod fuse_mount;
 mod hello;
@@ -59,6 +60,11 @@ use std::io::Write;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    #[cfg(unix)]
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__stpt-network-worker"))
+    {
+        return forwarding::native::helper();
+    }
     #[cfg(target_os = "linux")]
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__stpt-mount-tree")) {
         return if reverse::mount_client::helper().is_ok() {

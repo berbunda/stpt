@@ -292,3 +292,41 @@ Select the absolute directory in the Client's second terminal and enter the disp
 The Linux Server backend requires root, usable `/dev/fuse`, `fusectl` and permission to create and enter private mount namespaces. The Linux Client uses `openat2` for confined access. If these requirements cannot be met the request fails. Windows retains individual read/create requests.
 
 If the Server's FUSE worker exits during a read, the pending read fails and the Client closes the grant. An open file descriptor cannot keep the mount readable. See the [Tier RF scenario review](docs/RF_REVIEW.md).
+
+
+## TCP port forwarding (0.5.0-1)
+
+Forwarding runs without a terminal Session. A rule and its TCP connections end when their authenticated STPT Connection ends; there is no automatic reconnect or TCP replay. Ctrl+C stops the foreground command. QUIC migration preserves the existing Connection. The command prints the actual listener address, including an allocated port when `--bind` uses port 0.
+
+```
+stpt forward alice@server --mode local --bind 127.0.0.1:15432 --target db.internal:5432
+stpt forward alice@server --mode remote --bind 127.0.0.1:8080 --target 127.0.0.1:3000
+stpt forward alice@server --mode dynamic --bind 127.0.0.1:1080
+```
+
+Local mode listens on the Client and connects from the Server; remote mode listens on the Server and connects to the exact locally configured Client target. Dynamic mode is a restricted SOCKS5 CONNECT proxy with domain resolution on the Server. Applications must request proxy-side DNS themselves (for example, a SOCKS hostname mode); local application DNS is not prevented. SOCKS BIND, UDP, local Unix sockets and SOCKS authentication methods other than no-authentication are unsupported.
+
+Forwarding is disabled by default. The Server operator explicitly grants modes and numeric networks/ports for each Account in `server.toml`, for example:
+
+```toml
+[forwarding.accounts.alice]
+local = true
+remote = true
+dynamic = true
+targets = [{ network = "127.0.0.0/8", ports = [5432, 8080] }, { network = "10.0.0.0/8", ports = [5432] }]
+binds = [{ network = "127.0.0.1/32", ports = [8080] }]
+# Optional exact DNS-name allowlist, checked before resolution:
+names = ["db.internal", "localhost"]
+# Optional remote-listener source filter:
+ingress = ["127.0.0.0/8", "::1/128"]
+```
+
+Omitting `ports` allows all TCP ports in that network; an empty list allows none. A remote ephemeral bind needs authorization for port 0 and for the actual allocated port; omitting `ports` is one way to grant both. Missing mode flags are false; missing target/bind lists grant no access. Omitting `names` imposes no additional name filter; every resolved numeric candidate still requires a matching target network and port. DNS queries are absolute, without search suffixes. Configuration is read at startup; restart to change or revoke administrator policy, ending existing Connections.
+
+Local and remote listeners require an explicit numeric `--bind`. Non-loopback exposure additionally requires `--allow-non-loopback`; an exposed SOCKS listener also requires `--ingress CIDR` (repeatable). Anyone permitted to reach an exposed SOCKS listener can use its Account's forwarding authority. Remote ingress is configured on the Server, rather than through Client `--ingress`. IPv6 listeners are IPv6-only; use a separate command for IPv4. IPv6 scopes and Unicode DNS names are unsupported; provide ASCII A-label names.
+
+Server target filters apply to local/dynamic mode. Remote mode delegates the destination to the Client, so disable remote mode if that delegation is unsuitable. An authorized terminal alone does not enable forwarding. Unix socket creation and DNS run in same-binary helpers under the Account credentials, without its shell; Windows uses its already supported current Account/token. Neither platform substitutes service privileges when access is denied. External TCP legs are not encrypted by STPT and target services still need their own authentication.
+
+The CLI currently runs one rule per command/Connection. Protocol/runtime budgets support several rules on a Connection. Defaults: 8 rules/64 flows per Connection, 32/256 per Account, 256/2048 per Server, and 64 concurrent native DNS/socket helpers. Rule/flow opening and SOCKS handshake have 10-second deadlines; blocked data work has a 60-second progress deadline. Healthy idle TCP flows have no service idle timeout. Queues and admissions are bounded; cancellation does not retry a target connection.
+
+The [Tier RG scenario review](docs/RG_REVIEW.md) records 0.5.0-1 cancellation, quota and timeout fixes, foreground route monitoring and all 41 acceptance scenarios. DNS permissions reject disallowed ports before resolution; exact name allowlists use canonical lowercase ASCII names (one optional final root dot is normalized).

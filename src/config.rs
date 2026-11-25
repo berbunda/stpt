@@ -52,6 +52,8 @@ pub struct ClientConfig {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
+    #[serde(default)]
+    pub forwarding: crate::forwarding::Config,
     /// Maximum logical size of one file transfer (default 8 GiB).
     #[serde(default, deserialize_with = "file_size_limit")]
     pub max_file_size: Option<u64>,

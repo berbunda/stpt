@@ -719,7 +719,6 @@ pub(crate) mod tests {
     }
 
     impl Pair {
-        #[cfg(target_os = "linux")]
         pub(crate) fn rebind_client(&self) {
             crate::quic::rebind(&self._client, self.client.remote_address()).unwrap();
         }
