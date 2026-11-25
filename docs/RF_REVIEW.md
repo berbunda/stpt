@@ -42,3 +42,15 @@ Both dispatch paths now watch detach and Session end while accepting the local c
 Windows passed 288 tests with one ignored. Debian 12 passed 331 with eight ignored by default. The ignored native FUSE suite was also run explicitly with `STPT_FUSE_TEST_ACCOUNT` and passed all ten lifecycle cases in 125 seconds. Clippy passed on both platforms with warnings denied. An initial parallel Linux run failed the resume-checkpoint lock test outside Tier RF. Subsequent serial and default parallel runs passed. Windows tests used the ordinary user ACL environment after the sandbox's temporary-directory ACLs caused fixture failures.
 
 Linux mount checks require a real FUSE device, mount namespace privileges and fusectl. The suite includes an ordinary Session Account. Windows exercises grants, routing and one-shot operations. UDP migration was tested on loopback at the Channel layer. Asynchronous listing uses the same cancellation path as read. Reuse of an old mount instance is checked at the grant and implementation layers. These last two cases were not separately forced on a physical filesystem.
+
+## RF005 backend migration
+
+2026-11-25 · program 0.4.6-0 · protocol draft-58 (unchanged)
+
+The Linux backend now uses `fuser` 0.19.0 with default features disabled and no obsolete `abi-7-31` feature. `mount` takes a `Config`; `SessionACL::All` replaces `AllowOther`, and one event-loop thread preserves the serial worker exchange. The `Filesystem` callbacks use shared references and typed inode, handle, offset, flag, generation and error values. A mutex protects the bounded inode table. A missing request UID fails the existing Account check.
+
+The native suite also verifies the actual kernel mount flags, refuses append, directory creation, rename and removal, and checks the original Client file contents afterwards. Its additional `pending` case suspends the exact Client tree worker, waits for a read on an already-open descriptor to reach that worker, then revokes locally. The pending read must fail, the grant must close, and subsequent reads through the old descriptor and working directory must fail. The existing Server-worker-death case remains separate.
+
+The ordinary Windows suite passed 288 tests with one manual test ignored. The ordinary Ubuntu Linux suite passed 331 tests with eight ignored by default. Clippy passed on both platforms for all targets with warnings denied. The Linux checks use an isolated Rust 1.100.0 toolchain and build directory on the test VM.
+
+The ignored native FUSE suite passed explicitly on Ubuntu with kernel 7.0.0-44-generic and `STPT_FUSE_TEST_ACCOUNT=anubarak`: all eleven lifecycle cases completed in 127 seconds. It covers refusal and abandoned setup, ordinary Account access, local revocation, detach, takeover, Session termination, Connection loss, Server worker death, local revocation during a pending read and abrupt Server exit. The Account case also confirms that `SessionACL::All` permits the ordinary Session Account through the root-mounted FUSE interface while the UID/session checks reject access from outside the Session. No wire change or new platform capability is introduced.

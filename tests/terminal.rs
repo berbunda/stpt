@@ -175,9 +175,11 @@ mod server {
             "session",
             "connection",
             "helper",
+            "pending",
             "server",
         ] {
             if end != "account" || std::env::var_os("STPT_FUSE_TEST_ACCOUNT").is_some() {
+                eprintln!("native FUSE lifecycle: {end}");
                 fuse_lifetime(end);
             }
         }
@@ -267,6 +269,10 @@ STPT_TEST_MAPPED_FILE="$p/sample" '{test_bin}' --exact server::fuse_mapping_prob
 ls -a "$p"
 if cat "$p/link"; then exit 6; fi
 if touch "$p/new"; then exit 7; fi
+if printf x >> "$p/sample"; then exit 14; fi
+if mkdir "$p/new-dir"; then exit 15; fi
+if mv "$p/sample" "$p/moved"; then exit 16; fi
+if rm "$p/sample"; then exit 17; fi
 exec 3<"$p/sample"
 dd bs=1 count=1 <&3 2>/dev/null
 cd "$p"
@@ -393,6 +399,32 @@ touch '{}'
         let pid = parts.next().unwrap();
         let sid = parts.next().unwrap();
         let path = parts.next().unwrap();
+        let mountinfo = std::fs::read_to_string(format!("/proc/{pid}/mountinfo")).unwrap();
+        let mount = mountinfo
+            .lines()
+            .find(|line| line.split_whitespace().nth(4) == Some(path))
+            .unwrap();
+        let options: Vec<_> = mount
+            .split_whitespace()
+            .nth(5)
+            .unwrap()
+            .split(',')
+            .collect();
+        for option in ["ro", "nodev", "nosuid", "noexec"] {
+            assert!(options.contains(&option), "missing {option}: {mount}");
+        }
+        let super_options: Vec<_> = mount
+            .split_once(" - ")
+            .unwrap()
+            .1
+            .split_whitespace()
+            .nth(2)
+            .unwrap()
+            .split(',')
+            .collect();
+        for option in ["default_permissions", "allow_other"] {
+            assert!(super_options.contains(&option), "missing {option}: {mount}");
+        }
         assert!(std::fs::read(Path::new(path).join("sample")).is_err());
         let foreign = format!("/proc/{pid}/root{path}/sample");
         assert!(std::fs::read(foreign).is_err());
@@ -441,7 +473,7 @@ touch '{}'
             }
             "connection" => child.kill().unwrap(),
             "server" => s.server.kill_test_server(),
-            "helper" => {
+            "helper" | "pending" => {
                 // Hold the Client's already-open file read in flight. Wait for the
                 // CALL to reach its worker pipe without consuming it.
                 use std::os::fd::AsRawFd;
@@ -483,24 +515,30 @@ touch '{}'
                     );
                     std::thread::sleep(Duration::from_millis(10));
                 }
-                let helper = std::fs::read_dir("/proc")
-                    .unwrap()
-                    .flatten()
-                    .find_map(|entry| {
-                        let id = entry.file_name().to_str()?.parse::<i32>().ok()?;
-                        let cmd = std::fs::read(entry.path().join("cmdline")).ok()?;
-                        let mut args = cmd.split(|b| *b == 0);
-                        args.next();
-                        (args.next() == Some(b"__stpt-fuse")
-                            && args.next() == Some(path.as_bytes()))
-                        .then_some(id)
-                    })
+                if end == "pending" {
+                    // Revoke locally while a direct read on the existing
+                    // descriptor is waiting for the suspended Client worker.
+                    broker.type_text("\n");
+                } else {
+                    let helper = std::fs::read_dir("/proc")
+                        .unwrap()
+                        .flatten()
+                        .find_map(|entry| {
+                            let id = entry.file_name().to_str()?.parse::<i32>().ok()?;
+                            let cmd = std::fs::read(entry.path().join("cmdline")).ok()?;
+                            let mut args = cmd.split(|b| *b == 0);
+                            args.next();
+                            (args.next() == Some(b"__stpt-fuse")
+                                && args.next() == Some(path.as_bytes()))
+                            .then_some(id)
+                        })
+                        .unwrap();
+                    nix::sys::signal::kill(
+                        nix::unistd::Pid::from_raw(helper),
+                        nix::sys::signal::Signal::SIGKILL,
+                    )
                     .unwrap();
-                nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(helper),
-                    nix::sys::signal::Signal::SIGKILL,
-                )
-                .unwrap();
+                }
             }
             _ => broker.type_text("\n"),
         }
@@ -523,7 +561,7 @@ touch '{}'
             child.kill().unwrap();
         }
         let result = child.wait_with_output().unwrap();
-        if matches!(end, "local" | "helper" | "account") {
+        if matches!(end, "local" | "helper" | "pending" | "account") {
             assert!(result.status.success(), "{}", stderr(&result));
             assert!(stdout(&result).contains("abcdef"));
             assert!(stdout(&result).contains("sample"));
@@ -539,6 +577,9 @@ touch '{}'
             }
         }
         assert!(!source.join("new").exists());
+        assert!(!source.join("new-dir").exists());
+        assert!(!source.join("moved").exists());
+        assert_eq!(std::fs::read(source.join("sample")).unwrap(), b"abcdef");
         if let Some(mut other) = takeover {
             assert!(other.child.wait().unwrap().success());
         }

@@ -21,7 +21,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, UNIX_EPOCH},
 };
 use tokio::process::{Child, Command};
@@ -220,21 +220,32 @@ struct View {
     sid: i32,
     uid: u32,
     kind: u64,
+    inodes: Mutex<Inodes>,
+}
+struct Inodes {
     next: u64,
     paths: BTreeMap<u64, Vec<Value>>,
 }
 type Native<T> = Result<T, i32>;
 impl View {
     fn allows(&self, r: &Request) -> Native<()> {
-        if r.uid() == self.uid && r.pid() > 0 && unsafe { libc::getsid(r.pid() as i32) } == self.sid
+        if r.uid() == Some(self.uid)
+            && r.pid() > 0
+            && unsafe { libc::getsid(r.pid() as i32) } == self.sid
         {
             Ok(())
         } else {
             Err(libc::EACCES)
         }
     }
-    fn path(&self, ino: u64) -> Native<Vec<Value>> {
-        self.paths.get(&ino).cloned().ok_or(libc::ESTALE)
+    fn path(&self, ino: INodeNo) -> Native<Vec<Value>> {
+        self.inodes
+            .lock()
+            .map_err(|_| libc::EIO)?
+            .paths
+            .get(&ino.0)
+            .cloned()
+            .ok_or(libc::ESTALE)
     }
     fn name(&self, name: &OsStr) -> Native<Value> {
         let value = if self.kind == 0 {
@@ -248,16 +259,18 @@ impl View {
             Err(libc::EINVAL)
         }
     }
-    fn inode(&mut self, path: Vec<Value>) -> Native<u64> {
-        if let Some((id, _)) = self.paths.iter().find(|(_, p)| **p == path) {
-            return Ok(*id);
+    fn inode(&self, path: Vec<Value>) -> Native<INodeNo> {
+        let mut inodes = self.inodes.lock().map_err(|_| libc::EIO)?;
+        if let Some((id, _)) = inodes.paths.iter().find(|(_, p)| **p == path) {
+            return Ok(INodeNo(*id));
         }
-        if self.paths.len() >= 8192 {
+        if inodes.paths.len() >= 8192 {
             return Err(libc::ENOSPC);
         }
-        self.next = self.next.checked_add(1).ok_or(libc::EOVERFLOW)?;
-        self.paths.insert(self.next, path);
-        Ok(self.next)
+        let next = inodes.next.checked_add(1).ok_or(libc::EOVERFLOW)?;
+        inodes.next = next;
+        inodes.paths.insert(next, path);
+        Ok(INodeNo(next))
     }
     fn rpc(&self, op: u64, fields: Vec<(u64, Value)>) -> Native<Message> {
         let mut all = vec![(0, Value::Uint(op))];
@@ -290,7 +303,7 @@ impl View {
             _ => Err(libc::EIO),
         }
     }
-    fn attr(&self, ino: u64, path: Vec<Value>) -> Native<FileAttr> {
+    fn attr(&self, ino: INodeNo, path: Vec<Value>) -> Native<FileAttr> {
         let m = self.rpc(1, vec![(1, Value::Array(path))])?;
         let meta =
             p::validate_metadata(m.field(1).ok_or(libc::EIO)?, self.kind).map_err(|_| libc::EIO)?;
@@ -340,57 +353,56 @@ fn ft(kind: u64) -> Native<FileType> {
     }
 }
 impl Filesystem for View {
-    fn init(&mut self, _: &Request, config: &mut KernelConfig) -> Result<(), i32> {
+    fn init(&mut self, _: &Request, config: &mut KernelConfig) -> io::Result<()> {
         let _ = config.set_max_readahead(0);
         let _ = config.set_max_background(1);
         io::stdout()
             .write_all(&[1])
             .and_then(|_| io::stdout().flush())
-            .map_err(|_| libc::EIO)
     }
-    fn lookup(&mut self, r: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
+    fn lookup(&self, r: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let result = (|| {
             self.allows(r)?;
             let mut path = self.path(parent)?;
             path.push(self.name(name)?);
-            let mut a = self.attr(0, path.clone())?;
+            let mut a = self.attr(INodeNo(0), path.clone())?;
             a.ino = self.inode(path)?;
             Ok(a)
         })();
         match result {
-            Ok(a) => reply.entry(&Duration::ZERO, &a, 0),
-            Err(e) => reply.error(e),
+            Ok(a) => reply.entry(&Duration::ZERO, &a, Generation(0)),
+            Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
-    fn getattr(&mut self, r: &Request, ino: u64, _: Option<u64>, reply: ReplyAttr) {
+    fn getattr(&self, r: &Request, ino: INodeNo, _: Option<FileHandle>, reply: ReplyAttr) {
         match self.allows(r).and_then(|_| self.attr(ino, self.path(ino)?)) {
             Ok(a) => reply.attr(&Duration::ZERO, &a),
-            Err(e) => reply.error(e),
+            Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
-    fn open(&mut self, r: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
+    fn open(&self, r: &Request, ino: INodeNo, flags: OpenFlags, _: bool, reply: ReplyOpen) {
         let result = (|| {
             self.allows(r)?;
-            if flags & (libc::O_ACCMODE | libc::O_TRUNC) != 0 {
+            if flags.0 & (libc::O_ACCMODE | libc::O_TRUNC) != 0 {
                 return Err(libc::EROFS);
             }
             let m = self.rpc(3, vec![(1, Value::Array(self.path(ino)?))])?;
             m.field(3).and_then(Value::as_uint).ok_or(libc::EIO)
         })();
         match result {
-            Ok(h) => reply.opened(h, fuser::consts::FOPEN_DIRECT_IO),
-            Err(e) => reply.error(e),
+            Ok(h) => reply.opened(FileHandle(h), FopenFlags::FOPEN_DIRECT_IO),
+            Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
     fn read(
-        &mut self,
+        &self,
         r: &Request,
-        _: u64,
-        h: u64,
-        off: i64,
+        _: INodeNo,
+        h: FileHandle,
+        off: u64,
         size: u32,
-        _: i32,
-        lock_owner: Option<u64>,
+        _: OpenFlags,
+        lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
         let result = (|| {
@@ -400,7 +412,6 @@ impl Filesystem for View {
             if lock_owner.is_none() {
                 return Err(libc::EOPNOTSUPP);
             }
-            let off = u64::try_from(off).map_err(|_| libc::EINVAL)?;
             if off > p::MAX_SIZE {
                 return Ok(Vec::new());
             }
@@ -413,7 +424,7 @@ impl Filesystem for View {
                 let m = self.rpc(
                     4,
                     vec![
-                        (2, Value::Uint(h)),
+                        (2, Value::Uint(h.0)),
                         (3, Value::Uint(off + out.len() as u64)),
                         (4, Value::Uint(n as u64)),
                     ],
@@ -433,31 +444,38 @@ impl Filesystem for View {
         })();
         match result {
             Ok(b) => reply.data(&b),
-            Err(e) => reply.error(e),
+            Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
     fn release(
-        &mut self,
+        &self,
         _: &Request,
-        _: u64,
-        h: u64,
-        _: i32,
-        _: Option<u64>,
+        _: INodeNo,
+        h: FileHandle,
+        _: OpenFlags,
+        _: Option<LockOwner>,
         _: bool,
         reply: ReplyEmpty,
     ) {
-        match self.rpc(5, vec![(2, Value::Uint(h))]) {
+        match self.rpc(5, vec![(2, Value::Uint(h.0))]) {
             Ok(_) => reply.ok(),
-            Err(e) => reply.error(e),
+            Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
-    fn opendir(&mut self, r: &Request, _: u64, _: i32, reply: ReplyOpen) {
+    fn opendir(&self, r: &Request, _: INodeNo, _: OpenFlags, reply: ReplyOpen) {
         match self.allows(r) {
-            Ok(()) => reply.opened(0, 0),
-            Err(e) => reply.error(e),
+            Ok(()) => reply.opened(FileHandle(0), FopenFlags::empty()),
+            Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
-    fn readdir(&mut self, r: &Request, ino: u64, _: u64, off: i64, mut reply: ReplyDirectory) {
+    fn readdir(
+        &self,
+        r: &Request,
+        ino: INodeNo,
+        _: FileHandle,
+        off: u64,
+        mut reply: ReplyDirectory,
+    ) {
         let result = (|| {
             self.allows(r)?;
             let start = usize::try_from(off).map_err(|_| libc::EINVAL)?;
@@ -490,7 +508,7 @@ impl Filesystem for View {
                     child.push(self.name(OsStr::from_bytes(name))?);
                 }
                 let inode = self.inode(child)?;
-                if reply.add(inode, (i + 1) as i64, *kind, OsStr::from_bytes(name)) {
+                if reply.add(inode, (i + 1) as u64, *kind, OsStr::from_bytes(name)) {
                     break;
                 }
             }
@@ -498,7 +516,7 @@ impl Filesystem for View {
         })();
         match result {
             Ok(()) => reply.ok(),
-            Err(e) => reply.error(e),
+            Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
 }
@@ -577,21 +595,24 @@ pub fn helper() -> io::Result<()> {
         sid,
         uid,
         kind,
-        next: 1,
-        paths: BTreeMap::from([(1, Vec::new())]),
+        inodes: Mutex::new(Inodes {
+            next: 1,
+            paths: BTreeMap::from([(1, Vec::new())]),
+        }),
     };
     use MountOption::*;
-    fuser::mount2(
-        fs,
-        &path,
-        &[
-            RO,
-            NoDev,
-            NoExec,
-            NoSuid,
-            AllowOther,
-            DefaultPermissions,
-            FSName("stpt".into()),
-        ],
-    )
+    let mut config = Config::default();
+    config.mount_options = vec![
+        RO,
+        NoDev,
+        NoExec,
+        NoSuid,
+        DefaultPermissions,
+        FSName("stpt".into()),
+    ];
+    // The worker mounts as root; data requests still require the Session UID
+    // and OS session in View::allows. One loop preserves the serial pipe RPC.
+    config.acl = SessionACL::All;
+    config.n_threads = Some(1);
+    fuser::mount(fs, &path, &config)
 }
