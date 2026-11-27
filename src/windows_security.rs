@@ -147,11 +147,16 @@ pub fn check_handle(file: &std::fs::File, private: bool) -> io::Result<()> {
         if owner.is_null() || !trusted(owner) || acl.is_null() {
             return Err(io::Error::other("untrusted owner or unrestricted DACL"));
         }
+        // GetSecurityInfo stores the ACL in the descriptor owned by _local.
+        if IsValidAcl(acl) == 0 {
+            return Err(io::Error::other("invalid Server DACL"));
+        }
         for index in 0..(*acl).AceCount as u32 {
             let mut ace = std::ptr::null_mut();
             if GetAce(acl, index, &mut ace) == 0 {
                 return Err(io::Error::last_os_error());
             }
+            // A successful GetAce returns the indexed entry in that same ACL.
             let header = &*ace.cast::<ACE_HEADER>();
             if header.AceFlags & INHERIT_ONLY_ACE as u8 != 0 {
                 continue;
@@ -166,7 +171,17 @@ pub fn check_handle(file: &std::fs::File, private: bool) -> io::Result<()> {
                 return Err(io::Error::other("unsupported Server DACL entry"));
             }
             let allowed = &*ace.cast::<ACCESS_ALLOWED_ACE>();
-            let sid = (&allowed.SidStart as *const u32) as PSID;
+            // SidStart marks a variable-length SID. Derive the slice from
+            // the whole ACE allocation, never from the four-byte field.
+            let offset = std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart);
+            let tail = std::slice::from_raw_parts(
+                ace.cast::<u8>().add(offset),
+                usize::from(header.AceSize) - offset,
+            );
+            let sid = ace_sid(tail)?.as_ptr() as PSID;
+            if IsValidSid(sid) == 0 {
+                return Err(io::Error::other("invalid SID in Server DACL entry"));
+            }
             // Generic write/all, DELETE, WRITE_DAC/OWNER and file/directory
             // mutation bits. Private keys additionally forbid content reads.
             const MUTATE: u32 = 0x500d0156;
@@ -183,6 +198,14 @@ pub fn check_handle(file: &std::fs::File, private: bool) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn ace_sid(bytes: &[u8]) -> io::Result<&[u8]> {
+    // GetSidLengthRequired includes the fixed header and all subauthorities.
+    bytes
+        .get(1)
+        .and_then(|&count| bytes.get(..unsafe { GetSidLengthRequired(count) } as usize))
+        .ok_or_else(|| io::Error::other("truncated SID in Server DACL entry"))
 }
 
 pub(crate) fn descriptor(inherit: bool) -> io::Result<Local> {
@@ -344,6 +367,14 @@ pub fn make_private(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ace_must_contain_the_entire_sid() {
+        let sid = known(WinBuiltinAdministratorsSid).unwrap();
+        assert!(ace_sid(&sid).is_ok());
+        for length in 0..sid.len() {
+            assert!(ace_sid(&sid[..length]).is_err());
+        }
+    }
     #[test]
     fn private_file_and_owner_dacl_are_enforced() {
         let path = std::env::temp_dir().join(format!("stpt-private-key-{}", std::process::id()));
