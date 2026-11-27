@@ -3,6 +3,42 @@ Secure terminal access over QUIC: a single program acting as client and server, 
 
 Status: early development. Terminals and Sessions work, and `connect` attaches again by itself after a lost connection.
 
+## STPT 0.5.0-1 release binaries
+
+This release supports local, remote and dynamic (SOCKS) TCP forwarding. The
+Windows 11 x86-64 and Linux x86-64 GNU builds each provide both the Client
+and the Server. The [GitHub release](https://github.com/berbunda/stpt/releases/tag/v0.5.0-1)
+provides `stpt.exe` for Windows, `stpt` for Linux and `SHA256SUMS`.
+Keep all three downloads together to verify them with `sha256sum -c SHA256SUMS`.
+For the single-platform examples below, place the downloaded binary in the
+indicated platform directory. The local distribution is under `target/dist/stpt-0.5.0-1/`.
+Run the check for your platform from that directory, or from a copy with
+the same layout.
+
+**Windows (PowerShell)** — check the executable against its release digest.
+
+```powershell
+$expected = 'd85695cafec8f2b8e61a43e58021e6c751cc61dcbd79204d53d8f0256b0dbd2f'
+$actual = (Get-FileHash -Algorithm SHA256 -LiteralPath .\windows-x86_64\stpt.exe -ErrorAction Stop).Hash
+if ($actual -ne $expected) { throw 'STPT SHA-256 mismatch' }
+'windows-x86_64/stpt.exe: OK'
+```
+
+**Linux (GNU coreutils)** — check the Linux binary against its release digest.
+
+```sh
+echo '8956249a019626c402bd2975282057a9b6aa535f5965d0435e1272c7a079a081  linux-x86_64/stpt' | sha256sum --check
+```
+
+The Linux check prints `linux-x86_64/stpt: OK` on success. If you have both
+platform directories and the local distribution's `SHA256SUMS`, `sha256sum -c SHA256SUMS`
+checks both binaries. After verification, run `.\windows-x86_64\stpt.exe --version`
+or `./linux-x86_64/stpt --version` to confirm `stpt 0.5.0-1`. If copying the
+Linux file dropped its execute bit, restore it with `chmod +x linux-x86_64/stpt`.
+The [release notes](docs/RELEASE.md) record build provenance and validation.
+
+## Commands
+
 ```
 stpt server [--listen ADDR:PORT] [--fingerprint]
 stpt connect ACCOUNT@HOST[:PORT] [--name NAME | --attach SESSION [--takeover] [--read-only]]
@@ -243,7 +279,7 @@ reattach_timeout = 3600   # seconds `connect` keeps trying to attach again after
 Requires Rust 1.100 or newer, installed with rustup (distribution packages are usually older), and a C compiler: `build-essential` on Debian, the Visual Studio Build Tools (C++) on Windows. The cryptographic library (AWS-LC) is compiled from C.
 
 ```
-cargo build --release
+cargo build --release --locked
 ```
 
 The program is `target/release/stpt` (`stpt.exe` on Windows).

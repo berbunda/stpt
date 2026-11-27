@@ -56,6 +56,10 @@ mod trust;
 mod windows_security;
 mod wire;
 
+#[cfg(test)]
+#[path = "wire/parser_fuzz.rs"]
+mod parser_fuzz;
+
 use std::io::Write;
 use std::process::ExitCode;
 
